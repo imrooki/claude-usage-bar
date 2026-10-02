@@ -1,0 +1,8 @@
+{
+  "name": "usage-bar-local",
+  "owner": { "name": "imrooki" },
+  "description": "Local plugins for the Claude usage bar",
+  "plugins": [
+    { "name": "usage-feed", "source": "./usage-feed", "description": "Write Claude plan usage windows to a local usage.json for the taskbar widget" }
+  ]
+}

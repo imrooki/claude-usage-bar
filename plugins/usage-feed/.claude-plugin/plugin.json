@@ -1,0 +1,13 @@
+{
+  "name": "usage-feed",
+  "version": "0.1.0",
+  "description": "Write Claude plan usage windows to a local usage.json for the taskbar widget",
+  "author": { "name": "imrooki" },
+  "userConfig": {
+    "dataDir": {
+      "type": "string",
+      "title": "Data directory",
+      "description": "Absolute local folder that holds usage.json, for example C:/Users/<your-name>/claude-usage-bar/data. Leave empty to disable writing. OneDrive paths and UNC network paths are refused."
+    }
+  }
+}

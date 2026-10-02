@@ -1,0 +1,12 @@
+# Runtime data (usage snapshot, widget position, error log): generated at runtime, local only
+/data/
+
+# Local development material (notes, test tools, archived components): not published
+/dev/
+
+# Test output and caches
+_t/
+__pycache__/
+*.pyc
+node_modules/
+*.log

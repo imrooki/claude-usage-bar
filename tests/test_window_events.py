@@ -33,7 +33,8 @@ def make_app():
     w32.post_z_order_check.return_value = True
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
             patch.object(widget, "read_light_theme", return_value=False):
-        app = widget.WidgetApp(widget.Options(".", None, None, None), w32, Mock())
+        app = widget.WidgetApp(
+            widget.Options(".", None, None, None, no_codex=True), w32, Mock())
     app.hwnd = 10
     app.visible = True
     app._apply = Mock()

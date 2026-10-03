@@ -1,13 +1,21 @@
 # claude-usage-bar
 
-A small transparent widget for the Windows 11 taskbar that keeps your **Claude plan usage** in view: the 5-hour and the 7-day rate-limit windows, drawn as two horizontal bars with the percentage and the reset time. It sits right next to the notification area (to the left of the `^` button) and has no background, so your taskbar shows through.
+A small transparent widget for the Windows 11 taskbar that keeps your **Claude plan usage** in view: the 5-hour and the 7-day rate-limit windows, drawn as two horizontal bars with the used percentage and the reset time. If the **Codex CLI** is installed, its 5-hour and weekly limits appear in a second block next to Claude's. The widget sits right next to the notification area (to the left of the `^` button) and has no background, so your taskbar shows through.
 
 ```
  5h [########--]  65%  16:50
  7d [###-------]  33%  Sun
 ```
 
-Bars are green below 50 %, amber from 50 % to 80 %, and red from 80 % up.
+With Codex installed, each block carries its name above the bars:
+
+```
+           Claude                            Codex
+ 5h [###-------]  31%  21:40     5h [#---------]   5%  00:23
+ 7d [#########-]  88%  Sun       7d [#####-----]  50%  Fri
+```
+
+Percentages are the share already used, as Claude's usage page shows them (Codex's own status shows the share left, so 5 % used there reads as 95 % left). Bars are green below 50 %, amber from 50 % to 80 %, and red from 80 % up.
 
 ## How it works
 
@@ -17,7 +25,11 @@ Claude Code session (desktop app Code tab, or terminal)
   |   and whenever a rate-limit window moves by a whole percentage point, it takes
   |   the usage figures Claude Code itself reports and merges them into data/usage.json
   v
-usage_widget.py: reads data/usage.json every 15 s and draws the two bars
+usage_widget.py: reads data/usage.json every 15 s and draws the bars
+  ^
+  |   Codex CLI / Codex app: after each model response it appends a record with the
+  |   current rate limits to its local session log, %USERPROFILE%\.codex\sessions\...
+  |   The widget reads the last such record, read-only, every 15 s.
 ```
 
 - The numbers come only from Claude Code's documented [mods API](https://code.claude.com/docs/en/plugins/mods/overview). The project never reads your login token, never calls an unofficial endpoint and adds no requests of its own.
@@ -30,6 +42,7 @@ usage_widget.py: reads data/usage.json every 15 s and draws the two bars
 - Python 3 with [Pillow](https://pypi.org/project/pillow/) (developed with Python 3.13 and Pillow 11). The widget uses nothing else outside the standard library.
 - Claude Code with mod support. Claude Code's documentation says mods need v2.1.287 or later; this project was tested in the Claude desktop app's Code tab with Claude Code 2.1.286, with the plugin loaded through `CLAUDE_CODE_PLUGIN_DIRS` (see Install).
 - A Claude Pro or Max plan. Rate-limit windows are only reported for subscription plans.
+- Optional: the Codex CLI or Codex app signed in with a ChatGPT plan, for the Codex block. Nothing needs to be configured for it.
 
 ## Install
 
@@ -66,7 +79,8 @@ instead of creating a second copy.
    It runs as a single instance.
 6. Ask me to open a new Claude Code session and send one message. Then check that
    <repo>\data\usage.json was written by that session (its session_id) and that the
-   widget shows the numbers.
+   widget shows the numbers. If the Codex CLI is installed for my Windows user, the
+   widget shows a second "Codex" block on its own; nothing needs configuring for it.
 7. Only if I confirm: create a shortcut in my Startup folder (shell:startup) whose
    target is pythonw.exe and whose argument is the full path of usage_widget.py in
    quotes.
@@ -132,6 +146,26 @@ Chat and Claude Code count toward the [same subscription limits](https://support
 
 The widget cannot continuously refresh account limits while only chat is active. `Refresh now` re-reads the local snapshot; it does not query the account. Old readings retain their original timestamps and fade after 30 minutes. For a current reading while Code is idle, use Claude's own usage page. The widget does not extract login tokens or add background account requests.
 
+## Codex usage
+
+The Codex block needs no setup. The Codex CLI and the Codex app write a local session log for each session under `%USERPROFILE%\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl` (or under `CODEX_HOME` if you set that variable). After every model response they append a `token_count` record that carries the current rate limits: the 5-hour window (`primary`) and the weekly window (`secondary`), each with the used percentage and the reset time. The widget reads the last such record of the most recently written session log.
+
+- **Automatic detection.** The widget looks in the Codex folder of the Windows user it runs as. Without a `sessions` folder it shows only the Claude block, exactly as before; once Codex has been used, the Codex block appears on its own.
+- **Read-only and local.** Only lines that contain both `"token_count"` and `"rate_limits"` are parsed, so your prompts and answers in the same files are never read into the widget. It never opens `auth.json` or any other Codex file, makes no network connection and sends no requests. Only records whose `limit_id` is missing or `codex` are used.
+- **Not an official interface.** The session-log format belongs to Codex and may change in a future release. If it does, the Codex block keeps its last numbers, which fade after 30 minutes, or shows `--` if it never read any; the Claude block is not affected.
+- **What updates it.** Interactive Codex use updates it. Runs started with `codex exec --ephemeral` write no session log and therefore never show up.
+- **Turning it off.** Start the widget with `--no-codex` to hide the block, or with `--codex-home <folder>` to read another Codex home.
+
+## When the numbers change
+
+| What | How often |
+|---|---|
+| The widget re-reads `data/usage.json` and the Codex session log | every 15 s |
+| The widget looks for a newer Codex session log | at most every 60 s |
+| A block fades when its newest reading is older than | 30 min |
+
+The widget can only show what its sources have written. Claude's numbers arrive when a Code session finishes a turn or a limit moves by a whole point; Codex's numbers arrive after each Codex model response. A reading from an ongoing Codex session therefore shows up within about 15 s, one from a newly started session within about 75 s. `Refresh now` in the right-click menu re-reads both sources at once and looks for a new Codex session log immediately.
+
 ## Using the widget
 
 - **Drag** it sideways to move it. It then stays where you put it.
@@ -144,6 +178,7 @@ Known limitations:
 - Windows 11 does not let ordinary windows live inside the notification area, so the widget sits beside it, not inside.
 - After the right-click menu closes, keyboard focus stays on the widget until you click another window.
 - Only the primary monitor's taskbar is handled.
+- If the system clock ran far ahead while Codex was writing and was corrected later, the Codex block can stay on an old reading for about as long as the clock was ahead, or until Codex writes again.
 - When Explorer restarts, the widget recreates its window under the new taskbar. This was tested with one real restart; two restarts within 30 s can leave the widget without an owner for up to about 30 s, during which an open Start menu covers it.
 
 ## Design notes
@@ -154,7 +189,7 @@ Known limitations:
 - After an Explorer restart (tested once with `taskkill` and `start explorer.exe` on build 26200) the widget recreated its window under the new taskbar within the same second, and it again stayed visible over the Start menu.
 - To follow the notification area the widget reads the window rectangle of `TrayNotifyWnd` (read-only queries, every 2 s), so it moves when tray icons come and go.
 - Foreground and window-order notifications use out-of-context WinEvent hooks. When the taskbar covers the widget, for example after the Start menu closes, it restores its own window order without taking focus; repeated notifications are coalesced and the 2 s check remains as a fallback. Only overlapping shell panel rectangles prevent that restoration. Full-screen, auto-hide and menu rules still apply. Some machines report a busy notification state all the time, so a busy state alone does not hide the widget: the foreground must also be an ordinary application window covering the whole monitor of the taskbar. The taskbar, the desktop and the widget's own windows never count.
-- The widget makes no network connections and starts no subprocesses. It reads one registry value (the light/dark setting) and writes only `widget_pos.json` and a small error log (capped at 64 KB) into the data folder.
+- The widget makes no network connections and starts no subprocesses. It reads one registry value (the light/dark setting), `data/usage.json` and, read-only, the tail of the newest Codex session logs, and it writes only `widget_pos.json` and a small error log (capped at 64 KB) into the data folder. Looking for the newest Codex session log stats the files of the last 14 date folders at most once a minute (about 2 ms with 1,200 session logs); reading takes at most 1 MB from the end of a log.
 - The plugin calls five Claude Code APIs (`session.usage`, `session.id`, `clock.now`, `fs.read`, `fs.write`), hooks only `session.start` and `session.measure`, and writes only `usage.json` in the folder you configured. Every hook runs the engine's own handling first, and a failure inside the plugin is swallowed, so it cannot change how a session behaves.
 
 `usage.json` looks like this (`resets_at` is Unix seconds, `observed_at` is when the value was last confirmed):
@@ -177,7 +212,7 @@ Known limitations:
 | `usage_widget.py` | The taskbar widget |
 | `plugins/.claude-plugin/marketplace.json` | Local marketplace that lists the plugin |
 | `plugins/usage-feed/` | The Claude Code plugin: `hooks/register.ts` and its tests in `tests/` |
-| `tests/` | Widget tests: window events, taskbar ownership and window recovery, full-screen detection |
+| `tests/` | Widget tests: window events, taskbar ownership and window recovery, full-screen detection, the Codex session-log reader and the two-block display |
 
 The plugin has 53 tests that run on Claude Code's own test kit:
 

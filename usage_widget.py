@@ -7,7 +7,7 @@
 任务栏一起抬升层级。对资源管理器窗口只读查询；跨线程所有权会连接输入队列，主线程
 不能阻塞。
 
-运行：pythonw usage_widget.py [--data-dir DIR]
+运行：pythonw usage_widget.py [--data-dir DIR] [--no-codex] [--codex-home DIR]
 测试用参数：--exit-after SEC、--selftest-render OUTDIR、--selftest-gdi N
 
 代码分三层：
@@ -19,6 +19,7 @@
 import collections
 import ctypes
 import ctypes.wintypes as wintypes
+import datetime
 import functools
 import json
 import math
@@ -83,6 +84,13 @@ PCT_W = 34
 GAP_PCT_RESET = 6
 RESET_W = 40
 MARGIN_R = 2
+BLOCK_GAP = 12
+# 双栏：名称在进度条上方。行字号、槽高与页眉都比单栏略小，腾出页眉那一条。
+DUAL_HEADER_H = 12
+DUAL_HEADER_FONT_PX = 10
+DUAL_FONT_PX = 11
+DUAL_BAR_H = 6
+PROVIDER_TAGS = ("Claude", "Codex")
 TRAY_GAP = 2
 MIN_HEIGHT_PX = 12
 MIN_FONT_PX = 6
@@ -314,11 +322,322 @@ class SnapshotReader:
 
 
 # ---------------------------------------------------------------------------
+# Codex rate limits (read-only)
+# 只读本地会话日志尾部的 rate_limits。用户提示行不解析、不保存、不写入原因。
+# ---------------------------------------------------------------------------
+
+CODEX_SCAN_DAYS = 14
+CODEX_RESCAN_SECONDS = 60.0
+CODEX_TAIL_BYTES = 1024 * 1024
+CODEX_MAX_CANDIDATES = 5
+CODEX_WINDOW_KEYS = {300: "five_hour", 10080: "seven_day"}
+# 当前快照的观测时间超前时钟超过这个秒数时，视为时钟曾拨快后又拨回，不再用“更旧”挡住新记录。
+CODEX_FUTURE_TOLERANCE_SECONDS = 300.0
+
+
+def codex_home(override=None):
+    """override，否则环境变量 CODEX_HOME，否则 ~/.codex。"""
+    if override is not None:
+        return override
+    env_home = os.environ.get("CODEX_HOME")
+    if env_home:
+        return env_home
+    return os.path.join(os.path.expanduser("~"), ".codex")
+
+
+def _unix_from_iso(value):
+    """ISO 8601 转 Unix 秒。尾部 Z 当作 UTC；无效或缺失返回 None。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _codex_window(raw, observed_at, default_key):
+    """解析 primary 或 secondary。无效返回 (None, None)。"""
+    if not isinstance(raw, dict):
+        return None, None
+    pct = _finite(raw.get("used_percent"))
+    if pct is None or pct < 0:
+        return None, None
+    resets = _finite(raw.get("resets_at"))
+    if resets is None:
+        # 没有 resets_at 时，才用观测时刻加 resets_in_seconds
+        delta = _finite(raw.get("resets_in_seconds"))
+        if delta is None or observed_at is None:
+            return None, None
+        resets = observed_at + delta
+    if resets <= 0:
+        return None, None
+    key = default_key
+    minutes = _finite(raw.get("window_minutes"))
+    if minutes is not None:
+        try:
+            mapped = CODEX_WINDOW_KEYS.get(int(minutes))
+        except (OverflowError, ValueError):
+            mapped = None
+        if mapped is not None:
+            key = mapped
+    stamped = observed_at if observed_at is not None else 0.0
+    return key, Win(pct, resets, stamped)
+
+
+def parse_codex_rate_limits(line_text):
+    """解析一行日志。不是 token_count，或两个窗口都无效时返回 None。"""
+    try:
+        doc = json.loads(line_text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    payload = doc.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    limits = payload.get("rate_limits")
+    if not isinstance(limits, dict):
+        return None
+    # 只认缺省、null 或 codex。别的 limit_id 是以后的另一个桶，这里当作没有这条记录。
+    if "limit_id" in limits and limits.get("limit_id") not in (None, "codex"):
+        return None
+    observed_at = _unix_from_iso(doc.get("timestamp"))
+    snapshot = {"five_hour": None, "seven_day": None}
+    for name, default_key in (("primary", "five_hour"), ("secondary", "seven_day")):
+        key, win = _codex_window(limits.get(name), observed_at, default_key)
+        if key in snapshot and win is not None:
+            snapshot[key] = win
+    if snapshot["five_hour"] is None and snapshot["seven_day"] is None:
+        return None
+    return snapshot
+
+
+def _numeric_child_dirs(path):
+    """子目录里纯数字的 (整数值, 路径)。读失败或名称不是数字则跳过。"""
+    found = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                name = entry.name
+                if not name.isascii() or not name.isdigit():
+                    continue
+                try:
+                    number = int(name)
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except (OSError, ValueError):
+                    continue
+                found.append((number, entry.path))
+    except OSError:
+        return []
+    return found
+
+
+def find_codex_rollouts(sessions_dir, days=CODEX_SCAN_DAYS, limit=CODEX_MAX_CANDIDATES):
+    """最新 days 个日期目录里的 rollout-*.jsonl，按 mtime 从新到旧，最多 limit 个。"""
+    if days <= 0 or limit <= 0:
+        return []
+    day_folders = []
+    for year, year_path in _numeric_child_dirs(sessions_dir):
+        for month, month_path in _numeric_child_dirs(year_path):
+            for day, day_path in _numeric_child_dirs(month_path):
+                day_folders.append((year, month, day, day_path))
+    day_folders.sort(reverse=True)
+    ranked = []
+    for _year, _month, _day, folder in day_folders[:days]:
+        try:
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        # 目录项时间在文件被别的进程追加打开时可能滞后。
+                        # os.stat 会打开文件，拿到当前的 mtime。
+                        mtime = os.stat(entry.path).st_mtime
+                    except OSError:
+                        continue
+                    ranked.append((mtime, entry.path))
+        except OSError:
+            continue
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [path for _mtime, path in ranked[:limit]]
+
+
+def _snapshot_observed_at(snapshot):
+    """各窗口观测时间的最大值。没有窗口时返回 None。"""
+    if not snapshot:
+        return None
+    latest = None
+    for key in ("five_hour", "seven_day"):
+        win = snapshot.get(key)
+        if win is None:
+            continue
+        if latest is None or win.observed_at > latest:
+            latest = win.observed_at
+    return latest
+
+
+def _snapshot_is_older(found, current, now=None):
+    """found 的观测时间是否早于已有快照。缺一边的时间时不算更旧。
+
+    当前快照的最新观测时间比 now 超前超过 CODEX_FUTURE_TOLERANCE_SECONDS 时，
+    视为时钟曾拨快后又校正，不再把文件里较新的记录当成更旧而拒绝。
+    """
+    if not current:
+        return False
+    current_at = _snapshot_observed_at(current)
+    found_at = _snapshot_observed_at(found)
+    if current_at is None or found_at is None:
+        return False
+    if (now is not None
+            and current_at - now > CODEX_FUTURE_TOLERANCE_SECONDS):
+        return False
+    return found_at < current_at
+
+
+def _stamp_observed(snapshot, mtime):
+    """时间戳缺失时占位 0.0，读到文件后换成该文件的 mtime。"""
+    stamped = {}
+    for key in ("five_hour", "seven_day"):
+        win = snapshot[key]
+        if win is not None and win.observed_at == 0.0:
+            win = win._replace(observed_at=mtime)
+        stamped[key] = win
+    return stamped
+
+
+def _read_codex_tail(path):
+    """只读文件尾部。返回 (snapshot 或 None, mtime)。调用方负责捕获 OSError。"""
+    file_stat = os.stat(path)
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        start = size - CODEX_TAIL_BYTES if size > CODEX_TAIL_BYTES else 0
+        handle.seek(start)
+        raw = handle.read(CODEX_TAIL_BYTES)
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    # 不是从文件头开始时，首行多半被截断，丢掉
+    if start != 0 and lines:
+        lines = lines[1:]
+    for line in reversed(lines):
+        if '"rate_limits"' not in line or '"token_count"' not in line:
+            continue
+        parsed = parse_codex_rate_limits(line)
+        if parsed is not None:
+            return _stamp_observed(parsed, file_stat.st_mtime), file_stat.st_mtime
+    return None, file_stat.st_mtime
+
+
+class CodexReader:
+    """按日期目录找 rollout，只在最新文件签名变化时重读尾部。"""
+
+    def __init__(self, home=None, clock=time.time):
+        self.home = codex_home(home)
+        self.clock = clock
+        self.available = False
+        self.snapshot = None
+        self.last_reason = ""
+        self.source_path = None
+        self._candidates = None
+        self._last_scan = None
+        self._signature = None
+
+    def refresh(self, force=False):
+        """返回快照是否变化。任何 OSError / ValueError 都吞掉，不把文件内容写进原因。"""
+        try:
+            return self._refresh(force)
+        except (OSError, ValueError):
+            return False
+
+    def _refresh(self, force):
+        sessions = os.path.join(self.home, "sessions")
+        self.available = os.path.isdir(sessions)
+        if not self.available:
+            changed = self.snapshot is not None
+            self.snapshot = None
+            self.last_reason = "no_codex"
+            self.source_path = None
+            self._candidates = None
+            self._last_scan = None
+            self._signature = None
+            return changed
+
+        now = self.clock()
+        # 时钟回拨时上次扫描时间在未来，也要重新扫，否则候选列表会一直过期。
+        if (force or self._candidates is None or self._last_scan is None
+                or now < self._last_scan
+                or now - self._last_scan >= CODEX_RESCAN_SECONDS):
+            self._candidates = find_codex_rollouts(sessions)
+            self._last_scan = now
+
+        if not self._candidates:
+            self.last_reason = "no_rate_limits"
+            self._signature = None
+            return False
+
+        newest = self._candidates[0]
+        signature = None
+        try:
+            newest_stat = os.stat(newest)
+            signature = (newest, newest_stat.st_mtime_ns, newest_stat.st_size)
+        except OSError:
+            signature = None
+        if not force and signature is not None and signature == self._signature:
+            return False
+
+        found = None
+        found_path = None
+        for path in self._candidates:
+            try:
+                parsed, _mtime = _read_codex_tail(path)
+            except (OSError, ValueError):
+                continue
+            if parsed is None:
+                continue
+            found = parsed
+            found_path = path
+            break
+
+        if signature is not None:
+            self._signature = signature
+        # 不拿更旧的观测时间盖掉已有快照。强制刷新时允许退回旧记录。
+        # 当前快照的观测时间远在未来时，时钟校正后的新记录也要接受。
+        if (found is not None and not force
+                and _snapshot_is_older(found, self.snapshot, now)):
+            self.last_reason = ""
+            return False
+        if found is None:
+            self.last_reason = "no_rate_limits"
+            return False
+        changed = found != self.snapshot
+        self.snapshot = found
+        self.source_path = found_path
+        self.last_reason = ""
+        return changed
+
+
+# ---------------------------------------------------------------------------
 # 纯函数层：显示状态、文字、显示元组
 # ---------------------------------------------------------------------------
 
 RowView = collections.namedtuple(
     "RowView", ["label", "state", "fill", "tier", "pct_text", "reset_text"])
+BlockView = collections.namedtuple("BlockView", ["tag", "rows"])
 Display = collections.namedtuple(
     "Display", ["kind", "rows", "theme", "scale", "width", "height"])
 
@@ -409,6 +728,44 @@ def pixel_columns(scale):
     return {name: (scaled(lo, scale), scaled(hi, scale)) for name, (lo, hi) in columns.items()}
 
 
+def dual_block_columns():
+    """一个提供方块内各列相对块起点的逻辑像素 (左, 右)，以及块宽。
+
+    列与单栏相同，名称画在进度条上方，不再占左侧一列。
+    """
+    columns = {}
+    x = 0
+    for name, width, gap_after in (
+        ("label", LABEL_W, GAP_LABEL_BAR),
+        ("bar", BAR_W, GAP_BAR_PCT),
+        ("pct", PCT_W, GAP_PCT_RESET),
+        ("reset", RESET_W, 0),
+    ):
+        columns[name] = (x, x + width)
+        x += width + gap_after
+    return columns, x
+
+
+def dual_logical_width():
+    """双栏总宽（逻辑像素）：左边距 + 块 + 块间隙 + 块 + 右边距。"""
+    _columns, block_width = dual_block_columns()
+    return MARGIN_L + block_width + BLOCK_GAP + block_width + MARGIN_R
+
+
+def dual_pixel_columns(scale):
+    """两个块各自的像素列 (左, 右)。每条边界单独取整。"""
+    columns, block_width = dual_block_columns()
+    blocks = []
+    origin = MARGIN_L
+    for _index in range(len(PROVIDER_TAGS)):
+        blocks.append({
+            name: (scaled(origin + lo, scale), scaled(origin + hi, scale))
+            for name, (lo, hi) in columns.items()
+        })
+        origin += block_width + BLOCK_GAP
+    return blocks
+
+
 def window_height(taskbar_rect, scale):
     """小窗高度：标称 40 逻辑像素，任务栏放不下时取 任务栏高度 - 4。"""
     _left, top, _right, bottom = taskbar_rect
@@ -431,29 +788,70 @@ def render_metrics(scale, height):
     }
 
 
+def dual_render_metrics(scale, height):
+    """双栏的页眉高度、行高、字号与进度槽。单栏的 render_metrics 不走这里。"""
+    nominal_height = max(1, scaled(LOGICAL_H, scale))
+    vscale = min(1.0, height / float(nominal_height))
+    header_height = scaled(DUAL_HEADER_H * vscale, scale)
+    return {
+        "vscale": vscale,
+        "header_height": header_height,
+        "row_height": (height - header_height) / 2.0,
+        "font_px": max(MIN_FONT_PX, scaled(DUAL_FONT_PX * vscale, scale)),
+        "header_font_px": max(MIN_FONT_PX, scaled(DUAL_HEADER_FONT_PX * vscale, scale)),
+        "bar_height": max(2, scaled(DUAL_BAR_H * vscale, scale)),
+        "bar_radius": max(1, scaled(BAR_R * vscale, scale)),
+    }
+
+
 def display_width(kind, scale, height):
-    """小窗宽度（像素）：数据行按列布局算，无数据时按两行文字的实际宽度算。"""
+    """小窗宽度（像素）：数据行按列布局算，双栏按两块加间隙算，无数据时按两行文字的实际宽度算。"""
     if kind == "nodata":
         font = get_font(render_metrics(scale, height)["font_px"])
         text_width = int(math.ceil(max(font.getlength(line) for line in NODATA_LINES)))
         return scaled(MARGIN_L, scale) + text_width + scaled(MARGIN_R, scale)
+    if kind == "dual":
+        return scaled(dual_logical_width(), scale)
     return scaled(logical_columns()[1], scale)
 
 
-def build_display(snapshot, now, theme, scale, height):
+def _window_pair(snapshot):
+    """快照里的 (5h, 7d)；没有快照或窗口缺失时是 None。"""
+    five = snapshot.get("five_hour") if snapshot else None
+    seven = snapshot.get("seven_day") if snapshot else None
+    return five, seven
+
+
+def _metric_rows(five, seven, now):
+    return (build_row("5h", five, now, False), build_row("7d", seven, now, True))
+
+
+def build_display(snapshot, now, theme, scale, height, codex=None, codex_available=False):
     """把快照与当前时间整理成不可变的显示元组；元组相等就不用重绘。
 
     填充长度由取整后的百分比决定，这样元组相等一定意味着画面相同。宽度由内容、
     scale 与高度推出，放进元组是为了让尺寸变化也触发重绘。
+    codex_available 为假时只画 Claude，结果与原来相同。为真时左 Claude、右 Codex；
+    两边都没有任何窗口时仍是无数据。
     """
-    five = snapshot.get("five_hour") if snapshot else None
-    seven = snapshot.get("seven_day") if snapshot else None
-    if five is None and seven is None:
+    five, seven = _window_pair(snapshot)
+    if not codex_available:
+        if five is None and seven is None:
+            width = display_width("nodata", scale, height)
+            return Display("nodata", NODATA_LINES, theme, scale, width, height)
+        rows = _metric_rows(five, seven, now)
+        width = display_width("data", scale, height)
+        return Display("data", rows, theme, scale, width, height)
+    codex_five, codex_seven = _window_pair(codex)
+    if five is None and seven is None and codex_five is None and codex_seven is None:
         width = display_width("nodata", scale, height)
         return Display("nodata", NODATA_LINES, theme, scale, width, height)
-    rows = (build_row("5h", five, now, False), build_row("7d", seven, now, True))
-    width = display_width("data", scale, height)
-    return Display("data", rows, theme, scale, width, height)
+    blocks = (
+        BlockView(PROVIDER_TAGS[0], _metric_rows(five, seven, now)),
+        BlockView(PROVIDER_TAGS[1], _metric_rows(codex_five, codex_seven, now)),
+    )
+    width = display_width("dual", scale, height)
+    return Display("dual", blocks, theme, scale, width, height)
 
 
 def rect_inside(inner, outer):
@@ -578,10 +976,44 @@ def _compose_bar(width, height, radius, fill_width, track_rgba, fill_rgba):
 
 
 def _draw_text(draw, font, x, center_y, text, ink, align):
-    """按数字字形高度垂直居中（以基线定位），align 为 "l" 或 "r"。"""
+    """按数字字形高度垂直居中（以基线定位），align 为 "l"、"r" 或 "c"。"""
     digit_top = font.getbbox("0", anchor="ls")[1]
     baseline = int(math.floor(center_y - digit_top / 2.0 + 0.5))
-    draw.text((x, baseline), text, font=font, fill=ink, anchor="ls" if align == "l" else "rs")
+    if align == "l":
+        anchor = "ls"
+    elif align == "c":
+        anchor = "ms"
+    else:
+        anchor = "rs"
+    draw.text((x, baseline), text, font=font, fill=ink, anchor=anchor)
+
+
+def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rgba, row_height, origin=0.0):
+    """画一个块里的两行：标签、进度条、百分比、重置时间。
+
+    origin 为 0 时行中心与原来的单栏相同。双栏传入页眉高度，两行排在页眉下面。
+    """
+    bar_left, bar_right = edges["bar"]
+    bar_width = bar_right - bar_left
+    bar_height = metrics["bar_height"]
+    bar_radius = metrics["bar_radius"]
+    for index, row in enumerate(rows):
+        center = origin + (index + 0.5) * row_height
+        stale = row.state == "stale"
+        ink = text_rgb + (TEXT_ALPHA_STALE if stale else TEXT_ALPHA,)
+        _draw_text(text_draw, font, edges["label"][0], center, row.label, ink, "l")
+        fill_rgba = None
+        fill_width = 0
+        if row.state in ("normal", "stale"):
+            fill_width = int(math.floor(row.fill * bar_width / 100.0 + 0.5))
+            fill_rgba = TIER_RGB[row.tier] + (FILL_ALPHA_STALE if stale else FILL_ALPHA,)
+        top = int(math.floor(center - bar_height / 2.0 + 0.5))
+        canvas.paste(
+            _compose_bar(bar_width, bar_height, bar_radius, fill_width, track_rgba, fill_rgba),
+            (bar_left, top))
+        _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, ink, "r")
+        if row.reset_text:
+            _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")
 
 
 def render_display(display):
@@ -611,29 +1043,22 @@ def render_display(display):
         for index, line in enumerate(display.rows):
             _draw_text(text_draw, font, left, (index + 0.5) * row_height, line,
                        text_rgb + (TEXT_ALPHA,), "l")
+    elif display.kind == "dual":
+        dual = dual_render_metrics(scale, height)
+        row_font = get_font(dual["font_px"])
+        header_font = get_font(dual["header_font_px"])
+        header_height = dual["header_height"]
+        for block, edges in zip(display.rows, dual_pixel_columns(scale)):
+            # 名称水平落在该块进度条列的正中，垂直落在页眉带的正中。
+            bar_left, bar_right = edges["bar"]
+            tag_alpha = TEXT_ALPHA if any(row.state == "normal" for row in block.rows) else TEXT_ALPHA_STALE
+            _draw_text(text_draw, header_font, (bar_left + bar_right) / 2.0, header_height / 2.0,
+                       block.tag, text_rgb + (tag_alpha,), "c")
+            _draw_rows(canvas, text_draw, row_font, block.rows, edges, dual, text_rgb, track_rgba,
+                       dual["row_height"], header_height)
     else:
         edges = pixel_columns(scale)
-        bar_left, bar_right = edges["bar"]
-        bar_width = bar_right - bar_left
-        bar_height = metrics["bar_height"]
-        bar_radius = metrics["bar_radius"]
-        for index, row in enumerate(display.rows):
-            center = (index + 0.5) * row_height
-            stale = row.state == "stale"
-            ink = text_rgb + (TEXT_ALPHA_STALE if stale else TEXT_ALPHA,)
-            _draw_text(text_draw, font, edges["label"][0], center, row.label, ink, "l")
-            fill_rgba = None
-            fill_width = 0
-            if row.state in ("normal", "stale"):
-                fill_width = int(math.floor(row.fill * bar_width / 100.0 + 0.5))
-                fill_rgba = TIER_RGB[row.tier] + (FILL_ALPHA_STALE if stale else FILL_ALPHA,)
-            top = int(math.floor(center - bar_height / 2.0 + 0.5))
-            canvas.paste(
-                _compose_bar(bar_width, bar_height, bar_radius, fill_width, track_rgba, fill_rgba),
-                (bar_left, top))
-            _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, ink, "r")
-            if row.reset_text:
-                _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")
+        _draw_rows(canvas, text_draw, font, display.rows, edges, metrics, text_rgb, track_rgba, row_height)
     canvas.alpha_composite(text_layer)
     red, green, blue, alpha = canvas.split()
     return Image.merge("RGBA", (red, green, blue, alpha.point(_ALPHA_FLOOR)))
@@ -670,7 +1095,12 @@ def premultiply_bgra(image):
 
 SAMPLE_SCALES = (1.0, 1.25, 1.5)
 SAMPLE_COMBOS = tuple((theme, scale) for theme in ("light", "dark") for scale in SAMPLE_SCALES)
-SAMPLE_STATES = ("nodata", "green", "amber", "red", "full", "stale", "reset")
+DUAL_SAMPLE_STATES = (
+    "dual_green", "dual_mixed", "dual_codex_reset", "dual_claude_none",
+)
+SAMPLE_STATES = (
+    "nodata", "green", "amber", "red", "full", "stale", "reset",
+) + DUAL_SAMPLE_STATES
 SHEET_BACKGROUNDS = (
     ("light grey #F3F3F3", (0xF3, 0xF3, 0xF3)),
     ("dark grey #202020", (0x20, 0x20, 0x20)),
@@ -702,6 +1132,38 @@ def _sample_snapshot(name, now):
     if name == "reset":
         return {"five_hour": win(80, resets=now - 10.0, observed=now - 70.0),
                 "seven_day": win(55, resets_7d)}
+    if name in ("dual_green", "dual_codex_reset"):
+        # 左侧 Claude：与 green 样张相同
+        return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
+    if name == "dual_mixed":
+        # 左侧 Claude：与 amber 样张相同，观测时间仍是新鲜的
+        return {"five_hour": win(65), "seven_day": win(33, resets_7d)}
+    if name == "dual_claude_none":
+        return None
+    raise ValueError("unknown sample state: %s" % name)
+
+
+def _sample_codex_snapshot(name, now):
+    """双栏样张的 Codex 侧。时间基准与 _sample_snapshot 相同。"""
+    resets_5h = time.mktime((2026, 10, 2, 16, 50, 0, 0, 0, -1))
+    resets_7d = time.mktime((2026, 10, 4, 12, 0, 0, 0, 0, -1))
+    fresh = now - 60.0
+
+    def win(pct, resets=resets_5h, observed=fresh):
+        return Win(float(pct), resets, observed)
+
+    if name == "dual_green":
+        return {"five_hour": win(3), "seven_day": win(36, resets_7d)}
+    if name == "dual_mixed":
+        # 右侧 Codex：与 stale 样张相同
+        old = now - 31 * 60.0
+        return {"five_hour": win(65, observed=old), "seven_day": win(33, resets_7d, old)}
+    if name == "dual_codex_reset":
+        # 5h 已过重置点，7d 仍有效（与 reset 样张的两行对应）
+        return {"five_hour": win(80, resets=now - 10.0, observed=now - 70.0),
+                "seven_day": win(55, resets_7d)}
+    if name == "dual_claude_none":
+        return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
     raise ValueError("unknown sample state: %s" % name)
 
 
@@ -709,7 +1171,12 @@ def sample_display(name, theme, scale):
     """样张用的显示元组。时间固定，样张在任何时区、任何日期下都一样。"""
     now = time.mktime((2026, 10, 2, 15, 0, 0, 0, 0, -1))
     height = scaled(LOGICAL_H, scale)
-    return build_display(_sample_snapshot(name, now), now, theme, scale, height)
+    snapshot = _sample_snapshot(name, now)
+    if name not in DUAL_SAMPLE_STATES:
+        return build_display(snapshot, now, theme, scale, height)
+    return build_display(
+        snapshot, now, theme, scale, height,
+        codex=_sample_codex_snapshot(name, now), codex_available=True)
 
 
 def sample_filename(index, name, theme, scale):
@@ -1552,6 +2019,12 @@ class WidgetApp:
         self.log = log
         self.data_dir = opts.data_dir
         self.reader = SnapshotReader(os.path.join(self.data_dir, SNAPSHOT_NAME))
+        if opts.no_codex:
+            self.codex = None
+        else:
+            self.codex = CodexReader(opts.codex_home)
+        # 同一种 Codex 原因只记一次；原因变回空串后，下次再出现才重新记。
+        self._codex_log_reason = ""
         self.pos_path = os.path.join(self.data_dir, POS_FILE_NAME)
         self.mode, self.offset = load_position(self.pos_path)
         self.light = read_light_theme()
@@ -1898,7 +2371,16 @@ class WidgetApp:
         scale = self.w32.scale_for(self.hwnd)
         height = window_height(rect, scale)
         theme = "light" if self.light else "dark"
-        display = build_display(self._current_snapshot(), time.time(), theme, scale, height)
+        # 句柄自测改写 snapshot_override 时仍走单提供方，避免把 Codex 画进自测画面。
+        if self.snapshot_override is not None:
+            codex_snapshot = None
+            codex_available = False
+        else:
+            codex_snapshot = None if self.codex is None else self.codex.snapshot
+            codex_available = bool(self.codex and self.codex.available)
+        display = build_display(
+            self._current_snapshot(), time.time(), theme, scale, height,
+            codex=codex_snapshot, codex_available=codex_available)
         tray = self.w32.tray_notify_rect() if self.mode == MODE_AUTO else None
         geom = compute_layout(rect, edge, scale, display.width, self.mode, self.offset, tray)
         self.scale = scale
@@ -1939,7 +2421,27 @@ class WidgetApp:
         reason = self.reader.last_reason
         if reason and reason != "missing":
             self.log.log("SnapshotInvalid", reason)
+        self._poll_codex(force)
         self.refresh_view()
+
+    def _poll_codex(self, force):
+        """刷新 Codex。异常只记日志，不打断已经完成的 Claude 刷新，也不挡住后面的重绘。"""
+        reader = self.codex
+        if reader is None:
+            return
+        try:
+            reader.refresh(force=force)
+        except Exception as exc:
+            self._log_exception(exc)
+            return
+        reason = reader.last_reason
+        if reason == "":
+            self._codex_log_reason = ""
+            return
+        if reason == "no_codex" or reason == self._codex_log_reason:
+            return
+        self._codex_log_reason = reason
+        self.log.log("CodexRead", reason)
 
     def poll_theme(self):
         light = read_light_theme()
@@ -2148,7 +2650,9 @@ class WidgetApp:
 # ---------------------------------------------------------------------------
 
 Options = collections.namedtuple(
-    "Options", ["data_dir", "exit_after", "selftest_render", "selftest_gdi"])
+    "Options",
+    ["data_dir", "exit_after", "selftest_render", "selftest_gdi", "no_codex", "codex_home"],
+    defaults=(False, None))
 
 
 def parse_args(argv):
@@ -2157,10 +2661,16 @@ def parse_args(argv):
     exit_after = None
     render_dir = None
     gdi_count = None
-    names = ("--data-dir", "--exit-after", "--selftest-render", "--selftest-gdi")
+    no_codex = False
+    codex_home_arg = None
+    names = ("--data-dir", "--exit-after", "--selftest-render", "--selftest-gdi", "--codex-home")
     index = 0
     while index < len(argv):
         name, equals, inline = argv[index].partition("=")
+        if name == "--no-codex":
+            no_codex = True
+            index += 1
+            continue
         if name not in names:
             index += 1
             continue
@@ -2176,6 +2686,8 @@ def parse_args(argv):
             data_dir = os.path.abspath(value)
         elif name == "--selftest-render" and value:
             render_dir = os.path.abspath(value)
+        elif name == "--codex-home" and value:
+            codex_home_arg = os.path.abspath(value)
         elif name == "--exit-after":
             try:
                 seconds = float(value)
@@ -2190,7 +2702,7 @@ def parse_args(argv):
                 continue
             if count >= 1:
                 gdi_count = count
-    return Options(data_dir, exit_after, render_dir, gdi_count)
+    return Options(data_dir, exit_after, render_dir, gdi_count, no_codex, codex_home_arg)
 
 
 def run_app(opts, log):

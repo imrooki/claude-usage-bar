@@ -21,17 +21,63 @@ usage_widget.py: reads data/usage.json every 15 s and draws the two bars
 ```
 
 - The numbers come only from Claude Code's documented [mods API](https://code.claude.com/docs/en/plugins/mods/overview). The project never reads your login token, never calls an unofficial endpoint and adds no requests of its own.
-- Numbers change only while a Claude Code session is active, because they come from the last API response of a session. After 30 minutes without an update the bars fade and an age such as `45m` appears. Once a window's reset time has passed its row shows `reset` until fresh data arrives.
+- Numbers change only while a Claude Code session is active, because they come from the last API response of a session. After 30 minutes without an update the bars and text fade; no data-age label is shown. Once a window's reset time has passed its row shows `reset` until fresh data arrives.
 - With several sessions open, the plugin merges readings instead of blindly overwriting: inside one window period the usage can only go up, so an idle session's older reading does not replace a newer one, and a later reset time means a new period. There is no file lock, so in a rare race one update can be lost until the next event.
 
 ## Requirements
 
-- Windows 11. Developed and tested on build 26100 with the taskbar at the bottom and 100 % display scaling. Only the primary taskbar is handled, and only a bottom or top taskbar.
+- Windows 11. Developed on build 26100 and tested on build 26200, with the taskbar at the bottom and 100 % display scaling. Only the primary taskbar is handled, and only a bottom or top taskbar.
 - Python 3 with [Pillow](https://pypi.org/project/pillow/) (developed with Python 3.13 and Pillow 11). The widget uses nothing else outside the standard library.
-- Claude Code with mod support. Claude Code's documentation says mods need v2.1.287 or later; this project was tested in the Claude desktop app's Code tab with Claude Code 2.1.286.
+- Claude Code with mod support. Claude Code's documentation says mods need v2.1.287 or later; this project was tested in the Claude desktop app's Code tab with Claude Code 2.1.286, with the plugin loaded through `CLAUDE_CODE_PLUGIN_DIRS` (see Install).
 - A Claude Pro or Max plan. Rate-limit windows are only reported for subscription plans.
 
 ## Install
+
+### Let an AI assistant deploy it
+
+Paste this prompt into Claude Code (or another coding assistant that can run commands on your Windows machine):
+
+```text
+Deploy the claude-usage-bar project on this Windows 11 machine.
+
+Repository: https://github.com/imrooki/claude-usage-bar
+Goal: a transparent taskbar widget shows my Claude plan usage (5-hour and 7-day
+windows). The numbers come from the usage-feed Claude Code plugin in that repository,
+which writes data/usage.json; usage_widget.py draws them.
+
+If an earlier copy of this project or plugin is already set up on this machine,
+update it in place (pull the latest version and reuse its folder and settings)
+instead of creating a second copy.
+
+1. Clone the repository into a local folder that is not inside OneDrive and not on a
+   network share (the plugin refuses such paths). Create the "data" folder inside it.
+2. Make sure Python 3 with Pillow is available (pip install pillow). Tell me which
+   python.exe and pythonw.exe you will use.
+3. Validate the plugin: claude plugin validate <repo>\plugins\usage-feed must pass.
+4. Load the plugin for Claude desktop app sessions with the documented
+   CLAUDE_CODE_PLUGIN_DIRS setting. Back up %USERPROFILE%\.claude\settings.json, then
+   merge these keys into it without removing any existing key, and show me the diff:
+     "env": { "CLAUDE_CODE_PLUGIN_DIRS": "<absolute path of <repo>\plugins\usage-feed>" }
+     "pluginConfigs": { "usage-feed@inline": { "options": {
+         "dataDir": "<absolute path of <repo>\data, written with forward slashes>" } } }
+   If usage-feed@usage-bar-local is installed from a plugin marketplace, disable it:
+   claude plugin disable usage-feed@usage-bar-local
+5. Start the widget without a console window: pythonw "<repo>\usage_widget.py"
+   It runs as a single instance.
+6. Ask me to open a new Claude Code session and send one message. Then check that
+   <repo>\data\usage.json was written by that session (its session_id) and that the
+   widget shows the numbers.
+7. Only if I confirm: create a shortcut in my Startup folder (shell:startup) whose
+   target is pythonw.exe and whose argument is the full path of usage_widget.py in
+   quotes.
+
+Rules: use only the documented Claude Code plugin mechanisms. Do not read or copy
+login tokens or cookies, do not call any unofficial usage endpoint, and do not send
+extra model requests to refresh usage. Do not commit or push anything. At the end,
+list every file and setting you changed.
+```
+
+### Install by hand
 
 Clone the repository and create the folder that will hold the snapshot. It is git-ignored, so it does not exist after cloning.
 
@@ -42,40 +88,72 @@ mkdir data
 pip install pillow
 ```
 
-Register the local plugin marketplace and install the plugin. `dataDir` must be the full path of the `data` folder you just created, written with forward slashes.
+**Claude desktop app (Code tab).** Load the plugin from its folder with the documented `CLAUDE_CODE_PLUGIN_DIRS` setting, which is meant for sessions that the desktop app starts. Merge these keys into `%USERPROFILE%\.claude\settings.json`, keeping everything else in that file, and replace the paths with your own:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_PLUGIN_DIRS": "C:\\full\\path\\to\\claude-usage-bar\\plugins\\usage-feed"
+  },
+  "pluginConfigs": {
+    "usage-feed@inline": {
+      "options": { "dataDir": "C:/full/path/to/claude-usage-bar/data" }
+    }
+  }
+}
+```
+
+In testing with Claude Code 2.1.286, the copy installed from a plugin marketplace loaded but never wrote `usage.json` from desktop Code sessions, while the same plugin loaded through `CLAUDE_CODE_PLUGIN_DIRS` did. If you installed the marketplace copy earlier, disable it with `claude plugin disable usage-feed@usage-bar-local`; the folder copy overrides it in any case. When Claude Code loads the plugin from its folder it generates `tsconfig.json` and `.claude-plugin/types/` there; both are git-ignored.
+
+**Terminal only.** You can instead register the local marketplace and install the plugin:
 
 ```powershell
 claude plugin marketplace add ./plugins
 claude plugin install usage-feed@usage-bar-local --config dataDir=C:/full/path/to/claude-usage-bar/data
 ```
 
-The plugin accepts only a local absolute path. It refuses relative paths, network (UNC) paths and any path containing `onedrive`, and then writes nothing at all.
+Either way, `dataDir` must be the full path of the `data` folder, written with forward slashes. The plugin accepts only a local absolute path. It refuses relative paths, network (UNC) paths and any path containing `onedrive`, and then writes nothing at all.
 
-Open a new Claude Code session (or run `/reload-plugins` in an open one), then start the widget:
+Open a new Claude Code session, send one message, then start the widget:
 
 ```powershell
 pythonw usage_widget.py
 ```
 
+After the first completed turn, `data/usage.json` should carry that session's `session_id`. If it does not, start Claude Code with `--debug-file <path>` and look for `hooks module usage-feed@inline loaded` (or `usage-feed@usage-bar-local` for the marketplace copy) in that file.
+
 By default the widget reads `data/usage.json` next to the script. To use another folder pass `--data-dir <folder>`; it has to be the same folder you gave the plugin.
 
 To start it at login, put a shortcut in your Startup folder (press Win+R and run `shell:startup`) whose target is `pythonw.exe` and whose arguments are the full path of `usage_widget.py` in quotes. The widget runs as a single instance, so a second start exits at once.
+
+## Updating while using chat and Code
+
+Chat and Claude Code count toward the [same subscription limits](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work) when signed into the same account. A fresh Code reading therefore reflects the shared quota, including chat usage. The widget updates when the plugin receives those readings.
+
+The widget cannot continuously refresh account limits while only chat is active. `Refresh now` re-reads the local snapshot; it does not query the account. Old readings retain their original timestamps and fade after 30 minutes. For a current reading while Code is idle, use Claude's own usage page. The widget does not extract login tokens or add background account requests.
 
 ## Using the widget
 
 - **Drag** it sideways to move it. It then stays where you put it.
 - **Right-click** for the menu: `Refresh now`, `Snap to tray` (go back to following the notification area automatically) and `Quit`.
-- It hides itself while a full-screen app is running and while the taskbar is set to auto-hide.
+- It hides itself while a full-screen app is running (an ordinary application window covering the whole monitor of the taskbar) and while the taskbar is set to auto-hide. Clicking the taskbar or the desktop does not count as full screen.
+- It stays visible while the Start menu, Quick Settings or the notification overflow is open, and after a click on empty taskbar space. This was checked with screenshots on build 26200, opening Start and Quick Settings both by keyboard and by mouse.
 
 Known limitations:
 
 - Windows 11 does not let ordinary windows live inside the notification area, so the widget sits beside it, not inside.
 - After the right-click menu closes, keyboard focus stays on the widget until you click another window.
 - Only the primary monitor's taskbar is handled.
+- When Explorer restarts, the widget recreates its window under the new taskbar. This was tested with one real restart; two restarts within 30 s can leave the widget without an owner for up to about 30 s, during which an open Start menu covers it.
 
 ## Design notes
 
-- The widget is a separate top-level layered window with per-pixel transparency. It never attaches itself to the taskbar and never injects anything into Explorer, because a cross-process parent/child window would tie the two processes' input handling together. To follow the notification area it only reads the window rectangle of `TrayNotifyWnd` (read-only queries, every 2 s), so it moves when tray icons come and go.
+- The widget is a top-level layered window with per-pixel transparency, created with the primary taskbar (`Shell_TrayWnd`) as its owner through the documented `hWndParent` argument of `CreateWindowEx`. While the Start menu is open, Windows moves the taskbar into a higher window band than ordinary topmost windows, and it moves the taskbar's owned windows with it; an unowned topmost window stays hidden underneath. The widget is not a child window, and nothing is injected into Explorer.
+- Trade-off of the owner link: a cross-thread owner relationship attaches the input queues of the widget thread and the taskbar thread, so a hung widget could delay taskbar input. The widget therefore does only short work on its main thread (small file reads and small renders).
+- Ownership cannot be transferred after a window is created. When the taskbar window is replaced (for example after an Explorer restart), it destroys and recreates its own window, at most once every 30 s. If the widget started without an owner because no taskbar existed yet, it does the same once a taskbar appears. If creating the owned window failed and the widget fell back to an unowned one, it retries only for a different taskbar window or after the `TaskbarCreated` broadcast, so it does not flicker every 30 s. It does not use `GetWindow(GW_OWNER)` for that decision: on build 26200 that call returns no owner while the Start menu or a mouse-opened Quick Settings is showing, and the taskbar again once it closes, while the widget keeps following the taskbar. A mismatch there is only logged.
+- After an Explorer restart (tested once with `taskkill` and `start explorer.exe` on build 26200) the widget recreated its window under the new taskbar within the same second, and it again stayed visible over the Start menu.
+- To follow the notification area the widget reads the window rectangle of `TrayNotifyWnd` (read-only queries, every 2 s), so it moves when tray icons come and go.
+- Foreground and window-order notifications use out-of-context WinEvent hooks. When the taskbar covers the widget, for example after the Start menu closes, it restores its own window order without taking focus; repeated notifications are coalesced and the 2 s check remains as a fallback. Only overlapping shell panel rectangles prevent that restoration. Full-screen, auto-hide and menu rules still apply. Some machines report a busy notification state all the time, so a busy state alone does not hide the widget: the foreground must also be an ordinary application window covering the whole monitor of the taskbar. The taskbar, the desktop and the widget's own windows never count.
 - The widget makes no network connections and starts no subprocesses. It reads one registry value (the light/dark setting) and writes only `widget_pos.json` and a small error log (capped at 64 KB) into the data folder.
 - The plugin calls five Claude Code APIs (`session.usage`, `session.id`, `clock.now`, `fs.read`, `fs.write`), hooks only `session.start` and `session.measure`, and writes only `usage.json` in the folder you configured. Every hook runs the engine's own handling first, and a failure inside the plugin is swallowed, so it cannot change how a session behaves.
 
@@ -99,6 +177,7 @@ Known limitations:
 | `usage_widget.py` | The taskbar widget |
 | `plugins/.claude-plugin/marketplace.json` | Local marketplace that lists the plugin |
 | `plugins/usage-feed/` | The Claude Code plugin: `hooks/register.ts` and its tests in `tests/` |
+| `tests/` | Widget tests: window events, taskbar ownership and window recovery, full-screen detection |
 
 The plugin has 53 tests that run on Claude Code's own test kit:
 
@@ -107,9 +186,23 @@ claude plugin validate ./plugins/usage-feed
 claude plugin test ./plugins/usage-feed
 ```
 
+Widget regression tests run on Windows with Python and Pillow:
+
+```powershell
+python -B -m unittest discover -s tests -v
+```
+
+To also check real Windows event delivery, repeated reordering, window ownership and the real message loop, enable the native tests. They create only their own off-screen windows and do not operate the real taskbar:
+
+```powershell
+$env:CLAUDE_USAGE_NATIVE_TEST = '1'
+python -B -m unittest discover -s tests -v
+Remove-Item Env:CLAUDE_USAGE_NATIVE_TEST
+```
+
 ## Uninstall
 
-Choose `Quit` in the widget's right-click menu, delete the Startup shortcut if you made one, then remove the marketplace. This also uninstalls the plugin.
+Choose `Quit` in the widget's right-click menu and delete the Startup shortcut if you made one. If you load the plugin through `CLAUDE_CODE_PLUGIN_DIRS`, remove that key from `env` and the `usage-feed@inline` entry from `pluginConfigs` in `%USERPROFILE%\.claude\settings.json`. If you installed it from the marketplace, remove the marketplace, which also uninstalls the plugin:
 
 ```powershell
 claude plugin marketplace remove usage-bar-local

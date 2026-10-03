@@ -3,8 +3,9 @@
 
 上一行是 5 小时窗口，下一行是 7 天窗口，每行带百分比与重置时间。数据只来自
 <data-dir>\\usage.json（由别的程序写入）。本程序不联网、不起其它程序、不碰任何
-凭证文件；窗口是顶层分层窗口（逐像素 alpha），没有父窗口也没有所有者窗口，对资源
-管理器的窗口只读（类名、矩形、可见性）。
+凭证文件；窗口是无父窗口的顶层分层窗口（逐像素 alpha），以主任务栏为所有者，随
+任务栏一起抬升层级。对资源管理器窗口只读查询；跨线程所有权会连接输入队列，主线程
+不能阻塞。
 
 运行：pythonw usage_widget.py [--data-dir DIR]
 测试用参数：--exit-after SEC、--selftest-render OUTDIR、--selftest-gdi N
@@ -48,6 +49,7 @@ MAX_SNAPSHOT_BYTES = 1024 * 1024
 STALE_SECONDS = 1800
 SNAPSHOT_POLL_MS = 15000
 WINDOW_CHECK_MS = 2000
+OWNER_RECREATE_SECONDS = 30.0
 THEME_POLL_MS = 60000
 GDI_TICK_MS = 20
 GDI_SETTLE_MS = 1000
@@ -80,8 +82,6 @@ GAP_BAR_PCT = 6
 PCT_W = 34
 GAP_PCT_RESET = 6
 RESET_W = 40
-GAP_RESET_AGE = 4
-AGE_W = 28
 MARGIN_R = 2
 TRAY_GAP = 2
 MIN_HEIGHT_PX = 12
@@ -116,6 +116,16 @@ WS_EX_TOOLWINDOW = 0x80
 WS_EX_LAYERED = 0x80000
 WS_EX_NOACTIVATE = 0x08000000
 HWND_TOPMOST = -1
+GW_HWNDPREV = 3
+GW_OWNER = 4
+MAX_Z_ORDER_WINDOWS = 1024
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_REORDER = 0x8004
+OBJID_WINDOW = 0
+OBJID_CLIENT = -4
+CHILDID_SELF = 0
+WINEVENT_OUTOFCONTEXT = 0
+WINEVENT_SKIPOWNPROCESS = 2
 SWP_NOSIZE = 0x1
 SWP_NOMOVE = 0x2
 SWP_NOZORDER = 0x4
@@ -134,7 +144,9 @@ TPM_RIGHTBUTTON = 0x2
 TPM_NONOTIFY = 0x80
 TPM_RETURNCMD = 0x100
 DPI_CONTEXT_PER_MONITOR_V2 = -4
-HIDE_NOTIFICATION_STATES = frozenset({2, 3, 4})
+MONITOR_DEFAULTTONULL = 0
+BUSY_NOTIFICATION_STATE = 2
+HIDE_NOTIFICATION_STATES = frozenset({3, 4})
 SUPPORTED_EDGES = frozenset({ABE_TOP, ABE_BOTTOM})
 TOPMOST_SKIP_CLASSES = frozenset({
     "Windows.UI.Core.CoreWindow",
@@ -143,6 +155,14 @@ TOPMOST_SKIP_CLASSES = frozenset({
     "TopLevelWindowForOverflowXamlIsland",
     "XamlExplorerHostIslandWindow",
     "#32768",
+})
+# 前台是这些窗口时用户点的是任务栏或桌面本身，不是全屏应用；它们的矩形恰好等于
+# 任务栏或铺满显示器，只按矩形判断会把它们误当成全屏。
+SHELL_SURFACE_CLASSES = frozenset({
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "Progman",
+    "WorkerW",
 })
 
 WM_NULL = 0x0000
@@ -158,6 +178,8 @@ WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_CAPTURECHANGED = 0x0215
 WM_DPICHANGED = 0x02E0
+WM_APP_Z_ORDER = 0x8001
+WM_APP_RECREATE = 0x8002
 MA_NOACTIVATE = 3
 MK_LBUTTON = 0x0001
 SYSTEM_CHANGE_MESSAGES = frozenset({WM_DPICHANGED, WM_DISPLAYCHANGE, WM_SETTINGCHANGE})
@@ -298,7 +320,7 @@ class SnapshotReader:
 RowView = collections.namedtuple(
     "RowView", ["label", "state", "fill", "tier", "pct_text", "reset_text"])
 Display = collections.namedtuple(
-    "Display", ["kind", "rows", "age", "theme", "scale", "width", "height"])
+    "Display", ["kind", "rows", "theme", "scale", "width", "height"])
 
 
 def scaled(value, scale):
@@ -362,36 +384,12 @@ def build_row(label, win, now, seven_day):
         "%d%%" % display_percent(win.pct), reset_text(win.resets_at, seven_day))
 
 
-def format_age(seconds):
-    """年龄文字：小于 120 分钟按分钟向下取整，否则按小时向下取整。"""
-    minutes = int(seconds // 60)
-    if minutes < 120:
-        return "%dm" % max(minutes, 0)
-    return "%dh" % min(int(seconds // 3600), 999)
-
-
-def age_text(snapshot, now):
-    """较新的 observed_at 距今超过 STALE_SECONDS 才写年龄，否则（或无数据时）为空。"""
-    if not snapshot:
-        return ""
-    observed = [win.observed_at for win in snapshot.values() if win is not None]
-    if not observed:
-        return ""
-    age = now - max(observed)
-    if age <= STALE_SECONDS:
-        return ""
-    return format_age(age)
-
-
 # ---------------------------------------------------------------------------
-# 纯函数层：布局（右端锚定、宽度随内容变化）
+# 纯函数层：布局（右端锚定）
 # ---------------------------------------------------------------------------
 
-def logical_columns(has_age):
-    """按逻辑像素排出各列的 (左, 右)，返回 (字典, 总宽)。
-
-    年龄列只在有年龄文字时存在（间距 + 列宽），否则不占宽度。
-    """
+def logical_columns():
+    """按逻辑像素排出各列的 (左, 右)，返回 (字典, 总宽)。"""
     columns = {}
     x = MARGIN_L
     for name, width, gap_after in (
@@ -402,16 +400,12 @@ def logical_columns(has_age):
     ):
         columns[name] = (x, x + width)
         x += width + gap_after
-    if has_age:
-        x += GAP_RESET_AGE
-        columns["age"] = (x, x + AGE_W)
-        x += AGE_W
     return columns, x + MARGIN_R
 
 
-def pixel_columns(has_age, scale):
+def pixel_columns(scale):
     """各列的像素 (左, 右)。边界各自取整，所以相邻列之间不会因累计取整而错位。"""
-    columns, _total = logical_columns(has_age)
+    columns, _total = logical_columns()
     return {name: (scaled(lo, scale), scaled(hi, scale)) for name, (lo, hi) in columns.items()}
 
 
@@ -437,30 +431,29 @@ def render_metrics(scale, height):
     }
 
 
-def display_width(kind, has_age, scale, height):
+def display_width(kind, scale, height):
     """小窗宽度（像素）：数据行按列布局算，无数据时按两行文字的实际宽度算。"""
     if kind == "nodata":
         font = get_font(render_metrics(scale, height)["font_px"])
         text_width = int(math.ceil(max(font.getlength(line) for line in NODATA_LINES)))
         return scaled(MARGIN_L, scale) + text_width + scaled(MARGIN_R, scale)
-    return scaled(logical_columns(has_age)[1], scale)
+    return scaled(logical_columns()[1], scale)
 
 
 def build_display(snapshot, now, theme, scale, height):
     """把快照与当前时间整理成不可变的显示元组；元组相等就不用重绘。
 
     填充长度由取整后的百分比决定，这样元组相等一定意味着画面相同。宽度由内容、
-    scale 与高度推出，放进元组是为了让尺寸变化（例如年龄列出现）也触发重绘。
+    scale 与高度推出，放进元组是为了让尺寸变化也触发重绘。
     """
     five = snapshot.get("five_hour") if snapshot else None
     seven = snapshot.get("seven_day") if snapshot else None
     if five is None and seven is None:
-        width = display_width("nodata", False, scale, height)
-        return Display("nodata", NODATA_LINES, "", theme, scale, width, height)
+        width = display_width("nodata", scale, height)
+        return Display("nodata", NODATA_LINES, theme, scale, width, height)
     rows = (build_row("5h", five, now, False), build_row("7d", seven, now, True))
-    age = age_text(snapshot, now)
-    width = display_width("data", bool(age), scale, height)
-    return Display("data", rows, age, theme, scale, width, height)
+    width = display_width("data", scale, height)
+    return Display("data", rows, theme, scale, width, height)
 
 
 def rect_inside(inner, outer):
@@ -468,6 +461,12 @@ def rect_inside(inner, outer):
     return (inner[0] < inner[2] and inner[1] < inner[3]
             and outer[0] <= inner[0] and outer[1] <= inner[1]
             and inner[2] <= outer[2] and inner[3] <= outer[3])
+
+
+def rects_overlap(first, second):
+    """屏幕矩形是否有面积交集；边缘接触不算遮挡。"""
+    return (max(first[0], second[0]) < min(first[2], second[2])
+            and max(first[1], second[1]) < min(first[3], second[3]))
 
 
 def right_edge_x(taskbar_rect, scale, mode, offset, tray_rect):
@@ -613,7 +612,7 @@ def render_display(display):
             _draw_text(text_draw, font, left, (index + 0.5) * row_height, line,
                        text_rgb + (TEXT_ALPHA,), "l")
     else:
-        edges = pixel_columns(bool(display.age), scale)
+        edges = pixel_columns(scale)
         bar_left, bar_right = edges["bar"]
         bar_width = bar_right - bar_left
         bar_height = metrics["bar_height"]
@@ -635,10 +634,6 @@ def render_display(display):
             _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, ink, "r")
             if row.reset_text:
                 _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")
-        if display.age:
-            # 年龄列只在较新的数据也已过期时出现，所以一律用过期时的文字 alpha
-            _draw_text(text_draw, font, edges["age"][1], 0.5 * row_height, display.age,
-                       text_rgb + (TEXT_ALPHA_STALE,), "r")
     canvas.alpha_composite(text_layer)
     red, green, blue, alpha = canvas.split()
     return Image.merge("RGBA", (red, green, blue, alpha.point(_ALPHA_FLOOR)))
@@ -676,7 +671,6 @@ def premultiply_bgra(image):
 SAMPLE_SCALES = (1.0, 1.25, 1.5)
 SAMPLE_COMBOS = tuple((theme, scale) for theme in ("light", "dark") for scale in SAMPLE_SCALES)
 SAMPLE_STATES = ("nodata", "green", "amber", "red", "full", "stale", "reset")
-SAMPLE_STALE_AGE_LABEL = "28m"
 SHEET_BACKGROUNDS = (
     ("light grey #F3F3F3", (0xF3, 0xF3, 0xF3)),
     ("dark grey #202020", (0x20, 0x20, 0x20)),
@@ -715,12 +709,7 @@ def sample_display(name, theme, scale):
     """样张用的显示元组。时间固定，样张在任何时区、任何日期下都一样。"""
     now = time.mktime((2026, 10, 2, 15, 0, 0, 0, 0, -1))
     height = scaled(LOGICAL_H, scale)
-    display = build_display(_sample_snapshot(name, now), now, theme, scale, height)
-    if name == "stale":
-        # 年龄列用示例里的 28m 字样（真实流程里要超过 30 分钟才算陈旧，所以这里
-        # 直接改显示元组而不是改时间戳；字样宽度与真实的 31m 相同，版面一致）
-        display = display._replace(age=SAMPLE_STALE_AGE_LABEL)
-    return display
+    return build_display(_sample_snapshot(name, now), now, theme, scale, height)
 
 
 def sample_filename(index, name, theme, scale):
@@ -932,6 +921,17 @@ class APPBARDATA(ctypes.Structure):
     ]
 
 
+# rcMonitor 是整块显示器（含任务栏占用的部分），rcWork 已扣掉任务栏；
+# 调用 GetMonitorInfoW 前必须先把 cbSize 设为结构体大小。
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [
         ("biSize", wintypes.DWORD),
@@ -961,6 +961,9 @@ class BLENDFUNCTION(ctypes.Structure):
 # 句柄一律 c_void_p；位宽写错会在 64 位上悄悄截断。
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+WINEVENTPROC = ctypes.WINFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+    ctypes.c_long, ctypes.c_long, ctypes.c_uint, ctypes.c_uint)
 
 
 class WNDCLASSEXW(ctypes.Structure):
@@ -989,9 +992,10 @@ def _signature(func, argtypes, restype):
 class Win32:
     """所有 ctypes 调用集中在这里；方法名都是动作，便于测试时替换。
 
-    对其它进程窗口的操作只有只读查询：前台窗口类名、主任务栏及其通知区域子窗口的
-    矩形与可见性。写操作（显示、移动、发消息、置前台）的第一个参数一律是本进程自己
-    创建的窗口句柄。
+    对其它进程窗口的操作只有只读查询：前台窗口的类名、矩形与所属进程号，主任务栏
+    及其通知区域子窗口的矩形与可见性，任务栏所在显示器的矩形。小窗以主任务栏为
+    所有者；跨线程所有权会连接输入队列，主线程不能阻塞。显示、移动、置前台只针对
+    本进程窗口，消息只发给本进程窗口或消息循环线程。
     """
 
     def __init__(self):
@@ -1007,6 +1011,9 @@ class Win32:
         self._wndclass = None
         self._class_registered = False
         self._class_buffer = ctypes.create_unicode_buffer(256)
+        self._event_callback = None
+        self._event_hooks = []
+        self._thread_id = 0
         self._declare()
 
     def _declare(self):
@@ -1024,6 +1031,7 @@ class Win32:
         _signature(self.user32.DispatchMessageW, [ctypes.POINTER(wintypes.MSG)], ctypes.c_ssize_t)
         _signature(self.user32.PostQuitMessage, [i32], None)
         _signature(self.user32.PostMessageW, [ptr, u32, ctypes.c_size_t, ctypes.c_ssize_t], i32)
+        _signature(self.user32.PostThreadMessageW, [wintypes.DWORD, u32, ctypes.c_size_t, ctypes.c_ssize_t], i32)
         _signature(self.user32.SetTimer, [ptr, ctypes.c_size_t, u32, ptr], ctypes.c_size_t)
         _signature(self.user32.KillTimer, [ptr, ctypes.c_size_t], i32)
         _signature(self.user32.ShowWindow, [ptr, i32], i32)
@@ -1044,11 +1052,19 @@ class Win32:
         _signature(self.user32.SetForegroundWindow, [ptr], i32)
         _signature(self.user32.RegisterWindowMessageW, [wstr], u32)
         _signature(self.user32.GetForegroundWindow, [], ptr)
+        _signature(self.user32.GetDesktopWindow, [], ptr)
+        _signature(self.user32.GetWindow, [ptr, u32], ptr)
+        _signature(self.user32.SetWinEventHook, [u32, u32, ptr, WINEVENTPROC, u32, u32, u32], ptr)
+        _signature(self.user32.UnhookWinEvent, [ptr], i32)
         _signature(self.user32.GetClassNameW, [ptr, wintypes.LPWSTR, i32], i32)
         _signature(self.user32.FindWindowW, [wstr, wstr], ptr)
         _signature(self.user32.FindWindowExW, [ptr, ptr, wstr, wstr], ptr)
         _signature(self.user32.GetWindowRect, [ptr, ctypes.POINTER(wintypes.RECT)], i32)
+        _signature(self.user32.IsWindow, [ptr], i32)
         _signature(self.user32.IsWindowVisible, [ptr], i32)
+        _signature(self.user32.GetWindowThreadProcessId, [ptr, ctypes.POINTER(wintypes.DWORD)], wintypes.DWORD)
+        _signature(self.user32.MonitorFromRect, [ctypes.POINTER(wintypes.RECT), wintypes.DWORD], ptr)
+        _signature(self.user32.GetMonitorInfoW, [ptr, ctypes.POINTER(MONITORINFO)], i32)
         _signature(self.user32.GetGuiResources, [ptr, u32], u32)
 
         _signature(self.gdi32.CreateCompatibleDC, [ptr], ptr)
@@ -1064,6 +1080,8 @@ class Win32:
         _signature(self.kernel32.CreateMutexW, [ptr, i32, wstr], ptr)
         _signature(self.kernel32.CloseHandle, [ptr], i32)
         _signature(self.kernel32.GetCurrentProcess, [], ptr)
+        _signature(self.kernel32.GetCurrentProcessId, [], wintypes.DWORD)
+        _signature(self.kernel32.GetCurrentThreadId, [], wintypes.DWORD)
         _signature(self.kernel32.GetModuleHandleW, [wstr], ptr)
 
         # DPI 相关函数较新，旧系统上可能没有，缺失时在调用处按"拿不到"处理
@@ -1116,6 +1134,7 @@ class Win32:
     # 窗口类、窗口与消息循环 ------------------------------------------------
 
     def register_class(self, wndproc):
+        self._thread_id = self.kernel32.GetCurrentThreadId()
         self.hinstance = self.kernel32.GetModuleHandleW(None)
         wndclass = WNDCLASSEXW()
         wndclass.cbSize = ctypes.sizeof(WNDCLASSEXW)
@@ -1134,12 +1153,15 @@ class Win32:
             self._class_registered = False
             self.user32.UnregisterClassW(WINDOW_CLASS, self.hinstance)
 
-    def create_window(self, x, y, width, height):
-        """顶层分层窗口：没有父窗口，没有所有者窗口；创建时不可见。"""
+    def create_window(self, x, y, width, height, owner=None):
+        """无父窗口的顶层分层窗口，创建时不可见。
+
+        owner 可指定主任务栏；系统抬升任务栏层级时（如打开开始菜单），小窗随之抬升。
+        """
         ex_style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST
         hwnd = self.user32.CreateWindowExW(
             ex_style, WINDOW_CLASS, WINDOW_TITLE, WS_POPUP, x, y, width, height,
-            None, None, self.hinstance, None)
+            owner or None, None, self.hinstance, None)
         if not hwnd:
             raise OSError("CreateWindowExW failed, error %d" % ctypes.get_last_error())
         return hwnd
@@ -1150,21 +1172,69 @@ class Win32:
     def post_quit(self):
         self.user32.PostQuitMessage(0)
 
+    def post_thread_message(self, message):
+        return bool(self.user32.PostThreadMessageW(self._thread_id, message, 0, 0))
+
     def def_window_proc(self, hwnd, msg, wparam, lparam):
         return self.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-    def run_message_loop(self):
+    def run_message_loop(self, thread_handler=None, error_handler=None):
         """返回 0 表示收到 WM_QUIT；-1 表示 GetMessageW 出错。"""
         msg = wintypes.MSG()
         result = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
         while result > 0:
-            self.user32.TranslateMessage(ctypes.byref(msg))
-            self.user32.DispatchMessageW(ctypes.byref(msg))
+            if not msg.hWnd and msg.message == WM_APP_RECREATE:
+                if thread_handler is not None:
+                    try:
+                        thread_handler(msg.message)
+                    except Exception as exc:
+                        if error_handler is not None:
+                            error_handler(exc)
+                        else:
+                            say("thread message handler failed: %s: %s" % (type(exc).__name__, exc))
+            else:
+                self.user32.TranslateMessage(ctypes.byref(msg))
+                self.user32.DispatchMessageW(ctypes.byref(msg))
             result = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
         return result
 
     def register_message(self, name):
         return int(self.user32.RegisterWindowMessageW(name))
+
+    def watch_window_events(self, handler):
+        """进程外只读事件通知；回调只投递消息，不在回调里改变窗口层级。"""
+        def callback(_hook, event, hwnd, object_id, child_id, _thread, _time):
+            try:
+                handler(event, hwnd or 0, object_id, child_id)
+            except BaseException:
+                # ctypes 回调不能让异常逃到系统。
+                pass
+
+        self._event_callback = WINEVENTPROC(callback)
+        try:
+            for event in (EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_REORDER):
+                hook = self.user32.SetWinEventHook(
+                    event, event, None, self._event_callback, 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+                if not hook:
+                    raise OSError("SetWinEventHook failed for event %d" % event)
+                self._event_hooks.append(hook)
+        except BaseException:
+            self.unwatch_window_events()
+            raise
+
+    def unwatch_window_events(self):
+        """由注册通知的主线程注销；失败的句柄和回调保留，允许收尾时重试。"""
+        remaining = []
+        for hook in self._event_hooks:
+            if not self.user32.UnhookWinEvent(hook):
+                remaining.append(hook)
+        self._event_hooks = remaining
+        if not remaining:
+            self._event_callback = None
+
+    def post_z_order_check(self, hwnd):
+        return bool(self.user32.PostMessageW(hwnd, WM_APP_Z_ORDER, 0, 0))
 
     def set_timer(self, hwnd, timer_id, interval_ms):
         interval_ms = max(10, min(int(interval_ms), MAX_TIMER_MS))
@@ -1276,6 +1346,116 @@ class Win32:
     def foreground_hwnd(self):
         return self.user32.GetForegroundWindow() or 0
 
+    def desktop_hwnd(self):
+        return self.user32.GetDesktopWindow() or 0
+
+    def taskbar_hwnd(self):
+        return self.user32.FindWindowW("Shell_TrayWnd", None) or 0
+
+    def window_owner(self, hwnd):
+        """只读诊断；开始菜单调整任务栏 band 时 GW_OWNER 会临时变化，不能据此重建。"""
+        return self.user32.GetWindow(hwnd, GW_OWNER) or 0
+
+    def is_window(self, hwnd):
+        return bool(self.user32.IsWindow(hwnd))
+
+    def taskbar_above(self, hwnd):
+        covered, allowed = self._z_order_state(hwnd)
+        return covered and allowed
+
+    def topmost_allowed(self, hwnd):
+        return self._z_order_state(hwnd)[1]
+
+    def window_rect(self, hwnd):
+        rect = wintypes.RECT()
+        if not hwnd or not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return rect.left, rect.top, rect.right, rect.bottom
+
+    def window_pid(self, hwnd):
+        """窗口所属进程号；句柄为空或窗口已销毁返回 0。"""
+        if not hwnd:
+            return 0
+        pid = wintypes.DWORD(0)
+        # 返回值是线程号，0 表示失败，此时 pid 的内容不可信
+        if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+            return 0
+        return int(pid.value)
+
+    def monitor_rect_for(self, rect):
+        """rect 所在显示器的完整矩形（rcMonitor）；任一步失败返回 None。
+
+        用 MONITOR_DEFAULTTONULL：矩形不落在任何显示器上时得到 None，由调用方另想
+        办法，而不是悄悄换成最近的显示器。
+        """
+        query = wintypes.RECT(*rect)
+        monitor = self.user32.MonitorFromRect(ctypes.byref(query), MONITOR_DEFAULTTONULL)
+        if not monitor:
+            return None
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not self.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+        area = info.rcMonitor
+        return area.left, area.top, area.right, area.bottom
+
+    def foreground_covers_taskbar(self, taskbar_rect):
+        """前台是否为铺满本任务栏所在显示器的普通应用窗口，即全屏应用。
+
+        有些机器上 SHQueryUserNotificationState 长期返回忙碌（桌面空闲时也是），单凭
+        它不能判全屏，所以调用方还要靠这个函数确认。下列前台都不算全屏，否则挂件会
+        把自己藏起来：
+        - 任务栏、副任务栏、桌面（SHELL_SURFACE_CLASSES）：用户点任务栏空白处或桌面
+          后它们成为前台，矩形等于任务栏或铺满显示器；前台停在任务栏时（例如开始菜单
+          用 Esc 关闭后焦点回到任务栏）挂件会一直出不来；
+        - 本进程自己的窗口（右键菜单期间本窗口是前台）；
+        - 铺不满显示器的窗口：最大化窗口只比工作区多出几个像素，盖不住整条任务栏。
+        目标矩形取任务栏所在显示器的完整矩形；查不到显示器时退回任务栏矩形本身。
+        """
+        hwnd = self.foreground_hwnd()
+        if not hwnd or self.class_name(hwnd) in SHELL_SURFACE_CLASSES:
+            return False
+        if self.window_pid(hwnd) == self.kernel32.GetCurrentProcessId():
+            return False
+        foreground_rect = self.window_rect(hwnd)
+        if foreground_rect is None:
+            return False
+        target = self.monitor_rect_for(taskbar_rect)
+        if target is None:
+            target = taskbar_rect
+        return rect_inside(target, foreground_rect)
+
+    def shell_popup_overlaps(self, popup, hwnd):
+        """只避让真正覆盖小窗的可见系统面板，不因面板打开就放弃层级。"""
+        if (not self.user32.IsWindowVisible(popup)
+                or self.class_name(popup) not in TOPMOST_SKIP_CLASSES):
+            return False
+        popup_rect = self.window_rect(popup)
+        own_rect = self.window_rect(hwnd)
+        # 拿不到矩形时保守避让；下次事件或两秒检查会再确认。
+        return popup_rect is None or own_rect is None or rects_overlap(popup_rect, own_rect)
+
+    def _z_order_state(self, hwnd):
+        """只读返回 (任务栏在上方, 允许恢复层级)，有界遍历以容忍重排竞争。"""
+        tray = self.user32.FindWindowW("Shell_TrayWnd", None)
+        if not hwnd:
+            return False, False
+        seen = {hwnd}
+        covered = False
+        previous = self.user32.GetWindow(hwnd, GW_HWNDPREV)
+        for _index in range(MAX_Z_ORDER_WINDOWS):
+            if not previous:
+                return covered, True
+            if previous in seen:
+                return False, False
+            if previous == tray:
+                covered = True
+            elif self.shell_popup_overlaps(previous, hwnd):
+                return covered, False
+            seen.add(previous)
+            previous = self.user32.GetWindow(previous, GW_HWNDPREV)
+        return False, False
+
     def class_name(self, hwnd):
         if not hwnd:
             return ""
@@ -1376,6 +1556,13 @@ class WidgetApp:
         self.mode, self.offset = load_position(self.pos_path)
         self.light = read_light_theme()
         self.hwnd = 0
+        self.owner = 0
+        self._recreating = False
+        self._owner_recreated_at = None
+        self._owner_recreate_suppressed = False
+        # 有所有者创建失败过的任务栏句柄；0 表示没有这类失败。
+        self._owner_failed_tray = 0
+        self._exit_deadline = None
         self.scale = 1.0
         self.geom = None
         self.shown_display = None
@@ -1389,6 +1576,8 @@ class WidgetApp:
         self.msg_taskbar_created = 0
         self._busy = False
         self._again = False
+        self._reassert_pending = False
+        self._z_order_pending = False
         self._gdi = {}
         self._watchdog = None
 
@@ -1417,6 +1606,8 @@ class WidgetApp:
             self.log.log("SetTimer", "SetTimer failed for timer %d" % timer_id)
             return False
         self.timers.add(timer_id)
+        if timer_id == TIMER_EXIT and self._exit_deadline is None:
+            self._exit_deadline = time.monotonic() + max(10, min(int(interval_ms), MAX_TIMER_MS)) / 1000.0
         return True
 
     def kill_timer(self, timer_id):
@@ -1451,6 +1642,9 @@ class WidgetApp:
         if msg == WM_TIMER:
             self.on_timer(wparam)
             return True, 0
+        if msg == WM_APP_Z_ORDER:
+            self.on_z_order_check()
+            return True, 0
         if msg == WM_LBUTTONDOWN:
             self.on_left_down()
             return True, 0
@@ -1467,6 +1661,9 @@ class WidgetApp:
             self.on_right_up()
             return True, 0
         if msg in SYSTEM_CHANGE_MESSAGES or (self.msg_taskbar_created and msg == self.msg_taskbar_created):
+            # 只有任务栏重建才忘掉上次拒绝有所有者创建的句柄；DPI/显示/设置变化不清。
+            if self.msg_taskbar_created and msg == self.msg_taskbar_created:
+                self._owner_failed_tray = 0
             self.on_system_change()
             return True, 0
         if msg == WM_CLOSE:
@@ -1481,6 +1678,7 @@ class WidgetApp:
         if self.exiting:
             return
         if timer_id == TIMER_CHECK:
+            self._owner_check()
             self.refresh_view(reassert_topmost=True)
         elif timer_id == TIMER_POLL:
             self.poll_snapshot()
@@ -1502,11 +1700,143 @@ class WidgetApp:
             self.request_exit()
 
     def on_destroy(self):
-        self._kill_all_timers()
+        if self._recreating:
+            return
+        if self.exiting:
+            self.w32.unwatch_window_events()
+            self._kill_all_timers()
+            self.hwnd = 0
+            self.w32.post_quit()
+            return
+        # 所有者销毁时系统也会销毁小窗；等销毁消息返回后再通过线程消息重建。
+        self.log.log("WindowDestroyed", "window destroyed by the system; recovering via thread message")
+        self.timers.clear()
         self.hwnd = 0
-        self.w32.post_quit()
+        self.visible = False
+        if not self.w32.post_thread_message(WM_APP_RECREATE):
+            self.log.log("RecreateWindow", "PostThreadMessageW failed")
+            self.w32.post_quit()
+
+    def _create_widget_window(self):
+        tray = self.w32.taskbar_hwnd()
+        try:
+            hwnd = self.w32.create_window(0, 0, INITIAL_WINDOW_PX, INITIAL_WINDOW_PX, tray or None)
+        except OSError as exc:
+            if not tray:
+                raise
+            self._log_exception(exc)
+            # 先记成无所有者，避免创建过程中重入时按旧句柄再重建。
+            self.owner = 0
+            hwnd = self.w32.create_window(0, 0, INITIAL_WINDOW_PX, INITIAL_WINDOW_PX, None)
+            self._owner_failed_tray = tray
+            self.owner = 0
+            return hwnd
+        if tray:
+            # 有所有者创建成功后，这个任务栏可以再试。
+            self._owner_failed_tray = 0
+        self.owner = tray
+        return hwnd
+
+    def _owner_check(self):
+        """按创建时所有者与任务栏句柄有效性判断重建。
+
+        开始菜单打开时，Windows 调整任务栏 band 会临时改变 GW_OWNER，只记诊断日志。
+        """
+        if (self.exiting or self._recreating or self._busy or self.menu_open
+                or self.drag is not None or not self.hwnd):
+            return
+        tray = self.w32.taskbar_hwnd()
+        if not tray:
+            return
+        # 这个任务栏已经拒绝过有所有者创建，同一句柄不再反复重建。
+        if self.owner == 0 and tray == self._owner_failed_tray:
+            return
+        if not self.owner or tray != self.owner or not self.w32.is_window(self.owner):
+            if self.owner == 0:
+                cause = "unowned window, taskbar 0x%X" % tray
+            elif tray != self.owner:
+                cause = "taskbar replaced 0x%X -> 0x%X" % (self.owner, tray)
+            else:
+                cause = "owner 0x%X no longer valid, taskbar 0x%X" % (self.owner, tray)
+            now = time.monotonic()
+            if self._owner_recreated_at is not None and now - self._owner_recreated_at < OWNER_RECREATE_SECONDS:
+                if not self._owner_recreate_suppressed:
+                    self._owner_recreate_suppressed = True
+                    self.log.log("OwnerRecreateSuppressed", "recreate deferred for 30 s: " + cause)
+                return
+            self._owner_recreated_at = now
+            self._owner_recreate_suppressed = False
+            self._recreate_window(cause)
+        else:
+            actual_owner = self.w32.window_owner(self.hwnd)
+            if actual_owner != tray:
+                self.log.log("OwnerMismatch", "GW_OWNER=0x%X expected 0x%X; no recreate" % (actual_owner, tray))
+
+    def _recreate_window(self, reason):
+        self.log.log("OwnerChanged", reason)
+        self._recreating = True
+        try:
+            self._kill_all_timers()
+            old = self.hwnd
+            if self.w32.is_window(old):
+                self.w32.destroy_window(old)
+            self.hwnd = 0
+        finally:
+            self._recreating = False
+        try:
+            self.hwnd = self._create_widget_window()
+        except OSError as exc:
+            self._log_exception(exc)
+            self.request_exit()
+            return
+        self.visible = False
+        self.geom = None
+        self.shown_display = None
+        self._z_order_pending = False
+        self._start_timers(recreated=True)
+        self.refresh_view(force=True, reassert_topmost=True)
+
+    def on_thread_message(self, message):
+        if message != WM_APP_RECREATE or self.exiting or self.hwnd:
+            return
+        try:
+            self.hwnd = self._create_widget_window()
+        except OSError as exc:
+            self._log_exception(exc)
+            self.w32.post_quit()
+            return
+        self.visible = False
+        self.geom = None
+        self.shown_display = None
+        self._z_order_pending = False
+        self._start_timers(recreated=True)
+        self.refresh_view(force=True, reassert_topmost=True)
 
     # 显示与定位 --------------------------------------------------------------
+
+    def on_window_event(self, event, hwnd, object_id, child_id):
+        """合并窗口事件，每批最多投递一次检查；对象内部的列表重排不相关。"""
+        if self.exiting or not self.hwnd or not hwnd or self._z_order_pending:
+            return
+        if event == EVENT_OBJECT_REORDER:
+            if child_id != CHILDID_SELF:
+                return
+            if object_id != OBJID_WINDOW and not (
+                    object_id == OBJID_CLIENT and hwnd == self.w32.desktop_hwnd()):
+                return
+        elif event != EVENT_SYSTEM_FOREGROUND:
+            return
+        self._z_order_pending = True
+        if not self.w32.post_z_order_check(self.hwnd):
+            self._z_order_pending = False
+
+    def on_z_order_check(self):
+        self._z_order_pending = False
+        if self.exiting or not self.hwnd or not self.visible:
+            return
+        # 只在任务栏确实盖住小窗时恢复层级，避免自己的重排通知形成循环。
+        if self.w32.taskbar_above(self.hwnd):
+            self.refresh_view(reassert_topmost=True)
 
     def _current_snapshot(self):
         if self.snapshot_override is not None:
@@ -1522,6 +1852,7 @@ class WidgetApp:
         """
         if self.exiting or not self.hwnd:
             return
+        self._reassert_pending |= reassert_topmost
         if self._busy:
             self._again = True
             return
@@ -1532,7 +1863,9 @@ class WidgetApp:
             while self._again and passes < MAX_REFRESH_PASSES:
                 self._again = False
                 passes += 1
-                self._refresh_once(force and passes == 1, reassert_topmost and passes == 1)
+                reassert = self._reassert_pending
+                self._reassert_pending = False
+                self._refresh_once(force and passes == 1, reassert)
         finally:
             self._busy = False
 
@@ -1556,7 +1889,10 @@ class WidgetApp:
         if self.w32.taskbar_autohide():
             self._hide()
             return
-        if self.w32.notification_state() in HIDE_NOTIFICATION_STATES:
+        notification_state = self.w32.notification_state()
+        if (notification_state in HIDE_NOTIFICATION_STATES
+                or (notification_state == BUSY_NOTIFICATION_STATE
+                    and self.w32.foreground_covers_taskbar(rect))):
             self._hide()
             return
         scale = self.w32.scale_for(self.hwnd)
@@ -1570,7 +1906,7 @@ class WidgetApp:
         if not self.visible:
             self.w32.show_window(self.hwnd, SW_SHOWNOACTIVATE)
             self.visible = True
-        if reassert_topmost and self.w32.class_name(self.w32.foreground_hwnd()) not in TOPMOST_SKIP_CLASSES:
+        if reassert_topmost and self.w32.topmost_allowed(self.hwnd):
             self.w32.keep_topmost(self.hwnd)
 
     def _apply(self, display, geom, force):
@@ -1613,6 +1949,7 @@ class WidgetApp:
 
     def on_system_change(self):
         """DPI、显示器、系统设置、任务栏重建：立即重读主题并重算位置。"""
+        self._owner_check()
         self.light = read_light_theme()
         self.refresh_view()
 
@@ -1688,6 +2025,9 @@ class WidgetApp:
             self.menu_open = False
         if self.exiting:
             return
+        if not self.hwnd and not self.w32.post_thread_message(WM_APP_RECREATE):
+            self.log.log("RecreateWindow", "PostThreadMessageW failed")
+            self.w32.post_quit()
         if command == MENU_REFRESH:
             self.poll_snapshot(force=True)
         elif command == MENU_SNAP:
@@ -1723,6 +2063,7 @@ class WidgetApp:
         if self.exiting:
             return
         self.exiting = True
+        self.w32.unwatch_window_events()
         try:
             self._arm_watchdog()
         except Exception as exc:
@@ -1766,13 +2107,16 @@ class WidgetApp:
 
     # 主流程 ----------------------------------------------------------------------
 
-    def _start_timers(self):
+    def _start_timers(self, recreated=False):
         self.set_timer(TIMER_CHECK, WINDOW_CHECK_MS)
         self.set_timer(TIMER_POLL, SNAPSHOT_POLL_MS)
         self.set_timer(TIMER_THEME, THEME_POLL_MS)
-        if self.opts.exit_after is not None:
+        if recreated:
+            if self._exit_deadline is not None:
+                self.set_timer(TIMER_EXIT, max(10, int((self._exit_deadline - time.monotonic()) * 1000)))
+        elif self.opts.exit_after is not None:
             self.set_timer(TIMER_EXIT, int(self.opts.exit_after * 1000))
-        if self.opts.selftest_gdi:
+        if self.opts.selftest_gdi and not recreated:
             self.set_timer(TIMER_GDI_BEGIN, GDI_SETTLE_MS)
 
     def run(self):
@@ -1782,14 +2126,17 @@ class WidgetApp:
             self.w32.register_class(_WNDPROC_REF)
             try:
                 self.msg_taskbar_created = self.w32.register_message("TaskbarCreated")
-                self.hwnd = self.w32.create_window(0, 0, INITIAL_WINDOW_PX, INITIAL_WINDOW_PX)
+                self.hwnd = self._create_widget_window()
                 self._safe(self.poll_snapshot)
                 self._safe(self.refresh_view, False, True)
+                # 注册失败仍能用两秒轮询兜底，不影响小窗启动。
+                self._safe(self.w32.watch_window_events, self.on_window_event)
                 self._start_timers()
-                result = self.w32.run_message_loop()
+                result = self.w32.run_message_loop(self.on_thread_message, self._log_exception)
                 if result < 0:
                     self.log.log("MessageLoop", "GetMessageW failed")
             finally:
+                self.w32.unwatch_window_events()
                 self.w32.unregister_class()
         finally:
             _APP = None

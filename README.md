@@ -169,7 +169,7 @@ The widget can only show what its sources have written. Claude's numbers arrive 
 ## Using the widget
 
 - **Drag** it sideways to move it. It then stays where you put it.
-- **Right-click** for the menu: `Refresh now`, `Snap to tray` (go back to following the notification area automatically) and `Quit`.
+- **Right-click** for the menu: `Refresh now`, `Snap to tray` (go back to following the notification area automatically) and `Quit`. `Refresh now` re-reads both sources at once and dims the widget for about 0.3 s, so you can see that it ran even when no new reading has arrived.
 - It hides itself while a full-screen app is running (an ordinary application window covering the whole monitor of the taskbar) and while the taskbar is set to auto-hide. Clicking the taskbar or the desktop does not count as full screen.
 - It stays visible while the Start menu, Quick Settings or the notification overflow is open, and after a click on empty taskbar space. This was checked with screenshots on build 26200, opening Start and Quick Settings both by keyboard and by mouse.
 

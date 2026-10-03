@@ -209,6 +209,9 @@ TIMER_EXIT = 4
 TIMER_GDI_BEGIN = 5
 TIMER_GDI_TICK = 6
 TIMER_GDI_END = 7
+TIMER_FLASH = 8
+FLASH_MS = 300
+FLASH_ALPHA_SCALE = 0.35
 
 THEME_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
 THEME_VALUE_NAME = "SystemUsesLightTheme"
@@ -1072,6 +1075,18 @@ def _premultiply_table():
     这一点，否则会画出错误的颜色。
     """
     return tuple(bytes((c * a) // 255 for c in range(256)) for a in range(256))
+
+
+def dim_image(image, scale):
+    """返回一张新的 RGBA 图：alpha 乘 scale 后向下取整，且不低于 BACKGROUND_ALPHA。
+
+    RGB 不变。整窗 alpha 不能降到 0，否则点不中小窗。传入的图不改。
+    """
+    if image.mode != "RGBA":
+        raise ValueError("expected an RGBA image, got %s" % image.mode)
+    red, green, blue, alpha = image.split()
+    floor = [max(int(math.floor(value * scale)), BACKGROUND_ALPHA) for value in range(256)]
+    return Image.merge("RGBA", (red, green, blue, alpha.point(floor)))
 
 
 def premultiply_bgra(image):
@@ -2053,6 +2068,7 @@ class WidgetApp:
         self._z_order_pending = False
         self._gdi = {}
         self._watchdog = None
+        self._flashing = False
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -2171,6 +2187,9 @@ class WidgetApp:
             self.kill_timer(TIMER_GDI_END)
             self._gdi_report()
             self.request_exit()
+        elif timer_id == TIMER_FLASH:
+            self.kill_timer(TIMER_FLASH)
+            self._end_flash()
 
     def on_destroy(self):
         if self._recreating:
@@ -2266,6 +2285,7 @@ class WidgetApp:
         self.geom = None
         self.shown_display = None
         self._z_order_pending = False
+        self._flashing = False
         self._start_timers(recreated=True)
         self.refresh_view(force=True, reassert_topmost=True)
 
@@ -2282,6 +2302,7 @@ class WidgetApp:
         self.geom = None
         self.shown_display = None
         self._z_order_pending = False
+        self._flashing = False
         self._start_timers(recreated=True)
         self.refresh_view(force=True, reassert_topmost=True)
 
@@ -2396,7 +2417,10 @@ class WidgetApp:
         x, y, width, height = geom
         old = self.geom
         if force or old is None or old[2:] != (width, height) or display != self.shown_display:
-            data = premultiply_bgra(render_display(display))
+            image = render_display(display)
+            if self._flashing:
+                image = dim_image(image, FLASH_ALPHA_SCALE)
+            data = premultiply_bgra(image)
             self.w32.update_layered(self.hwnd, x, y, width, height, data)
             self.shown_display = display
             self.geom = geom
@@ -2510,6 +2534,30 @@ class WidgetApp:
         self._save_position()
         self.refresh_view()
 
+    def _end_flash(self):
+        """结束变暗。先丢掉已显示的元组，下一轮即使被挡住也会重画未变暗的画面。"""
+        self._flashing = False
+        self.shown_display = None
+        self.refresh_view(force=True)
+
+    def _begin_flash(self):
+        """刷新后把画面短暂变暗再恢复，数据没变时点击也有可见反馈。
+
+        闪烁不进显示元组，所以开始和结束都用 force=True 重绘。已经在闪时再点刷新
+        只重设定时器，不再多画一次。重绘抛错也要建上定时器；定时器建不起来就立刻
+        取消变暗，避免小窗一直停在暗的画面上。
+        """
+        if self.exiting or not self.hwnd:
+            return
+        already = self._flashing
+        self._flashing = True
+        try:
+            if not already:
+                self.refresh_view(force=True)
+        finally:
+            if not self.set_timer(TIMER_FLASH, FLASH_MS):
+                self._end_flash()
+
     def _save_position(self):
         try:
             save_position(self.data_dir, self.mode, self.offset)
@@ -2532,6 +2580,7 @@ class WidgetApp:
             self.w32.post_quit()
         if command == MENU_REFRESH:
             self.poll_snapshot(force=True)
+            self._begin_flash()
         elif command == MENU_SNAP:
             self.mode = MODE_AUTO
             self._save_position()
@@ -2565,6 +2614,7 @@ class WidgetApp:
         if self.exiting:
             return
         self.exiting = True
+        self._flashing = False
         self.w32.unwatch_window_events()
         try:
             self._arm_watchdog()

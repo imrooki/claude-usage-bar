@@ -2,9 +2,12 @@
 """Claude 用量小窗：贴在 Windows 任务栏通知区域左边的两行横向进度条，没有背景色。
 
 上一行是 5 小时窗口，下一行是 7 天窗口，每行带百分比与重置时间。数据只来自
-<data-dir>\\usage.json（由别的程序写入）。本程序不联网、不起其它程序、不碰任何
-凭证文件；窗口是无父窗口的顶层分层窗口（逐像素 alpha），以主任务栏为所有者，随
-任务栏一起抬升层级。对资源管理器窗口只读查询；跨线程所有权会连接输入队列，主线程
+<data-dir>\\usage.json（由别的程序写入）。读数超过 30 分钟视为陈旧：进度条变成
+灰色，并显示读数的年龄（单栏写在重置时间右边，双栏写在页眉里）。右键 Refresh now
+之后，页眉或附加列（没有任何数据时是第二行）会短暂（约 2.5 秒）改写成刷新结果，
+如 new 14:58、same 14:29、no data、read error。本程序不联网、不起其它程序、不碰
+任何凭证文件；窗口是无父窗口的顶层分层窗口（逐像素 alpha），以主任务栏为所有者，
+随任务栏一起抬升层级。对资源管理器窗口只读查询；跨线程所有权会连接输入队列，主线程
 不能阻塞。
 
 运行：pythonw usage_widget.py [--data-dir DIR] [--no-codex] [--codex-home DIR]
@@ -48,6 +51,9 @@ ERROR_ALREADY_EXISTS = 183
 
 MAX_SNAPSHOT_BYTES = 1024 * 1024
 STALE_SECONDS = 1800
+# 年龄文字的天数上限，更大的一律写 999d。畸形的 observed_at（例如 -1e300）经 _finite 检查后仍是
+# 有限数，不封顶会得到几百位的天数，把小窗宽度撑到几千像素，右端锚定也随之失效。
+MAX_AGE_DAYS = 999
 SNAPSHOT_POLL_MS = 15000
 WINDOW_CHECK_MS = 2000
 OWNER_RECREATE_SECONDS = 30.0
@@ -85,6 +91,8 @@ GAP_PCT_RESET = 6
 RESET_W = 40
 MARGIN_R = 2
 BLOCK_GAP = 12
+# 单栏在重置时间列右边再挂一列（年龄或反馈文字），与重置列隔开这么多逻辑像素。
+ASIDE_GAP = 4
 # 双栏：名称在进度条上方。行字号、槽高与页眉都比单栏略小，腾出页眉那一条。
 DUAL_HEADER_H = 12
 DUAL_HEADER_FONT_PX = 10
@@ -107,7 +115,9 @@ TIER_RGB = {"green": (0x2E, 0xA0, 0x43), "amber": (0xD2, 0x99, 0x22), "red": (0x
 TEXT_ALPHA = 255
 TEXT_ALPHA_STALE = 150
 FILL_ALPHA = 255
-FILL_ALPHA_STALE = 120
+# 陈旧行的进度条填充用固定中性灰，alpha 与正常行相同。透明任务栏上看不出变淡，
+# 颜色被抽干才在任何壁纸上都站得住。
+STALE_FILL_RGB = (0x8A, 0x8A, 0x8A)
 
 NODATA_LINES = ("Claude usage", "no data yet")
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -210,8 +220,11 @@ TIMER_GDI_BEGIN = 5
 TIMER_GDI_TICK = 6
 TIMER_GDI_END = 7
 TIMER_FLASH = 8
+TIMER_CAPTION = 9
 FLASH_MS = 300
 FLASH_ALPHA_SCALE = 0.35
+# Refresh now 之后反馈文字显示的毫秒数。
+CAPTION_MS = 2500
 
 THEME_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
 THEME_VALUE_NAME = "SystemUsesLightTheme"
@@ -336,6 +349,11 @@ CODEX_MAX_CANDIDATES = 5
 CODEX_WINDOW_KEYS = {300: "five_hour", 10080: "seven_day"}
 # 当前快照的观测时间超前时钟超过这个秒数时，视为时钟曾拨快后又拨回，不再用“更旧”挡住新记录。
 CODEX_FUTURE_TOLERANCE_SECONDS = 300.0
+# 这三个读取原因只表示没有这个数据源，或数据源里还没有限额记录，不算读取失败
+# （no_rate_limits：装了 Codex 但还没跑过带限额记录的对话）。其它非空原因
+# （bad_json、read_error:... 等）才算失败。
+CAPTION_BENIGN_REASONS = frozenset({"missing", "no_codex", "no_rate_limits"})
+CAPTION_READ_ERROR = "read error"
 
 
 def codex_home(override=None):
@@ -641,8 +659,13 @@ class CodexReader:
 RowView = collections.namedtuple(
     "RowView", ["label", "state", "fill", "tier", "pct_text", "reset_text"])
 BlockView = collections.namedtuple("BlockView", ["tag", "rows"])
+# ages、captions 按提供方各一条（下标 0 是 Claude，1 是 Codex）：陈旧读数的年龄文字，
+# 以及点 Refresh now 之后的反馈文字。它们属于显示元组，元组相等才仍然意味着画面
+# 相同；两条都是空串时存成 ()，所以没有这些文字的显示元组与原来的六字段写法相等。
+# nodata 布局没有进度条行，ages 恒为 ()，captions 至多一项（下标 0），是顶替第二行的那条反馈文字。
 Display = collections.namedtuple(
-    "Display", ["kind", "rows", "theme", "scale", "width", "height"])
+    "Display", ["kind", "rows", "theme", "scale", "width", "height", "ages", "captions"],
+    defaults=((), ()))
 
 
 def scaled(value, scale):
@@ -706,6 +729,56 @@ def build_row(label, win, now, seven_day):
         "%d%%" % display_percent(win.pct), reset_text(win.resets_at, seven_day))
 
 
+def format_age(seconds):
+    """年龄文字：向下取整；不足 120 分钟写 "<分钟>m"（至少 1m），不足 48 小时写 "<小时>h"，
+    否则写 "<天>d"。天数最多 MAX_AGE_DAYS（999），更大一律写 "999d"，所以文字宽度有界。"""
+    # 整数不转 float：超大整数转 float 会溢出，所以天数按整数除法算，最后再封顶。
+    # 负数、bool、非有限数一律按 0 处理。
+    total = 0
+    if isinstance(seconds, int) and not isinstance(seconds, bool):
+        total = max(seconds, 0)
+    elif isinstance(seconds, float) and math.isfinite(seconds):
+        total = max(int(math.floor(seconds)), 0)
+    if total < 7200:
+        return "%dm" % max(1, total // 60)
+    if total < 172800:
+        return "%dh" % (total // 3600)
+    return "%dd" % min(total // 86400, MAX_AGE_DAYS)
+
+
+def stale_age_seconds(five, seven, now):
+    """提供方陈旧时返回最旧的陈旧读数的年龄（秒），否则 None。"""
+    oldest = None
+    for win in (five, seven):
+        if row_state(win, now) != "stale":
+            continue
+        if oldest is None or win.observed_at < oldest:
+            oldest = win.observed_at
+    if oldest is None:
+        return None
+    return now - oldest
+
+
+def _clock_text(unix_seconds):
+    """本地时间 HH:MM（两位补零）；超出平台时间范围时返回 "--:--"。"""
+    try:
+        local = time.localtime(unix_seconds)
+    except (OverflowError, OSError, ValueError):
+        return "--:--"
+    return "%02d:%02d" % (local.tm_hour, local.tm_min)
+
+
+def caption_text(before, after, reason):
+    """点 Refresh now 之后某个提供方的反馈文字，纯 ASCII。"""
+    if reason and reason not in CAPTION_BENIGN_REASONS:
+        return CAPTION_READ_ERROR
+    if after is None:
+        return "no data"
+    if before is None or after > before:
+        return "new " + _clock_text(after)
+    return "same " + _clock_text(after)
+
+
 # ---------------------------------------------------------------------------
 # 纯函数层：布局（右端锚定）
 # ---------------------------------------------------------------------------
@@ -729,6 +802,11 @@ def pixel_columns(scale):
     """各列的像素 (左, 右)。边界各自取整，所以相邻列之间不会因累计取整而错位。"""
     columns, _total = logical_columns()
     return {name: (scaled(lo, scale), scaled(hi, scale)) for name, (lo, hi) in columns.items()}
+
+
+def aside_left(scale):
+    """单栏附加列文字的左边缘（像素）：重置列右边缘再右移 ASIDE_GAP 个逻辑像素。"""
+    return pixel_columns(scale)["reset"][1] + scaled(ASIDE_GAP, scale)
 
 
 def dual_block_columns():
@@ -807,14 +885,22 @@ def dual_render_metrics(scale, height):
     }
 
 
-def display_width(kind, scale, height):
-    """小窗宽度（像素）：数据行按列布局算，双栏按两块加间隙算，无数据时按两行文字的实际宽度算。"""
+def display_width(kind, scale, height, aside=""):
+    """小窗宽度（像素）：数据行按列布局算，双栏按两块加间隙算，无数据时按两行文字的实际宽度算。
+
+    单栏有附加文字时，宽度收到 aside_left 再加文字宽度和右边距；没有附加文字时与原来相同。
+    nodata 的 aside 是顶替第二行的反馈文字，非空时一并计入宽度，避免窗口被这条文字撑出边界。
+    """
     if kind == "nodata":
         font = get_font(render_metrics(scale, height)["font_px"])
-        text_width = int(math.ceil(max(font.getlength(line) for line in NODATA_LINES)))
+        lines = NODATA_LINES + ((aside,) if aside else ())
+        text_width = int(math.ceil(max(font.getlength(line) for line in lines)))
         return scaled(MARGIN_L, scale) + text_width + scaled(MARGIN_R, scale)
     if kind == "dual":
         return scaled(dual_logical_width(), scale)
+    if aside:
+        font = get_font(render_metrics(scale, height)["font_px"])
+        return aside_left(scale) + int(math.ceil(font.getlength(aside))) + scaled(MARGIN_R, scale)
     return scaled(logical_columns()[1], scale)
 
 
@@ -829,32 +915,93 @@ def _metric_rows(five, seven, now):
     return (build_row("5h", five, now, False), build_row("7d", seven, now, True))
 
 
-def build_display(snapshot, now, theme, scale, height, codex=None, codex_available=False):
+def _age_text(five, seven, now):
+    """该提供方陈旧时的年龄文字；不陈旧时是空串。"""
+    seconds = stale_age_seconds(five, seven, now)
+    if seconds is None:
+        return ""
+    return format_age(seconds)
+
+
+def _stored_strings(values):
+    """全是空串时存成 ()，这样没有附加文字的显示元组在新字段上仍是默认值。"""
+    if any(values):
+        return tuple(values)
+    return ()
+
+
+def _caption_at(captions, index):
+    """调用方给的反馈文字；缺项或 captions 为空时是空串。"""
+    if not captions or index >= len(captions) or captions[index] is None:
+        return ""
+    return captions[index]
+
+
+def _nodata_caption(texts):
+    """无数据布局第二行的反馈文字。
+
+    无数据布局只有第二行能写反馈文字，双栏两侧都没有窗口时 read error 优先；
+    否则取第一条非空文字；都没有则返回空串。
+    """
+    for text in texts:
+        if text == CAPTION_READ_ERROR:
+            return CAPTION_READ_ERROR
+    for text in texts:
+        if text:
+            return text
+    return ""
+
+
+def _nodata_display(theme, scale, height, caption):
+    """无数据布局：没有进度条行，ages 恒为 ()，反馈文字至多一项。"""
+    return Display(
+        "nodata", NODATA_LINES, theme, scale,
+        display_width("nodata", scale, height, caption), height,
+        (), _stored_strings((caption,)))
+
+
+def build_display(snapshot, now, theme, scale, height, codex=None, codex_available=False, captions=None):
     """把快照与当前时间整理成不可变的显示元组；元组相等就不用重绘。
 
     填充长度由取整后的百分比决定，这样元组相等一定意味着画面相同。宽度由内容、
     scale 与高度推出，放进元组是为了让尺寸变化也触发重绘。
     codex_available 为假时只画 Claude，结果与原来相同。为真时左 Claude、右 Codex；
     两边都没有任何窗口时仍是无数据。
+    ages、captions 按提供方各一条（下标 0 是 Claude，1 是 Codex）；全空时存成 ()。
+    有反馈文字时优先显示它，否则才显示年龄文字。nodata 没有进度条行可挂年龄文字，
+    只保留反馈文字（单栏取 Claude 的；双栏两侧都没有窗口时 read error 优先，否则取
+    第一条非空的），存成只有一项的 captions，渲染时顶替第二行 "no data yet"。
     """
     five, seven = _window_pair(snapshot)
     if not codex_available:
         if five is None and seven is None:
-            width = display_width("nodata", scale, height)
-            return Display("nodata", NODATA_LINES, theme, scale, width, height)
+            return _nodata_display(theme, scale, height, _caption_at(captions, 0))
+        age = _age_text(five, seven, now)
+        caption = _caption_at(captions, 0)
+        aside = caption or age
         rows = _metric_rows(five, seven, now)
-        width = display_width("data", scale, height)
-        return Display("data", rows, theme, scale, width, height)
+        width = display_width("data", scale, height, aside)
+        return Display(
+            "data", rows, theme, scale, width, height,
+            _stored_strings((age,)), _stored_strings((caption,)))
     codex_five, codex_seven = _window_pair(codex)
     if five is None and seven is None and codex_five is None and codex_seven is None:
-        width = display_width("nodata", scale, height)
-        return Display("nodata", NODATA_LINES, theme, scale, width, height)
+        return _nodata_display(
+            theme, scale, height,
+            _nodata_caption((_caption_at(captions, 0), _caption_at(captions, 1))))
     blocks = (
         BlockView(PROVIDER_TAGS[0], _metric_rows(five, seven, now)),
         BlockView(PROVIDER_TAGS[1], _metric_rows(codex_five, codex_seven, now)),
     )
+    ages = (
+        _age_text(five, seven, now),
+        _age_text(codex_five, codex_seven, now),
+    )
+    caption_pair = (_caption_at(captions, 0), _caption_at(captions, 1))
     width = display_width("dual", scale, height)
-    return Display("dual", blocks, theme, scale, width, height)
+    return Display(
+        "dual", blocks, theme, scale, width, height,
+        _stored_strings(ages), _stored_strings(caption_pair))
 
 
 def rect_inside(inner, outer):
@@ -938,8 +1085,8 @@ def _pill_mask(width, height, radius):
 def _compose_bar(width, height, radius, fill_width, track_rgba, fill_rgba):
     """进度条（空槽加填充）的直通 alpha RGBA 图，像素在整数域里精确合成。
 
-    填充覆盖的地方是"替换"空槽而不是叠在空槽上：叠加会让 stale 填充的 alpha 从
-    120 变成 145，并被空槽的黑色染暗。逐像素公式（f、t 为填充与空槽的覆盖度 0..255，
+    填充覆盖的地方是"替换"空槽而不是叠在空槽上：叠加会让 alpha 120 的填充变成
+    145，并被空槽的黑色染暗。逐像素公式（f、t 为填充与空槽的覆盖度 0..255，
     Af、At 为两者的 alpha）：
         权重 wf = f * Af * 255，wt = (255 - f) * t * At
         颜色 = (Cf * wf + Ct * wt) / (wf + wt)，alpha = (wf + wt) / 255²
@@ -991,10 +1138,63 @@ def _draw_text(draw, font, x, center_y, text, ink, align):
     draw.text((x, baseline), text, font=font, fill=ink, anchor=anchor)
 
 
+def _provider_item(items, index):
+    """按提供方下标取字符串；元组比下标短时按空串处理。"""
+    if index < len(items):
+        return items[index]
+    return ""
+
+
+def single_aside(display):
+    """单栏附加列的 (文字, alpha)。
+
+    反馈文字优先，alpha 用 TEXT_ALPHA；否则是年龄文字，alpha 用 TEXT_ALPHA_STALE；
+    都没有时文字为空串。
+    """
+    caption = _provider_item(display.captions, 0)
+    if caption:
+        return caption, TEXT_ALPHA
+    age = _provider_item(display.ages, 0)
+    if age:
+        return age, TEXT_ALPHA_STALE
+    return "", TEXT_ALPHA
+
+
+def nodata_lines(display):
+    """无数据布局实际画出的两行。
+
+    有反馈文字时顶替第二行 "no data yet"；没有时原样返回 display.rows，画面与改动前相同。
+    """
+    caption = _provider_item(display.captions, 0)
+    if caption:
+        return (display.rows[0], caption)
+    return display.rows
+
+
+def dual_header(display, index):
+    """双栏第 index 个块的页眉 (文字, alpha)。
+
+    有反馈文字：文字是它，alpha 用 TEXT_ALPHA（替换原来的名称）。
+    否则文字是名称 block.tag；有年龄文字时写成 "<tag> <年龄>"，例如 "Claude 41m"。
+    alpha 沿用现有规则：该块有任何 state == "normal" 的行用 TEXT_ALPHA，否则用 TEXT_ALPHA_STALE。
+    """
+    block = display.rows[index]
+    caption = _provider_item(display.captions, index)
+    if caption:
+        text = caption
+        alpha = TEXT_ALPHA
+    else:
+        age = _provider_item(display.ages, index)
+        text = ("%s %s" % (block.tag, age)) if age else block.tag
+        alpha = TEXT_ALPHA if any(row.state == "normal" for row in block.rows) else TEXT_ALPHA_STALE
+    return text, alpha
+
+
 def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rgba, row_height, origin=0.0):
     """画一个块里的两行：标签、进度条、百分比、重置时间。
 
     origin 为 0 时行中心与原来的单栏相同。双栏传入页眉高度，两行排在页眉下面。
+    陈旧行的填充是中性灰、alpha 与正常行相同；文字仍用 TEXT_ALPHA_STALE 变淡。
     """
     bar_left, bar_right = edges["bar"]
     bar_width = bar_right - bar_left
@@ -1009,7 +1209,10 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
         fill_width = 0
         if row.state in ("normal", "stale"):
             fill_width = int(math.floor(row.fill * bar_width / 100.0 + 0.5))
-            fill_rgba = TIER_RGB[row.tier] + (FILL_ALPHA_STALE if stale else FILL_ALPHA,)
+            if stale:
+                fill_rgba = STALE_FILL_RGB + (FILL_ALPHA,)
+            else:
+                fill_rgba = TIER_RGB[row.tier] + (FILL_ALPHA,)
         top = int(math.floor(center - bar_height / 2.0 + 0.5))
         canvas.paste(
             _compose_bar(bar_width, bar_height, bar_radius, fill_width, track_rgba, fill_rgba),
@@ -1043,7 +1246,7 @@ def render_display(display):
 
     if display.kind == "nodata":
         left = scaled(MARGIN_L, scale)
-        for index, line in enumerate(display.rows):
+        for index, line in enumerate(nodata_lines(display)):
             _draw_text(text_draw, font, left, (index + 0.5) * row_height, line,
                        text_rgb + (TEXT_ALPHA,), "l")
     elif display.kind == "dual":
@@ -1051,17 +1254,21 @@ def render_display(display):
         row_font = get_font(dual["font_px"])
         header_font = get_font(dual["header_font_px"])
         header_height = dual["header_height"]
-        for block, edges in zip(display.rows, dual_pixel_columns(scale)):
+        for index, (block, edges) in enumerate(zip(display.rows, dual_pixel_columns(scale))):
             # 名称水平落在该块进度条列的正中，垂直落在页眉带的正中。
             bar_left, bar_right = edges["bar"]
-            tag_alpha = TEXT_ALPHA if any(row.state == "normal" for row in block.rows) else TEXT_ALPHA_STALE
+            header_text, tag_alpha = dual_header(display, index)
             _draw_text(text_draw, header_font, (bar_left + bar_right) / 2.0, header_height / 2.0,
-                       block.tag, text_rgb + (tag_alpha,), "c")
+                       header_text, text_rgb + (tag_alpha,), "c")
             _draw_rows(canvas, text_draw, row_font, block.rows, edges, dual, text_rgb, track_rgba,
                        dual["row_height"], header_height)
     else:
         edges = pixel_columns(scale)
         _draw_rows(canvas, text_draw, font, display.rows, edges, metrics, text_rgb, track_rgba, row_height)
+        aside_text, aside_alpha = single_aside(display)
+        if aside_text:
+            _draw_text(text_draw, font, aside_left(scale), 0.5 * row_height, aside_text,
+                       text_rgb + (aside_alpha,), "l")
     canvas.alpha_composite(text_layer)
     red, green, blue, alpha = canvas.split()
     return Image.merge("RGBA", (red, green, blue, alpha.point(_ALPHA_FLOOR)))
@@ -1116,6 +1323,20 @@ DUAL_SAMPLE_STATES = (
 SAMPLE_STATES = (
     "nodata", "green", "amber", "red", "full", "stale", "reset",
 ) + DUAL_SAMPLE_STATES
+# 另放一份：SAMPLE_STATES 的尾部被测试钉住，原有样张的文件名序号不能变。
+EXTRA_SAMPLE_STATES = (
+    "stale_hours", "stale_one_row",
+    "dual_stale_both", "dual_stale_claude",
+    "caption_new", "caption_same", "caption_error",
+    "dual_caption_new_same", "dual_caption_nodata_error",
+    "caption_nodata", "caption_nodata_error", "dual_caption_all_nodata",
+)
+EXTRA_DUAL_SAMPLE_STATES = (
+    "dual_stale_both", "dual_stale_claude",
+    "dual_caption_new_same", "dual_caption_nodata_error",
+    "dual_caption_all_nodata",
+)
+ALL_SAMPLE_STATES = SAMPLE_STATES + EXTRA_SAMPLE_STATES
 SHEET_BACKGROUNDS = (
     ("light grey #F3F3F3", (0xF3, 0xF3, 0xF3)),
     ("dark grey #202020", (0x20, 0x20, 0x20)),
@@ -1131,7 +1352,7 @@ def _sample_snapshot(name, now):
     def win(pct, resets=resets_5h, observed=fresh):
         return Win(float(pct), resets, observed)
 
-    if name == "nodata":
+    if name in ("nodata", "caption_nodata", "caption_nodata_error", "dual_caption_all_nodata"):
         return None
     if name == "green":
         return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
@@ -1154,6 +1375,26 @@ def _sample_snapshot(name, now):
         # 左侧 Claude：与 amber 样张相同，观测时间仍是新鲜的
         return {"five_hour": win(65), "seven_day": win(33, resets_7d)}
     if name == "dual_claude_none":
+        return None
+    if name == "stale_hours":
+        old = now - 3 * 3600.0
+        return {"five_hour": win(65, observed=old), "seven_day": win(33, resets_7d, old)}
+    if name == "stale_one_row":
+        # 一行陈旧一行正常
+        return {"five_hour": win(65, observed=now - 41 * 60.0), "seven_day": win(33, resets_7d)}
+    if name in ("dual_stale_both", "dual_stale_claude"):
+        old = now - 41 * 60.0
+        return {"five_hour": win(65, observed=old), "seven_day": win(33, resets_7d, old)}
+    if name == "caption_new":
+        return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
+    if name == "caption_same":
+        old = now - 31 * 60.0
+        return {"five_hour": win(65, observed=old), "seven_day": win(33, resets_7d, old)}
+    if name == "caption_error":
+        return {"five_hour": win(65), "seven_day": win(33, resets_7d)}
+    if name == "dual_caption_new_same":
+        return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
+    if name == "dual_caption_nodata_error":
         return None
     raise ValueError("unknown sample state: %s" % name)
 
@@ -1179,7 +1420,53 @@ def _sample_codex_snapshot(name, now):
                 "seven_day": win(55, resets_7d)}
     if name == "dual_claude_none":
         return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
+    if name == "dual_stale_both":
+        old = now - 3 * 3600.0
+        return {"five_hour": win(3, observed=old), "seven_day": win(36, resets_7d, old)}
+    if name == "dual_stale_claude":
+        return {"five_hour": win(3), "seven_day": win(36, resets_7d)}
+    if name == "dual_caption_new_same":
+        old = now - 31 * 60.0
+        return {"five_hour": win(65, observed=old), "seven_day": win(33, resets_7d, old)}
+    if name == "dual_caption_nodata_error":
+        return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
+    if name == "dual_caption_all_nodata":
+        return None
     raise ValueError("unknown sample state: %s" % name)
+
+
+def _sample_captions(name, now):
+    """样张的反馈文字，与应用层一样用 caption_text 算。其它名字返回 None。
+
+    没有任何窗口时整个小窗是无数据布局，反馈文字顶替第二行；caption_nodata、
+    caption_nodata_error、dual_caption_all_nodata 这三个样张演示它。
+    """
+    if name == "caption_new":
+        return (caption_text(now - 3600.0, now - 60.0, ""), "")
+    if name == "caption_same":
+        return (caption_text(now - 31 * 60.0, now - 31 * 60.0, ""), "")
+    if name == "caption_error":
+        return (caption_text(now - 60.0, now - 60.0, "bad_json"), "")
+    if name == "dual_caption_new_same":
+        return (
+            caption_text(now - 3600.0, now - 60.0, ""),
+            caption_text(now - 31 * 60.0, now - 31 * 60.0, ""),
+        )
+    if name == "dual_caption_nodata_error":
+        return (
+            caption_text(None, None, "missing"),
+            caption_text(now - 60.0, now - 60.0, "bad_json"),
+        )
+    if name == "caption_nodata":
+        return (caption_text(None, None, "missing"), "")
+    if name == "caption_nodata_error":
+        return (caption_text(None, None, "bad_json"), "")
+    if name == "dual_caption_all_nodata":
+        return (
+            caption_text(None, None, "missing"),
+            caption_text(None, None, "bad_json"),
+        )
+    return None
 
 
 def sample_display(name, theme, scale):
@@ -1187,11 +1474,12 @@ def sample_display(name, theme, scale):
     now = time.mktime((2026, 10, 2, 15, 0, 0, 0, 0, -1))
     height = scaled(LOGICAL_H, scale)
     snapshot = _sample_snapshot(name, now)
-    if name not in DUAL_SAMPLE_STATES:
-        return build_display(snapshot, now, theme, scale, height)
+    captions = _sample_captions(name, now)
+    if name not in DUAL_SAMPLE_STATES and name not in EXTRA_DUAL_SAMPLE_STATES:
+        return build_display(snapshot, now, theme, scale, height, captions=captions)
     return build_display(
         snapshot, now, theme, scale, height,
-        codex=_sample_codex_snapshot(name, now), codex_available=True)
+        codex=_sample_codex_snapshot(name, now), codex_available=True, captions=captions)
 
 
 def sample_filename(index, name, theme, scale):
@@ -1205,14 +1493,23 @@ def composite_on(image, background_rgb):
     return base.convert("RGB")
 
 
+def contact_sheet_label_width(names, pad=10, gap=10, minimum=170):
+    """标签栏宽度：最长状态名与最长底色名并排，中间留 gap，两侧各留 pad，且不窄于 minimum。"""
+    font = get_font(13)
+    name_width = max(font.getlength(name) for name in names)
+    background_width = max(font.getlength(background_name) for background_name, _rgb in SHEET_BACKGROUNDS)
+    return max(minimum, int(math.ceil(pad + name_width + gap + background_width + pad)))
+
+
 def compose_contact_sheet(rows):
     """rows: [(状态名, [每个组合一张 RGBA 图])]。
 
     每个状态占三行，分别把六种组合合成到三种底色上；左侧写状态名与底色名。
+    标签栏宽度随最长状态名而定，避免长状态名与底色名叠在同一行上。
     """
     pad = 10
     pad_v = 6
-    label_width = 170
+    label_width = contact_sheet_label_width([name for name, _ in rows], pad)
     header_height = 26
     state_gap = 10
     columns = len(SAMPLE_COMBOS)
@@ -1260,10 +1557,10 @@ def say(text):
 
 
 def selftest_render(out_dir):
-    """每个状态在两种主题与三种 scale 下各出一张 RGBA PNG，再拼 contact_sheet.png。"""
+    """每个样张状态在两种主题与三种 scale 下各出一张 RGBA PNG，再拼 contact_sheet.png。"""
     os.makedirs(out_dir, exist_ok=True)
     rows = []
-    for index, name in enumerate(SAMPLE_STATES, 1):
+    for index, name in enumerate(ALL_SAMPLE_STATES, 1):
         images = []
         for theme, scale in SAMPLE_COMBOS:
             image = render_display(sample_display(name, theme, scale))
@@ -2069,6 +2366,8 @@ class WidgetApp:
         self._gdi = {}
         self._watchdog = None
         self._flashing = False
+        self._caption = None          # (截止时间, 各提供方反馈文字)，None 表示没有
+        self._caption_before = None   # 只在 Refresh now 读数据源期间非 None：刷新前各提供方最新的 observed_at
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -2190,6 +2489,11 @@ class WidgetApp:
         elif timer_id == TIMER_FLASH:
             self.kill_timer(TIMER_FLASH)
             self._end_flash()
+        elif timer_id == TIMER_CAPTION:
+            self.kill_timer(TIMER_CAPTION)
+            # 计时器到点就直接擦。系统计时器可能比墙钟略早触发，不能再拿截止时间去比。
+            self._caption = None
+            self.refresh_view()
 
     def on_destroy(self):
         if self._recreating:
@@ -2286,6 +2590,7 @@ class WidgetApp:
         self.shown_display = None
         self._z_order_pending = False
         self._flashing = False
+        self._caption = None
         self._start_timers(recreated=True)
         self.refresh_view(force=True, reassert_topmost=True)
 
@@ -2303,6 +2608,7 @@ class WidgetApp:
         self.shown_display = None
         self._z_order_pending = False
         self._flashing = False
+        self._caption = None
         self._start_timers(recreated=True)
         self.refresh_view(force=True, reassert_topmost=True)
 
@@ -2399,9 +2705,19 @@ class WidgetApp:
         else:
             codex_snapshot = None if self.codex is None else self.codex.snapshot
             codex_available = bool(self.codex and self.codex.available)
+        now = time.time()
+        captions = None
+        if self._caption is not None:
+            # 截止时间是兜底：定时器没建成，或到点那次重绘被菜单、拖动、隐藏挡住时，
+            # 之后两秒一次的 TIMER_CHECK 会因为截止时间已过而重绘擦掉反馈文字。
+            deadline, texts = self._caption
+            if now < deadline:
+                captions = texts
+            else:
+                self._caption = None
         display = build_display(
-            self._current_snapshot(), time.time(), theme, scale, height,
-            codex=codex_snapshot, codex_available=codex_available)
+            self._current_snapshot(), now, theme, scale, height,
+            codex=codex_snapshot, codex_available=codex_available, captions=captions)
         tray = self.w32.tray_notify_rect() if self.mode == MODE_AUTO else None
         geom = compute_layout(rect, edge, scale, display.width, self.mode, self.offset, tray)
         self.scale = scale
@@ -2441,12 +2757,44 @@ class WidgetApp:
     # 周期任务 ----------------------------------------------------------------
 
     def poll_snapshot(self, force=False):
+        """读两个数据源再重绘。TIMER_POLL 与 Refresh now 共用。
+
+        Refresh now 会先把刷新前的最新观测时间放进 self._caption_before。读完数据源后
+        立刻取走并清掉这个标记，再算出反馈文字；第一次重绘就带着它。
+        """
         self.reader.refresh(force=force)
         reason = self.reader.last_reason
         if reason and reason != "missing":
             self.log.log("SnapshotInvalid", reason)
         self._poll_codex(force)
+        # refresh_view 内部的 UpdateLayeredWindow / SetWindowPos 会处理别的线程发来的消息，
+        # 不能让那些路径看到仍然"刷新中"的标记，所以先取到局部变量并立刻置 None。
+        before = self._caption_before
+        self._caption_before = None
+        if before is not None:
+            self._arm_caption(before)
         self.refresh_view()
+
+    def _latest_observed(self):
+        """各提供方当前快照里最新的 observed_at：(Claude, Codex)；没有窗口或没有该数据源则 None。"""
+        codex = None if self.codex is None else self.codex.snapshot
+        return (_snapshot_observed_at(self.reader.snapshot), _snapshot_observed_at(codex))
+
+    def _arm_caption(self, before):
+        """读完数据源后算出各提供方的反馈文字，记下截止时间并起定时器。
+
+        before 是刷新前 _latest_observed() 的结果。定时器建不起来也不用处理：
+        set_timer 自己记日志，截止时间仍由之后的重绘兜底擦掉。
+        """
+        texts = [caption_text(
+            before[0], _snapshot_observed_at(self.reader.snapshot), self.reader.last_reason)]
+        if self.codex is None:
+            texts.append("")
+        else:
+            texts.append(caption_text(
+                before[1], _snapshot_observed_at(self.codex.snapshot), self.codex.last_reason))
+        self._caption = (time.time() + CAPTION_MS / 1000.0, tuple(texts))
+        self.set_timer(TIMER_CAPTION, CAPTION_MS)
 
     def _poll_codex(self, force):
         """刷新 Codex。异常只记日志，不打断已经完成的 Claude 刷新，也不挡住后面的重绘。"""
@@ -2540,6 +2888,25 @@ class WidgetApp:
         self.shown_display = None
         self.refresh_view(force=True)
 
+    def _refresh_now(self, before=None):
+        """Refresh now：记下刷新前的观测时间，重读数据源并重绘（第一次重绘就带反馈文字），再变暗。
+
+        before 是菜单打开那一刻的 _latest_observed()。菜单开着时 TIMER_POLL 仍会派发，
+        新数据可能已经读进读取器；等菜单关了再取，before 会等于新数据，反馈就被写成 same。
+        before 为 None 时才退回当场取（无参调用仍然成立）。
+        poll_snapshot 仍是对外入口，不给它加参数：TIMER_POLL 与现有测试都按 force 单参数
+        调用或替换它。反馈文字靠 _caption_before 接进去：只在读数据源期间非 None，
+        poll_snapshot 读完就清掉；这里的 finally 保住异常路径也清掉。
+        """
+        if before is None:
+            before = self._latest_observed()
+        self._caption_before = before
+        try:
+            self.poll_snapshot(force=True)
+        finally:
+            self._caption_before = None
+        self._begin_flash()
+
     def _begin_flash(self):
         """刷新后把画面短暂变暗再恢复，数据没变时点击也有可见反馈。
 
@@ -2568,6 +2935,9 @@ class WidgetApp:
         if self.menu_open or self.drag is not None:
             return
         x, y = self.w32.cursor_pos()
+        # 菜单开着时 TIMER_POLL 仍会派发，新数据可能在这期间被读进读取器；
+        # 刷新前的观测时间必须在菜单打开这一刻取，不能等菜单关了再取。
+        before = self._latest_observed()
         self.menu_open = True
         try:
             command = self.w32.track_menu(self.hwnd, x, y)
@@ -2579,8 +2949,7 @@ class WidgetApp:
             self.log.log("RecreateWindow", "PostThreadMessageW failed")
             self.w32.post_quit()
         if command == MENU_REFRESH:
-            self.poll_snapshot(force=True)
-            self._begin_flash()
+            self._refresh_now(before)
         elif command == MENU_SNAP:
             self.mode = MODE_AUTO
             self._save_position()
@@ -2615,6 +2984,7 @@ class WidgetApp:
             return
         self.exiting = True
         self._flashing = False
+        self._caption = None
         self.w32.unwatch_window_events()
         try:
             self._arm_watchdog()

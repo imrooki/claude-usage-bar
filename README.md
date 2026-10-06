@@ -33,7 +33,7 @@ usage_widget.py: reads data/usage.json every 15 s and draws the bars
 ```
 
 - The numbers come only from Claude Code's documented [mods API](https://code.claude.com/docs/en/plugins/mods/overview). The project never reads your login token, never calls an unofficial endpoint and adds no requests of its own.
-- Numbers change only while a Claude Code session is active, because they come from the last API response of a session. After 30 minutes without an update the bars and text fade; no data-age label is shown. Once a window's reset time has passed its row shows `reset` until fresh data arrives.
+- Numbers change only while a Claude Code session is active, because they come from the last API response of a session. After 30 minutes without an update the bars turn grey and an age label (`41m`, `3h`, `2d`) shows how old the reading is. Once a window's reset time has passed its row shows `reset` until fresh data arrives.
 - With several sessions open, the plugin merges readings instead of blindly overwriting: inside one window period the usage can only go up, so an idle session's older reading does not replace a newer one, and a later reset time means a new period. There is no file lock, so in a rare race one update can be lost until the next event.
 
 ## Requirements
@@ -144,7 +144,7 @@ To start it at login, put a shortcut in your Startup folder (press Win+R and run
 
 Chat and Claude Code count toward the [same subscription limits](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work) when signed into the same account. A fresh Code reading therefore reflects the shared quota, including chat usage. The widget updates when the plugin receives those readings.
 
-The widget cannot continuously refresh account limits while only chat is active. `Refresh now` re-reads the local snapshot; it does not query the account. Old readings retain their original timestamps and fade after 30 minutes. For a current reading while Code is idle, use Claude's own usage page. The widget does not extract login tokens or add background account requests.
+The widget cannot continuously refresh account limits while only chat is active. `Refresh now` re-reads the local snapshot; it does not query the account. Old readings retain their original timestamps and turn grey, with an age label, after 30 minutes. For a current reading while Code is idle, use Claude's own usage page. The widget does not extract login tokens or add background account requests.
 
 ## Codex usage
 
@@ -152,7 +152,7 @@ The Codex block needs no setup. The Codex CLI and the Codex app write a local se
 
 - **Automatic detection.** The widget looks in the Codex folder of the Windows user it runs as. Without a `sessions` folder it shows only the Claude block, exactly as before; once Codex has been used, the Codex block appears on its own.
 - **Read-only and local.** Only lines that contain both `"token_count"` and `"rate_limits"` are parsed, so your prompts and answers in the same files are never read into the widget. It never opens `auth.json` or any other Codex file, makes no network connection and sends no requests. Only records whose `limit_id` is missing or `codex` are used.
-- **Not an official interface.** The session-log format belongs to Codex and may change in a future release. If it does, the Codex block keeps its last numbers, which fade after 30 minutes, or shows `--` if it never read any; the Claude block is not affected.
+- **Not an official interface.** The session-log format belongs to Codex and may change in a future release. If it does, the Codex block keeps its last numbers, which turn grey after 30 minutes, or shows `--` if it never read any; the Claude block is not affected.
 - **What updates it.** Interactive Codex use updates it. Runs started with `codex exec --ephemeral` write no session log and therefore never show up.
 - **Turning it off.** Start the widget with `--no-codex` to hide the block, or with `--codex-home <folder>` to read another Codex home.
 
@@ -162,14 +162,58 @@ The Codex block needs no setup. The Codex CLI and the Codex app write a local se
 |---|---|
 | The widget re-reads `data/usage.json` and the Codex session log | every 15 s |
 | The widget looks for a newer Codex session log | at most every 60 s |
-| A block fades when its newest reading is older than | 30 min |
+| A block turns grey and shows its age when its newest reading is older than | 30 min |
+| The result of `Refresh now` stays on screen for | about 2.5 s |
 
 The widget can only show what its sources have written. Claude's numbers arrive when a Code session finishes a turn or a limit moves by a whole point; Codex's numbers arrive after each Codex model response. A reading from an ongoing Codex session therefore shows up within about 15 s, one from a newly started session within about 75 s. `Refresh now` in the right-click menu re-reads both sources at once and looks for a new Codex session log immediately.
+
+The grey of an old reading is drawn at full strength on purpose: on a transparent taskbar a faded bar is almost invisible, a grey one is not. The age label shows the age of the oldest stale reading of that block, rounded down: minutes below 2 h, hours below 48 h, then days (never more than `999d`).
+
+## When the numbers do not move
+
+First rule out the two usual causes, which are not faults:
+
+- **The usage happened somewhere the widget cannot see.** Claude Code sessions on another computer, the phone app, claude.ai in a browser and the desktop Chat tab do not write to this folder. They count against the same limits, but the widget only learns about them once a local Code session reports a fresh reading.
+- **The session reports no limits.** Claude Code hands the plugin rate-limit figures only from the last response that carried them, so a session that has not completed a turn yet, or whose responses carried none, gives the plugin nothing to write.
+
+To see which one it is, click `Refresh now` in the right-click menu. For about 2.5 s the widget shows what the click found next to the numbers (in the block header when two blocks are shown):
+
+| Text | Meaning |
+|---|---|
+| `new 14:59` | A reading newer than the one on screen was found; 14:59 is when it was taken (local time). |
+| `same 14:29` | Nothing newer exists in the data; the newest reading was taken at 14:29. The widget works, the source has not written anything since. |
+| `no data` | There is no reading at all yet for this block. |
+| `read error` | The data (the Claude data file, or the Codex session log for the Codex block) exists but could not be read or parsed. |
+
+Each block gets its own text, so a fresh Claude block and a stale Codex block can say `new` and `same` side by side.
+
+If a Code session is running and the widget still says `same`, look at the plugin's own log, `usage-feed-events.json`, in the same folder as `usage.json`. The plugin adds one entry per hook call and keeps the latest 200. It is plain JSON; open it in any editor, newest entry last:
+
+```json
+{"t": 1790900000123, "ev": "session.measure", "sid": "...", "n": 2, "kinds": ["five_hour", "seven_day"], "kept": 2, "out": "wrote", "why": "", "held": [], "changed": []}
+```
+
+| Field | Meaning |
+|---|---|
+| `t` | Time of the call, in milliseconds since 1970 |
+| `ev` | `session.start` or `session.measure` (after every turn or whenever a limit moves) |
+| `sid` | The session that made the call |
+| `n`, `kinds` | How many limit windows Claude Code handed over, and which kinds (`five_hour`, `seven_day`, `spend_limit`) |
+| `kept` | How many of them were usable |
+| `out` | `wrote` (usage.json updated), `skipped` (nothing to write) or `failed` (the write failed) |
+| `why` | Empty when `out` is `wrote`. Otherwise `no_rate_limits` (the session reported none), `all_dropped` (every window was unusable, see `drops`), `bad_clock` (no valid time from the engine), `usage_error:<name>` (reading the usage failed) or `write_error:<name>` (writing failed) |
+| `drops` | Why windows were unusable, as counts, for example `{"no_resets_at": 2}`; left out when nothing was dropped. Reasons: `not_object`, `unknown_kind`, `bad_percent`, `no_resets_at`, `bad_resets_at`, `duplicate_kind` |
+| `held` | Windows whose new reading did not replace the stored one, because it was lower in the same period or belonged to an earlier period; the stored value was kept |
+| `changed` | The names of the metrics that changed, as the engine reported them (empty at session start) |
+
+How to read it: many `no_rate_limits` entries mean that session never receives limits (not a fault of the widget or the plugin). `all_dropped` with `no_resets_at` means Claude Code sent percentages without a reset time, which the plugin does not accept. `held` filled in again and again means another session wrote a higher reading in the same period. No new entries at all while you work usually means the plugin is not loaded in that session; see the install section for the debug-file check.
+
+The log holds no file paths, working folders, prompts or model names, only what the table lists. It is written without a lock; with several sessions at once an entry can be lost, and in a rare race the whole log restarts from empty. It is for troubleshooting only and nothing reads it back.
 
 ## Using the widget
 
 - **Drag** it sideways to move it. It then stays where you put it.
-- **Right-click** for the menu: `Refresh now`, `Snap to tray` (go back to following the notification area automatically) and `Quit`. `Refresh now` re-reads both sources at once and dims the widget for about 0.3 s, so you can see that it ran even when no new reading has arrived.
+- **Right-click** for the menu: `Refresh now`, `Snap to tray` (go back to following the notification area automatically) and `Quit`. `Refresh now` re-reads both sources at once, dims the widget for about 0.3 s and then shows for about 2.5 s what it found (`new 14:59`, `same 14:29`, `no data` or `read error`, see "When the numbers do not move"), so you can see that it ran even when no new reading has arrived.
 - It hides itself while a full-screen app is running (an ordinary application window covering the whole monitor of the taskbar) and while the taskbar is set to auto-hide. Clicking the taskbar or the desktop does not count as full screen.
 - It stays visible while the Start menu, Quick Settings or the notification overflow is open, and after a click on empty taskbar space. This was checked with screenshots on build 26200, opening Start and Quick Settings both by keyboard and by mouse.
 
@@ -190,7 +234,7 @@ Known limitations:
 - To follow the notification area the widget reads the window rectangle of `TrayNotifyWnd` (read-only queries, every 2 s), so it moves when tray icons come and go.
 - Foreground and window-order notifications use out-of-context WinEvent hooks. When the taskbar covers the widget, for example after the Start menu closes, it restores its own window order without taking focus; repeated notifications are coalesced and the 2 s check remains as a fallback. Only overlapping shell panel rectangles prevent that restoration. Full-screen, auto-hide and menu rules still apply. Some machines report a busy notification state all the time, so a busy state alone does not hide the widget: the foreground must also be an ordinary application window covering the whole monitor of the taskbar. The taskbar, the desktop and the widget's own windows never count.
 - The widget makes no network connections and starts no subprocesses. It reads one registry value (the light/dark setting), `data/usage.json` and, read-only, the tail of the newest Codex session logs, and it writes only `widget_pos.json` and a small error log (capped at 64 KB) into the data folder. Looking for the newest Codex session log stats the files of the last 14 date folders at most once a minute (about 2 ms with 1,200 session logs); reading takes at most 1 MB from the end of a log.
-- The plugin calls five Claude Code APIs (`session.usage`, `session.id`, `clock.now`, `fs.read`, `fs.write`), hooks only `session.start` and `session.measure`, and writes only `usage.json` in the folder you configured. Every hook runs the engine's own handling first, and a failure inside the plugin is swallowed, so it cannot change how a session behaves.
+- The plugin calls five Claude Code APIs (`session.usage`, `session.id`, `clock.now`, `fs.read`, `fs.write`), hooks only `session.start` and `session.measure`, and writes only `usage.json` and the troubleshooting log `usage-feed-events.json` in the folder you configured. Every hook runs the engine's own handling first, and a failure inside the plugin is swallowed, so it cannot change how a session behaves.
 
 `usage.json` looks like this (`resets_at` is Unix seconds, `observed_at` is when the value was last confirmed):
 
@@ -212,9 +256,9 @@ Known limitations:
 | `usage_widget.py` | The taskbar widget |
 | `plugins/.claude-plugin/marketplace.json` | Local marketplace that lists the plugin |
 | `plugins/usage-feed/` | The Claude Code plugin: `hooks/register.ts` and its tests in `tests/` |
-| `tests/` | Widget tests: window events, taskbar ownership and window recovery, full-screen detection, the Codex session-log reader and the two-block display |
+| `tests/` | Widget tests: window events, taskbar ownership and window recovery, full-screen detection, the Codex session-log reader, the two-block display, and the stale-reading and refresh-result display |
 
-The plugin has 53 tests that run on Claude Code's own test kit:
+The plugin has 75 tests that run on Claude Code's own test kit:
 
 ```powershell
 claude plugin validate ./plugins/usage-feed

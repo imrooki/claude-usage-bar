@@ -59,11 +59,16 @@ Deploy the claude-usage-bar project on this Windows 11 machine.
 Repository: https://github.com/imrooki/claude-usage-bar
 Goal: a transparent taskbar widget shows my Claude plan usage (5-hour and 7-day
 windows). The numbers come from the usage-feed Claude Code plugin in that repository,
-which writes data/usage.json; usage_widget.py draws them.
+which writes data/usage.json; usage_widget.py draws them. If the Codex CLI is
+installed, the widget also shows a Codex block on its own. The widget's right-click
+menu has "Refresh now"; what it does and what it costs is described in the README
+sections "Refresh now and the app's usage tool" and "Codex usage". Read them first.
 
 If an earlier copy of this project or plugin is already set up on this machine,
-update it in place (pull the latest version and reuse its folder and settings)
-instead of creating a second copy.
+update it in place (git pull --ff-only, reuse its folder and settings) instead of
+creating a second copy. A plugin update is only picked up by sessions that start after
+it, so ask me to open a new Claude Code session afterwards, and restart the widget
+(Quit from its right-click menu, then start it again).
 
 1. Clone the repository into a local folder that is not inside OneDrive and not on a
    network share (the plugin refuses such paths). Create the "data" folder inside it.
@@ -78,20 +83,36 @@ instead of creating a second copy.
          "dataDir": "<absolute path of <repo>\data, written with forward slashes>" } } }
    If usage-feed@usage-bar-local is installed from a plugin marketplace, disable it:
    claude plugin disable usage-feed@usage-bar-local
+   (A marketplace install is only for terminal sessions: in the desktop app it loads
+   but its hooks never run, so it must not be the only way the plugin is loaded.)
 5. Start the widget without a console window: pythonw "<repo>\usage_widget.py"
    It runs as a single instance.
-6. Ask me to open a new Claude Code session and send one message. Then check that
-   <repo>\data\usage.json was written by that session (its session_id) and that the
-   widget shows the numbers. If the Codex CLI is installed for my Windows user, the
-   widget shows a second "Codex" block on its own; nothing needs configuring for it.
-7. Only if I confirm: create a shortcut in my Startup folder (shell:startup) whose
+6. Ask me to open a new Claude Code session and send one message. Then check:
+   - <repo>\data\usage.json was written by that session (its session_id) and the
+     widget shows the numbers;
+   - <repo>\data\usage-feed-events.json has entries for that session (an "ev":
+     "session.start" and an "ev": "session.measure" entry). If there is none, the
+     plugin is not running in that session: re-check step 4 and the README section
+     "When the numbers do not move".
+   If the Codex CLI is installed for my Windows user, the widget shows a second
+   "Codex" block on its own; nothing needs configuring for it.
+7. Ask me to right-click the widget and choose "Refresh now" once, myself. Do not
+   click it for me. Then check that <repo>\data\refresh-ack.json has "status": "ok"
+   and that the Claude block showed "new HH:MM" or "same HH:MM". "no session" means
+   no desktop-app session with the plugin loaded answered; see the README. The
+   click also sends one tiny request through my own Codex CLI when the Codex block
+   is shown; tell me that before I click, and mention that --no-codex-ping and
+   --no-app-refresh switch the two requests off.
+8. Only if I confirm: create a shortcut in my Startup folder (shell:startup) whose
    target is pythonw.exe and whose argument is the full path of usage_widget.py in
    quotes.
 
 Rules: use only the documented Claude Code plugin mechanisms. Do not read or copy
-login tokens or cookies, do not call any unofficial usage endpoint, and do not send
-extra model requests to refresh usage. Do not commit or push anything. At the end,
-list every file and setting you changed.
+login tokens, cookies or auth.json, do not call any unofficial usage endpoint, and do
+not send any model request yourself to refresh usage; the only requests this project
+makes are the two that happen when I click "Refresh now" (the Claude one uses the
+desktop app's own usage tool, the Codex one a tiny codex exec request). Do not commit
+or push anything. At the end, list every file and setting you changed.
 ```
 
 ### Install by hand
@@ -137,7 +158,9 @@ Open a new Claude Code session, send one message, then start the widget:
 pythonw usage_widget.py
 ```
 
-After the first completed turn, `data/usage.json` should carry that session's `session_id`. If it does not, start Claude Code with `--debug-file <path>` and look for `hooks module usage-feed@inline loaded` (or `usage-feed@usage-bar-local` for the marketplace copy) in that file.
+After the first completed turn, `data/usage.json` should carry that session's `session_id`, and `data/usage-feed-events.json` should have an entry with the same `sid` (a `session.start`, then a `session.measure`). If neither does, the plugin is not running in that session: start Claude Code with `--debug-file <path>` and look for `hooks module usage-feed@inline loaded` (or `usage-feed@usage-bar-local` for the marketplace copy) in that file, and re-check that the settings above are in `%USERPROFILE%\.claude\settings.json`.
+
+**Updating.** After `git pull`, nothing has to be reinstalled when the plugin is loaded from its folder with `CLAUDE_CODE_PLUGIN_DIRS`: sessions that start afterwards run the new code, sessions that are already open keep the version they loaded, so open a new one. Restart the widget too (`Quit`, then start it again). For a marketplace install in a terminal, run `claude plugin update usage-feed@usage-bar-local` as well; it only updates when the version in `plugin.json` has changed, which is why the version is bumped with every plugin change.
 
 By default the widget reads `data/usage.json` next to the script. To use another folder pass `--data-dir <folder>`; it has to be the same folder you gave the plugin.
 
@@ -155,7 +178,7 @@ When you click `Refresh now`, the widget writes a small request file, `refresh-r
 
 - **Limits.** One request per click; after an answer the widget accepts the next click after 60 s (10 s after an unanswered one); each session also refuses to call the tool more than once per 30 s (a failed call counts too, so a retry within 30 s of a failure can show `no session` once more); a request older than 30 s is ignored; a call that takes longer than 15 s is given up. Nothing is sent without a click.
 - **The numbers it writes.** The tool reports whole percents, the session figures carry one decimal. If the tool's number is the same as the stored one within 1 point, the stored number is kept and only its observation time is refreshed, so the widget can say `new` without the figure jumping. A figure is never replaced by a lower one from the same period.
-- **No session.** If no desktop-app session answers within 8 s, the Claude block shows `no session`. Reasons: only terminal sessions are open (they have no such tool), no session has the updated plugin loaded (run `/reload-plugins` in an open session, or start a new one), or the app has no session open at all. Every failure is silent on the plugin side, so a terminal session never blocks a desktop one; the plugin's log, `usage-feed-events.json`, records the attempts as `refresh.app` entries.
+- **No session.** If no desktop-app session answers within 8 s, the Claude block shows `no session`. Reasons: only terminal sessions are open (they have no such tool); no open desktop-app session runs the updated plugin (a plugin update is only picked up by sessions that start after it, so open a new one); the plugin is loaded in the desktop app through a marketplace install instead of `CLAUDE_CODE_PLUGIN_DIRS` (see Install: that copy loads but its hooks never run in desktop sessions); or the app has no session open at all. To tell these apart, look in `usage-feed-events.json`: a desktop session that runs the plugin has entries with its own `sid`, and a click it handled leaves a `refresh.app` entry. Every failure is silent on the plugin side, so a terminal session never blocks a desktop one; the plugin's log, `usage-feed-events.json`, records the attempts as `refresh.app` entries.
 - **Not a promise.** `ccd_session_mgmt` is a tool of the desktop app, not part of the documented mods API; only `$.mcp.call` is documented. If the app renames or removes it, the click falls back to `no session` and nothing else breaks. Turn the request off with `--no-app-refresh`.
 
 ## Codex usage

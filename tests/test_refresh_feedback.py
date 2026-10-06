@@ -35,6 +35,8 @@ def make_app():
     app.hwnd = 10
     app.visible = True
     app._apply = Mock()
+    # Keep the app refresh off here: a real one would write a request file into the data directory.
+    app.app_refresher = None
     return app
 
 

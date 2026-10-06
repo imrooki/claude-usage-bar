@@ -3,9 +3,10 @@
 // 底层 hook 上，文件在内存里模拟，所以这里任何一次"写"都不会碰磁盘。
 // 引擎宿主会把传给 fs 的路径换成反斜杠，所以断言路径时统一用 norm 换回正斜杠；
 // 模块自己传出的原始字符串（正斜杠、去末尾斜杠）不在这里断言。
-import { test, expect } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import { test, expect, mock } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On } from 'claude-code'
+import { parseRequest, parseAck, extractPayload, windowsFromApp, mergeApp } from '../hooks/register.ts'
 
 // 假路径，只是内存假文件系统里的键，不对应任何真实目录。
 const DATA_DIR = 'D:/usage-feed-test/mem'
@@ -46,6 +47,7 @@ const makeWorld = (on: On) => {
     files: new Map<string, string>(),
     events: [] as string[],
     writes: [] as { path: string; text: string }[],
+    timers: [] as number[], // 被测模块每次 $.clock.every 的间隔（毫秒）；不进 events，原因见下面的记录器
     reads: [] as string[], // 每次 fs.read 的 norm 路径，按调用顺序；被拒绝的读也要记
     failReadPaths: new Set<string>(), // 这些路径（norm 形式）的 fs.read 被拒绝
     failWritePaths: new Set<string>(), // 这些路径（norm 形式）的 fs.write 被拒绝
@@ -63,7 +65,10 @@ const makeWorld = (on: On) => {
   // 先注册的在最外层，能看到之后所有事件，包括被测模块发起的引擎调用。
   on('*', async (_$, e, next) => {
     const name = String(next.event)
-    if (!BOOT_NOISE.has(name)) w.events.push(name)
+    // clock.every 单独记：它不属于各组 events 断言所描述的读写流程，而这些断言要保持严格
+    // （clock.after 等其它任何新调用仍会进 events 被抓到）。定时器本身另有专门的用例核对。
+    if (name === 'clock.every') w.timers.push((e as unknown as { ms: number }).ms)
+    else if (!BOOT_NOISE.has(name)) w.events.push(name)
     return next(e)
   })
   on('clock.now', () => {
@@ -101,6 +106,8 @@ const makeWorld = (on: On) => {
     w.lastMeasure = value
     return value
   })
+  // 这个夹具没有可推进的时钟：拒绝 clock.every，间隔在第一期就结束，不会空转。每次布下都被拒绝，所以 w.timers 的长度就是布下定时器的次数。
+  on('clock.every', () => ({ deny: 'no timers in this fixture' }))
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   return w
 }
@@ -1361,4 +1368,1794 @@ scenario('pass-through: both hooks return what the rest of the chain produced, a
   w.usageLimits = [lim('five_hour', 30, R5)]
   w.failing.add('write')
   expect(await start($)).toStrictEqual(w.lastStart)
+})
+
+// ---------------------------------------------------------------- 刷新请求：纯函数
+
+const REQ_ID = '3fa91c07b2de'
+const REQ_AT = 1791279531.301
+// 协议里 get_usage 的真实形状。\u00b7 是标签里真实出现的中点。
+const REAL_PLAN = {
+  plan: {
+    status: 'ok',
+    plan: 'Max',
+    windows: [
+      { label: '5-hour limit', percentUsed: 67, resetsAt: '2026-10-06T10:49:59.664Z', resetsIn: '1h 10m' },
+      { label: 'Weekly \u00b7 all models', percentUsed: 57, resetsAt: '2026-10-11T05:59:59.664Z', resetsIn: '4d 20h' },
+      { label: 'Weekly \u00b7 Fable', percentUsed: 0, resetsAt: '2026-10-11T06:00:00.000Z', resetsIn: '4d 20h' },
+    ],
+    extraUsage: { enabled: false, percentUsed: 0, spent: '0.00', monthlyLimit: '155.00', currency: 'AUD' },
+  },
+  context: { session: 'self', status: 'ok', tokensUsed: 413648, contextWindow: 1000000, percentUsed: 41 },
+}
+
+const reqText = (id: unknown, at: unknown, schema: unknown = 1, extra?: Record<string, unknown>): string =>
+  JSON.stringify({ schema, id, requested_at: at, ...extra })
+
+test('app pure: parseRequest accepts the protocol example and ignores extra fields', () => {
+  const text = JSON.stringify({ schema: 1, id: REQ_ID, requested_at: REQ_AT })
+  const got = parseRequest(text)
+  expect(got, 'protocol example').toEqual({ id: REQ_ID, requestedAt: REQ_AT })
+  expect(Object.keys(got ?? {}), 'protocol example keys').toEqual(['id', 'requestedAt'])
+  const extra = parseRequest(reqText(REQ_ID, REQ_AT, 1, { note: 'x', n: 2 }))
+  expect(extra, 'extra fields').toEqual({ id: REQ_ID, requestedAt: REQ_AT })
+  expect(Object.keys(extra ?? {}), 'extra fields keys').toEqual(['id', 'requestedAt'])
+})
+
+test('app pure: parseRequest id length and charset', () => {
+  const rows: { label: string; id: unknown; ok: boolean }[] = [
+    { label: 'one char', id: 'a', ok: true },
+    { label: '32 chars', id: 'a'.repeat(32), ok: true },
+    { label: '33 chars', id: 'a'.repeat(33), ok: false },
+    { label: 'mixed case and digits', id: 'AbC09zZ1', ok: true },
+    { label: 'empty', id: '', ok: false },
+    { label: 'hyphen', id: 'ab-cd', ok: false },
+    { label: 'space', id: 'ab cd', ok: false },
+    { label: 'cjk', id: 'id中文', ok: false },
+    { label: 'trailing newline', id: REQ_ID + '\n', ok: false },
+    { label: 'slash', id: 'a/b', ok: false },
+    { label: 'backslash', id: 'a\\b', ok: false },
+  ]
+  for (const row of rows) {
+    const got = parseRequest(reqText(row.id, REQ_AT))
+    if (row.ok) expect(got, row.label).toEqual({ id: row.id, requestedAt: REQ_AT })
+    else expect(got, row.label).toBeNull()
+  }
+})
+
+test('app pure: parseRequest rejects a non-string or missing id', () => {
+  const rows: { label: string; text: string }[] = [
+    { label: 'numeric id', text: JSON.stringify({ schema: 1, id: 12, requested_at: REQ_AT }) },
+    { label: 'null id', text: JSON.stringify({ schema: 1, id: null, requested_at: REQ_AT }) },
+    { label: 'array id', text: JSON.stringify({ schema: 1, id: ['a'], requested_at: REQ_AT }) },
+    { label: 'missing id', text: JSON.stringify({ schema: 1, requested_at: REQ_AT }) },
+  ]
+  for (const row of rows) expect(parseRequest(row.text), row.label).toBeNull()
+})
+
+test('app pure: parseRequest schema must be the number 1', () => {
+  const rows: { label: string; schema: unknown }[] = [
+    { label: 'schema 2', schema: 2 },
+    { label: "schema '1'", schema: '1' },
+    { label: 'schema true', schema: true },
+  ]
+  for (const row of rows) expect(parseRequest(reqText(REQ_ID, REQ_AT, row.schema)), row.label).toBeNull()
+  expect(parseRequest(JSON.stringify({ id: REQ_ID, requested_at: REQ_AT })), 'schema missing').toBeNull()
+})
+
+test('app pure: parseRequest requested_at must be a finite number', () => {
+  const bad: { label: string; text: string }[] = [
+    { label: 'missing', text: JSON.stringify({ schema: 1, id: REQ_ID }) },
+    { label: 'null', text: JSON.stringify({ schema: 1, id: REQ_ID, requested_at: null }) },
+    { label: 'string', text: JSON.stringify({ schema: 1, id: REQ_ID, requested_at: '5' }) },
+    { label: 'true', text: JSON.stringify({ schema: 1, id: REQ_ID, requested_at: true }) },
+    { label: 'infinity', text: '{"schema":1,"id":"' + REQ_ID + '","requested_at":1e999}' },
+  ]
+  for (const row of bad) expect(parseRequest(row.text), row.label).toBeNull()
+  const good: { label: string; at: number }[] = [
+    { label: 'zero', at: 0 },
+    { label: 'negative', at: -3.5 },
+    { label: 'fraction', at: 1.25 },
+  ]
+  for (const row of good) expect(parseRequest(reqText(REQ_ID, row.at)), row.label).toEqual({ id: REQ_ID, requestedAt: row.at })
+})
+
+test('app pure: parseRequest strips one leading BOM and rejects bad roots', () => {
+  const text = JSON.stringify({ schema: 1, id: REQ_ID, requested_at: REQ_AT })
+  expect(parseRequest('\ufeff' + text), 'one bom').toEqual({ id: REQ_ID, requestedAt: REQ_AT })
+  expect(parseRequest('\ufeff\ufeff' + text), 'two boms').toBeNull()
+  const bad: { label: string; text: unknown }[] = [
+    { label: 'broken json', text: '{schema:1' },
+    { label: 'truncated', text: '{"schema":1,"id":"' + REQ_ID + '","requested_a' },
+    { label: 'empty', text: '' },
+    { label: 'array', text: '[]' },
+    { label: 'null', text: 'null' },
+    { label: 'number', text: '42' },
+    { label: 'string', text: '"x"' },
+    { label: 'undefined', text: undefined },
+    { label: 'null input', text: null },
+    { label: 'number input', text: 5 },
+    { label: 'object input', text: { schema: 1, id: REQ_ID, requested_at: REQ_AT } },
+  ]
+  for (const row of bad) expect(parseRequest(row.text), row.label).toBeNull()
+})
+
+test('app pure: parseAck accepts the protocol example and any status string', () => {
+  const text = JSON.stringify({ schema: 1, id: REQ_ID, status: 'ok', at: 1791279533.912, windows: 2 })
+  const got = parseAck(text)
+  expect(got, 'protocol example').toEqual({ id: REQ_ID, status: 'ok' })
+  expect(Object.keys(got ?? {}), 'protocol example keys').toEqual(['id', 'status'])
+  expect(parseAck(JSON.stringify({ schema: 1, id: REQ_ID, status: 'unavailable' })), 'unavailable').toEqual({
+    id: REQ_ID,
+    status: 'unavailable',
+  })
+  expect(parseAck(JSON.stringify({ schema: 1, id: REQ_ID, status: 'zzz' })), 'any string').toEqual({
+    id: REQ_ID,
+    status: 'zzz',
+  })
+})
+
+test('app pure: parseAck id follows the same whitelist', () => {
+  const rows: { label: string; text: string }[] = [
+    { label: '33 chars', text: JSON.stringify({ schema: 1, id: 'a'.repeat(33), status: 'ok' }) },
+    { label: 'hyphen', text: JSON.stringify({ schema: 1, id: 'ab-cd', status: 'ok' }) },
+    { label: 'numeric id', text: JSON.stringify({ schema: 1, id: 12, status: 'ok' }) },
+    { label: 'missing id', text: JSON.stringify({ schema: 1, status: 'ok' }) },
+  ]
+  for (const row of rows) expect(parseAck(row.text), row.label).toBeNull()
+})
+
+test('app pure: parseAck rejects a bad schema, a non-string status, a truncated file and non-string input, and strips one BOM', () => {
+  const rows: { label: string; text: unknown }[] = [
+    { label: 'schema 2', text: JSON.stringify({ schema: 2, id: REQ_ID, status: 'ok' }) },
+    { label: 'status missing', text: JSON.stringify({ schema: 1, id: REQ_ID }) },
+    { label: 'status null', text: JSON.stringify({ schema: 1, id: REQ_ID, status: null }) },
+    { label: 'status number', text: JSON.stringify({ schema: 1, id: REQ_ID, status: 1 }) },
+    { label: 'status object', text: JSON.stringify({ schema: 1, id: REQ_ID, status: { ok: true } }) },
+    { label: 'truncated', text: '{"schema":1,"id":"' + REQ_ID + '","sta' },
+    { label: 'undefined', text: undefined },
+    { label: 'null input', text: null },
+    { label: 'number input', text: 5 },
+  ]
+  for (const row of rows) expect(parseAck(row.text), row.label).toBeNull()
+  const text = JSON.stringify({ schema: 1, id: REQ_ID, status: 'ok', at: 1, windows: 0 })
+  expect(parseAck('\ufeff' + text), 'one bom').toEqual({ id: REQ_ID, status: 'ok' })
+})
+
+test('app pure: extractPayload prefers structuredContent over a text block', () => {
+  const onlyStructured = extractPayload({ structuredContent: REAL_PLAN })
+  expect(onlyStructured, 'structured only').toEqual(REAL_PLAN)
+  const onlyText = extractPayload({ content: [{ type: 'text', text: JSON.stringify(REAL_PLAN) }] })
+  expect(onlyText, 'text only').toEqual(REAL_PLAN)
+  const structured = { plan: { status: 'ok', from: 'structured' } }
+  const both = extractPayload({
+    structuredContent: structured,
+    content: [{ type: 'text', text: JSON.stringify({ plan: { status: 'ok', from: 'text' } }) }],
+  })
+  expect(both, 'structured wins').toEqual(structured)
+  expect((both as { plan: { from: string } }).plan.from, 'not the text body').toBe('structured')
+})
+
+test('app pure: extractPayload falls back when structuredContent is not an object', () => {
+  const body = { plan: { status: 'ok' } }
+  const rows: { label: string; structuredContent: unknown }[] = [
+    { label: 'string', structuredContent: '{"plan":1}' },
+    { label: 'array', structuredContent: [{ plan: 1 }] },
+    { label: 'null', structuredContent: null },
+  ]
+  for (const row of rows) {
+    const got = extractPayload({
+      structuredContent: row.structuredContent,
+      content: [{ type: 'text', text: JSON.stringify(body) }],
+    })
+    expect(got, row.label).toEqual(body)
+  }
+})
+
+test('app pure: extractPayload returns null for a bad response shape', () => {
+  const rows: { label: string; res: unknown }[] = [
+    { label: 'null res', res: null },
+    { label: 'undefined res', res: undefined },
+    { label: 'string res', res: 'x' },
+    { label: 'number res', res: 5 },
+    { label: 'array res', res: [] },
+    { label: 'content string', res: { content: 'nope' } },
+    { label: 'content object', res: { content: { type: 'text', text: '{}' } } },
+    { label: 'content missing', res: {} },
+    { label: 'json array', res: { content: [{ type: 'text', text: '[1,2]' }] } },
+    { label: 'json null', res: { content: [{ type: 'text', text: 'null' }] } },
+    { label: 'json number', res: { content: [{ type: 'text', text: '7' }] } },
+    { label: 'json string', res: { content: [{ type: 'text', text: '"hi"' }] } },
+    { label: 'broken json', res: { content: [{ type: 'text', text: '{no' }] } },
+    { label: 'empty content', res: { content: [] } },
+    { label: 'image only', res: { content: [{ type: 'image' }] } },
+    { label: 'text not a string', res: { content: [{ type: 'text', text: 12 }] } },
+  ]
+  for (const row of rows) expect(extractPayload(row.res), row.label).toBeNull()
+})
+
+test('app pure: extractPayload does not fall through after the first text block', () => {
+  const good = JSON.stringify({ plan: { status: 'ok' } })
+  expect(
+    extractPayload({ content: [{ type: 'text', text: '{bad' }, { type: 'text', text: good }] }),
+    'first text is broken json',
+  ).toBeNull()
+  expect(
+    extractPayload({ content: [{ type: 'text', text: '[1]' }, { type: 'text', text: good }] }),
+    'first text is a json array',
+  ).toBeNull()
+  expect(
+    extractPayload({
+      content: [{ type: 'image' }, { type: 'text', text: 1 }, { type: 'text', text: good }],
+    }),
+    'skips non-text then takes the first string',
+  ).toEqual({ plan: { status: 'ok' } })
+})
+
+test('app pure: extractPayload ignores isError and returns the parsed plan', () => {
+  const got = extractPayload({
+    isError: true,
+    content: [{ type: 'text', text: JSON.stringify(REAL_PLAN) }],
+  })
+  expect(got, 'isError still parsed').toEqual(REAL_PLAN)
+  const plan = (got as { plan: { windows: { label: string }[] } }).plan
+  expect(plan.status, 'plan status').toBe('ok')
+  expect(plan.windows[0].label, 'first label').toBe('5-hour limit')
+  expect(plan.windows[1].label, 'weekly all models').toBe('Weekly \u00b7 all models')
+  expect(plan.windows[2].label, 'weekly fable').toBe('Weekly \u00b7 Fable')
+})
+
+// ---------------------------------------------------------------- 刷新请求：映射与合并
+
+const fr = (used: number, resets: number) => ({ used_percentage: used, resets_at: resets })
+const planOf = (windows: unknown, status: unknown = 'ok') => ({ plan: { status, windows } })
+const w5 = (percentUsed: unknown, resetsAt: unknown) => ({ label: '5-hour limit', percentUsed, resetsAt })
+const w7 = (percentUsed: unknown, resetsAt: unknown) => ({ label: 'Weekly \u00b7 all models', percentUsed, resetsAt })
+const EMPTY_APP = { status: null, fresh: {}, drops: {}, count: 0 }
+const FABLE = 'Weekly \u00b7 Fable'
+const ISO_5H = '2026-10-06T10:49:59.664Z'
+const RESET_5H = 1791283799
+const ISO_7D = '2026-10-11T05:59:59.664Z'
+const RESET_7D = 1791698399
+
+test('app pure: windowsFromApp maps the real plan and drops the per-model weekly window', () => {
+  const got = windowsFromApp(REAL_PLAN)
+  expect(got, 'real plan').toEqual({
+    status: 'ok',
+    fresh: {
+      five_hour: { used_percentage: 67, resets_at: RESET_5H },
+      seven_day: { used_percentage: 57, resets_at: RESET_7D },
+    },
+    drops: {},
+    count: 3,
+  })
+  expect(Object.keys(got), 'result keys').toEqual(['status', 'fresh', 'drops', 'count'])
+  expect(Object.keys(got.fresh), 'no spend_limit').toEqual(['five_hour', 'seven_day'])
+  expect('spend_limit' in got.fresh, 'spend_limit absent').toBe(false)
+})
+
+test('app pure: windowsFromApp keeps a non-ok status and still maps windows', () => {
+  // status 不是 'ok' 时照常映射，要不要用由调用方决定。
+  const mapped = windowsFromApp(planOf([w5(67, ISO_5H)], 'not_applicable'))
+  expect(mapped, 'not_applicable still maps').toEqual({
+    status: 'not_applicable',
+    fresh: { five_hour: { used_percentage: 67, resets_at: RESET_5H } },
+    drops: {},
+    count: 1,
+  })
+  const rows: { label: string; status: unknown }[] = [
+    { label: 'missing', status: undefined },
+    { label: 'number', status: 5 },
+    { label: 'null', status: null },
+    { label: 'object', status: { ok: true } },
+  ]
+  for (const row of rows) {
+    const got = windowsFromApp({ plan: { ...(row.status === undefined ? {} : { status: row.status }), windows: [w5(1, ISO_5H)] } })
+    expect(got.status, row.label).toBeNull()
+    expect(got.fresh, row.label + ' still mapped').toEqual({ five_hour: { used_percentage: 1, resets_at: RESET_5H } })
+  }
+  expect(windowsFromApp(planOf([], 'x'.repeat(200))).status, 'clipped to 128').toBe('x'.repeat(128))
+})
+
+test('app pure: windowsFromApp returns an empty result when plan is not an object', () => {
+  const rows: { label: string; payload: unknown }[] = [
+    { label: 'empty object', payload: {} },
+    { label: 'null', payload: null },
+    { label: 'string', payload: 'x' },
+    { label: 'array', payload: [] },
+    { label: 'number', payload: 5 },
+    { label: 'plan null', payload: { plan: null } },
+    { label: 'plan string', payload: { plan: 'x' } },
+    { label: 'plan array', payload: { plan: [] } },
+    { label: 'plan number', payload: { plan: 5 } },
+  ]
+  for (const row of rows) expect(windowsFromApp(row.payload), row.label).toEqual(EMPTY_APP)
+})
+
+test('app pure: windowsFromApp treats a non-array windows list as empty', () => {
+  const rows: { label: string; plan: Record<string, unknown> }[] = [
+    { label: 'missing', plan: { status: 'ok' } },
+    { label: 'null', plan: { status: 'ok', windows: null } },
+    { label: 'string', plan: { status: 'ok', windows: 'x' } },
+    { label: 'object', plan: { status: 'ok', windows: {} } },
+    { label: 'number', plan: { status: 'ok', windows: 5 } },
+  ]
+  for (const row of rows) {
+    expect(windowsFromApp({ plan: row.plan }), row.label).toEqual({ status: 'ok', fresh: {}, drops: {}, count: 0 })
+  }
+})
+
+test('app pure: windowsFromApp only looks at the first 12 windows', () => {
+  const filler = { label: FABLE, percentUsed: 1, resetsAt: ISO_5H }
+  const past = [...Array.from({ length: 12 }, () => filler), w5(9, ISO_5H)]
+  expect(windowsFromApp(planOf(past)), 'index 12 ignored').toEqual({ status: 'ok', fresh: {}, drops: {}, count: 12 })
+  const at11 = [...Array.from({ length: 11 }, () => filler), w5(9, ISO_5H)]
+  expect(windowsFromApp(planOf(at11)), 'index 11 mapped').toEqual({
+    status: 'ok',
+    fresh: { five_hour: { used_percentage: 9, resets_at: RESET_5H } },
+    drops: {},
+    count: 12,
+  })
+  const thirty = [...Array.from({ length: 30 }, () => filler)]
+  expect(windowsFromApp(planOf(thirty)).count, '30 clipped to 12').toBe(12)
+})
+
+test('app pure: windowsFromApp drops a bad percent and keeps the boundary values', () => {
+  const bad: { label: string; percent: unknown }[] = [
+    { label: 'negative', percent: -0.1 },
+    { label: 'nan', percent: Number.NaN },
+    { label: 'infinity', percent: Number.POSITIVE_INFINITY },
+    { label: 'string', percent: '67' },
+    { label: 'null', percent: null },
+    { label: 'true', percent: true },
+  ]
+  for (const row of bad) {
+    const got = windowsFromApp(planOf([w5(row.percent, ISO_5H)]))
+    expect(got.fresh, row.label).toEqual({})
+    expect(got.drops, row.label).toEqual({ bad_percent: 1 })
+  }
+  expect(windowsFromApp(planOf([{ label: '5-hour limit', resetsAt: ISO_5H }])).drops, 'missing percent').toEqual({
+    bad_percent: 1,
+  })
+  const good: { label: string; percent: number }[] = [
+    { label: 'zero', percent: 0 },
+    { label: 'over 100', percent: 100.5 },
+    { label: 'fraction', percent: 66.4 },
+  ]
+  for (const row of good) {
+    expect(windowsFromApp(planOf([w5(row.percent, ISO_5H)])).fresh, row.label).toEqual({
+      five_hour: { used_percentage: row.percent, resets_at: RESET_5H },
+    })
+  }
+})
+
+test('app pure: windowsFromApp classifies a bad resetsAt and stops at the first reason', () => {
+  const missing: { label: string; window: Record<string, unknown> }[] = [
+    { label: 'missing', window: { label: '5-hour limit', percentUsed: 1 } },
+    { label: 'null', window: w5(1, null) },
+    { label: 'number', window: w5(1, 1791283799) },
+  ]
+  for (const row of missing) {
+    expect(windowsFromApp(planOf([row.window])).drops, row.label).toEqual({ no_resets_at: 1 })
+  }
+  const bad: { label: string; resetsAt: string }[] = [
+    { label: 'garbage', resetsAt: 'garbage' },
+    { label: 'empty', resetsAt: '' },
+    { label: 'impossible date', resetsAt: '2027-13-45T99:99:99Z' },
+    { label: 'floors to zero', resetsAt: '1970-01-01T00:00:00.999Z' },
+    { label: 'epoch', resetsAt: '1970-01-01T00:00:00Z' },
+    { label: 'before epoch', resetsAt: '1969-12-31T23:59:59Z' },
+  ]
+  for (const row of bad) {
+    expect(windowsFromApp(planOf([w5(1, row.resetsAt)])).drops, row.label).toEqual({ bad_resets_at: 1 })
+  }
+  expect(windowsFromApp(planOf([w5(1, '1970-01-01T00:00:01.000Z')])).fresh, 'one second').toEqual({
+    five_hour: { used_percentage: 1, resets_at: 1 },
+  })
+  expect(windowsFromApp(planOf([w5(-1, 'garbage')])).drops, 'percent checked first').toEqual({ bad_percent: 1 })
+})
+
+test('app pure: windowsFromApp keeps the first valid window of a kind', () => {
+  const rows: { label: string; windows: unknown[]; fresh: unknown; drops: unknown }[] = [
+    {
+      label: 'second five_hour ignored',
+      windows: [w5(10, ISO_5H), w5(20, ISO_5H)],
+      fresh: { five_hour: { used_percentage: 10, resets_at: RESET_5H } },
+      drops: {},
+    },
+    {
+      label: 'invalid five_hour does not occupy the kind',
+      windows: [w5(-1, ISO_5H), w5(20, ISO_5H)],
+      fresh: { five_hour: { used_percentage: 20, resets_at: RESET_5H } },
+      drops: { bad_percent: 1 },
+    },
+    {
+      label: 'later invalid five_hour is not counted',
+      windows: [w5(10, ISO_5H), w5(-1, 'garbage')],
+      fresh: { five_hour: { used_percentage: 10, resets_at: RESET_5H } },
+      drops: {},
+    },
+    {
+      label: 'second seven_day ignored',
+      windows: [w7(10, ISO_7D), w7(20, ISO_7D)],
+      fresh: { seven_day: { used_percentage: 10, resets_at: RESET_7D } },
+      drops: {},
+    },
+    {
+      label: 'invalid seven_day does not occupy the kind',
+      windows: [w7(-1, ISO_7D), w7(20, ISO_7D)],
+      fresh: { seven_day: { used_percentage: 20, resets_at: RESET_7D } },
+      drops: { bad_percent: 1 },
+    },
+    {
+      label: 'later invalid seven_day is not counted',
+      windows: [w7(10, ISO_7D), w7(-1, 'garbage')],
+      fresh: { seven_day: { used_percentage: 10, resets_at: RESET_7D } },
+      drops: {},
+    },
+  ]
+  for (const row of rows) {
+    const got = windowsFromApp(planOf(row.windows))
+    expect(got.fresh, row.label).toEqual(row.fresh)
+    expect(got.drops, row.label).toEqual(row.drops)
+  }
+})
+
+test('app pure: windowsFromApp maps labels without trimming and prefers 5-hour', () => {
+  const mapped: { label: string; kind: string }[] = [
+    { label: '5-hour limit', kind: 'five_hour' },
+    { label: '5-HOUR LIMIT', kind: 'five_hour' },
+    { label: 'Weekly \u00b7 all models', kind: 'seven_day' },
+    { label: 'WEEKLY \u00b7 ALL MODELS', kind: 'seven_day' },
+    { label: 'weekly all models', kind: 'seven_day' },
+    { label: 'Weekly 5-hour all models', kind: 'five_hour' },
+  ]
+  for (const row of mapped) {
+    const got = windowsFromApp(planOf([{ label: row.label, percentUsed: 1, resetsAt: ISO_5H }]))
+    expect(Object.keys(got.fresh), row.label).toEqual([row.kind])
+  }
+  const unmapped = [
+    'Weekly \u00b7 Fable',
+    'Weekly \u00b7 Sonnet only',
+    'Fable weekly - all models',
+    ' Weekly all models',
+    'all models',
+    '',
+    'Daily',
+  ]
+  for (const label of unmapped) {
+    const got = windowsFromApp(planOf([{ label, percentUsed: 1, resetsAt: ISO_5H }]))
+    expect(got.fresh, label === '' ? 'empty label' : label).toEqual({})
+    expect(got.drops, label === '' ? 'empty label drops' : label + ' drops').toEqual({})
+  }
+})
+
+test('app pure: windowsFromApp skips unmapped and non-object items without counting a drop', () => {
+  const windows = [null, 5, 'x', [], { label: 5 }, { label: null }, {}, w5(4, ISO_5H)]
+  const got = windowsFromApp(planOf(windows))
+  expect(got.fresh, 'five_hour mapped').toEqual({ five_hour: { used_percentage: 4, resets_at: RESET_5H } })
+  expect(got.drops, 'no drops').toEqual({})
+  expect(got.count, 'full length').toBe(windows.length)
+  const fable = windowsFromApp(planOf([{ label: FABLE, percentUsed: -1 }, { label: FABLE }, w5(4, ISO_5H)]))
+  expect(fable.fresh, 'fable ignored').toEqual({ five_hour: { used_percentage: 4, resets_at: RESET_5H } })
+  expect(fable.drops, 'fable drops empty').toEqual({})
+})
+
+test('app pure: windowsFromApp accumulates one drop per mapped invalid window', () => {
+  const got = windowsFromApp(
+    planOf([w5(-1, ISO_5H), { label: 'Weekly \u00b7 all models', percentUsed: 1 }, w7(1, 'garbage')]),
+  )
+  expect(got.drops, 'three reasons').toEqual({ bad_percent: 1, no_resets_at: 1, bad_resets_at: 1 })
+  expect(got.fresh, 'none mapped').toEqual({})
+  expect(got.count, 'all three seen').toBe(3)
+})
+
+const NOW = T0 + 600
+const OLD_AT = T0 - 300
+const SID = 'sess-new'
+
+test('app pure: mergeApp keeps stored windows when the app reading has none', () => {
+  const old = {
+    five_hour: win(40, R5, OLD_AT, 'old-a'),
+    seven_day: win(10, R7, OLD_AT, 'old-b'),
+    spend_limit: win(1, R7, OLD_AT, 'old-c'),
+  }
+  const all = mergeApp(old, {}, NOW, SID)
+  expect(all.windows, 'all kept').toEqual(old)
+  expect(all.held, 'nothing held').toEqual([])
+  const one = mergeApp(old, { five_hour: fr(50, R5) }, NOW, SID)
+  expect(one.windows.seven_day, 'seven_day untouched').toEqual(old.seven_day)
+  expect(one.windows.spend_limit, 'spend_limit untouched').toEqual(old.spend_limit)
+})
+
+test('app pure: mergeApp takes an app window when nothing is stored', () => {
+  const got = mergeApp({}, { five_hour: fr(12.5, R5) }, NOW, SID)
+  expect(got.windows, 'new window').toEqual({ five_hour: win(12.5, R5, NOW, SID) })
+  expect(got.held, 'nothing held').toEqual([])
+})
+
+test('app pure: mergeApp takes the app value in the same period when it is not lower', () => {
+  const old = { five_hour: win(40, R5, OLD_AT, 'old-a') }
+  const rows: { label: string; used: number; resets: number }[] = [
+    { label: 'equal', used: 40, resets: R5 + 60 },
+    { label: 'higher', used: 62.5, resets: R5 + 120 },
+    { label: 'minus 120', used: 41, resets: R5 - 120 },
+  ]
+  for (const row of rows) {
+    const got = mergeApp(old, { five_hour: fr(row.used, row.resets) }, NOW, SID)
+    expect(got.windows, row.label).toEqual({ five_hour: win(row.used, row.resets, NOW, SID) })
+    expect(got.held, row.label).toEqual([])
+  }
+})
+
+test('app pure: mergeApp confirms a rounding gap under 1 and holds a gap of 1', () => {
+  const confirm: { label: string; used: number }[] = [
+    { label: 'gap 0.4', used: 66.4 },
+    { label: 'gap 0.5', used: 66.5 },
+    { label: 'gap 0.99', used: 66.99 },
+  ]
+  for (const row of confirm) {
+    const old = { five_hour: win(row.used, R5, OLD_AT, 'old-a') }
+    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW, SID)
+    expect(got.windows, row.label).toEqual({ five_hour: win(row.used, R5, NOW, SID) })
+    expect(got.held, row.label).toEqual([])
+  }
+  const hold: { label: string; used: number }[] = [
+    { label: 'gap 1', used: 67 },
+    { label: 'gap 4', used: 70 },
+  ]
+  for (const row of hold) {
+    const old = { five_hour: win(row.used, R5, OLD_AT, 'old-a') }
+    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW, SID)
+    expect(got.windows, row.label).toEqual(old)
+    expect(got.held, row.label).toEqual(['five_hour'])
+  }
+})
+
+test('app pure: mergeApp follows the later reset across periods', () => {
+  const later = mergeApp({ five_hour: win(90, R5, OLD_AT, 'old-a') }, { five_hour: fr(3, R5 + 121) }, NOW, SID)
+  expect(later.windows, 'later period').toEqual({ five_hour: win(3, R5 + 121, NOW, SID) })
+  expect(later.held, 'later period').toEqual([])
+  const earlier = mergeApp({ five_hour: win(10, R5, OLD_AT, 'old-a') }, { five_hour: fr(99, R5 - 121) }, NOW, SID)
+  expect(earlier.windows, 'earlier period').toEqual({ five_hour: win(10, R5, OLD_AT, 'old-a') })
+  expect(earlier.held, 'earlier period').toEqual(['five_hour'])
+})
+
+test('app pure: mergeApp treats 120 seconds as the same period and 121 as a new one', () => {
+  const old = { five_hour: win(90, R5, OLD_AT, 'old-a') }
+  const plus120 = mergeApp(old, { five_hour: fr(3, R5 + 120) }, NOW, SID)
+  expect(plus120.windows, '+120 keeps old').toEqual(old)
+  expect(plus120.held, '+120 held').toEqual(['five_hour'])
+  const plus121 = mergeApp(old, { five_hour: fr(3, R5 + 121) }, NOW, SID)
+  expect(plus121.windows, '+121 takes app').toEqual({ five_hour: win(3, R5 + 121, NOW, SID) })
+  expect(plus121.held, '+121 held').toEqual([])
+  const minus120 = mergeApp(old, { five_hour: fr(91, R5 - 120) }, NOW, SID)
+  expect(minus120.windows, '-120 takes app').toEqual({ five_hour: win(91, R5 - 120, NOW, SID) })
+  expect(minus120.held, '-120 held').toEqual([])
+  const minus121 = mergeApp(old, { five_hour: fr(99, R5 - 121) }, NOW, SID)
+  expect(minus121.windows, '-121 keeps old').toEqual(old)
+  expect(minus121.held, '-121 held').toEqual(['five_hour'])
+})
+
+test('app pure: mergeApp keeps kind order and lists held kinds in kind order', () => {
+  const old = {
+    five_hour: win(40, R5, OLD_AT, 'old-a'),
+    seven_day: win(10, R7, OLD_AT, 'old-b'),
+    spend_limit: win(1, R7, OLD_AT, 'old-c'),
+  }
+  const fresh = {
+    spend_limit: fr(2, R7),
+    seven_day: fr(9, R7),
+    five_hour: fr(39.5, R5 + 60),
+  }
+  const got = mergeApp(old, fresh, NOW, SID)
+  expect(Object.keys(got.windows), 'kind order').toEqual(['five_hour', 'seven_day', 'spend_limit'])
+  expect(got.windows.five_hour, 'confirmed').toEqual(win(40, R5, NOW, SID))
+  expect(got.windows.seven_day, 'held').toEqual(old.seven_day)
+  expect(got.windows.spend_limit, 'taken').toEqual(win(2, R7, NOW, SID))
+  expect(got.held, 'only seven_day').toEqual(['seven_day'])
+  const two = mergeApp(
+    old,
+    { spend_limit: fr(0, R7 - 121), five_hour: fr(30, R5), seven_day: fr(11, R7) },
+    NOW,
+    SID,
+  )
+  expect(two.held, 'two kinds in kind order').toEqual(['five_hour', 'spend_limit'])
+})
+
+test('app pure: mergeApp writes a null session id and a fixed field order', () => {
+  const taken = mergeApp({}, { five_hour: fr(12, R5) }, NOW, null)
+  expect(taken.windows.five_hour, 'null session').toEqual(win(12, R5, NOW, null))
+  expect(Object.keys(taken.windows.five_hour), 'taken field order').toEqual([
+    'used_percentage',
+    'resets_at',
+    'observed_at',
+    'session_id',
+  ])
+  const confirmed = mergeApp({ five_hour: win(66.4, R5, OLD_AT, 'old-a') }, { five_hour: fr(66, R5) }, NOW, SID)
+  expect(Object.keys(confirmed.windows.five_hour), 'confirmed field order').toEqual([
+    'used_percentage',
+    'resets_at',
+    'observed_at',
+    'session_id',
+  ])
+})
+
+test('app pure: mergeApp does not mutate its inputs', () => {
+  const old = { five_hour: win(66.4, R5, OLD_AT, 'old-a'), seven_day: win(10, R7, OLD_AT, 'old-b') }
+  const fresh = { five_hour: fr(66, R5 + 60), seven_day: fr(9, R7) }
+  const oldText = JSON.stringify(old)
+  const freshText = JSON.stringify(fresh)
+  mergeApp(old, fresh, NOW, SID)
+  expect(JSON.stringify(old), 'old unchanged').toBe(oldText)
+  expect(JSON.stringify(fresh), 'fresh unchanged').toBe(freshText)
+})
+
+// ---------------------------------------------------------------- 刷新请求：流程
+// 每个用例一个世界：同一个测试里不能再注册同名 hook（clock.now 注册两次会直接拒绝装载）。
+// 不给 dataDir 的话安全闸不注册任何 hook，定时检查不会发生。
+// mock 时钟只在 advance 越过到期时间时触发；一次 advance(3000) 会把这一期里所有 await 跑完。
+
+const REQUEST = DATA_DIR + '/refresh-request.json'
+const ACK = DATA_DIR + '/refresh-ack.json'
+const POLL = 3000 // 定时检查间隔；故意写字面量，不从模块里导入，免得常量改坏时测试跟着一起错
+const TICK1 = T0 + 3 // 第一期定时检查时的引擎时间（秒）
+
+const makeAppWorld = (on: On) => {
+  const a = {
+    files: new Map<string, string>(),
+    events: [] as string[], // 经过引擎的事件名，按顺序（含 clock.every、clock.after）
+    writes: [] as { path: string; text: string }[], // 成功的 fs.write，norm 路径；被拒绝的不记
+    exists: [] as string[], // 每次 fs.exists 的 norm 路径
+    mcpCalls: [] as { server: string; tool: string; args: unknown }[],
+    afterMs: [] as number[], // 每次 clock.after 的等待毫秒
+    mcp: {} as Record<string, unknown>, // 服务器名 -> 返回值，或 'throw'、'hang'、'late'。'late' 的调用各自挂起，由测试用 a.release 按调用顺序放出，放出后调用的返回值是 APP_OK；没配置的服务器等同 'throw'
+    failClock: false, // 为真时 clock.now 被拒绝
+    clockScript: [] as ('ok' | 'fail' | number)[], // 前几次 clock.now：'fail' 拒绝，'ok' 放行；数字直接作为这次 clock.now 的返回值，用来模拟系统时间被调过（mock 时钟本身只能往前走）；用完后回到 failClock 的取值
+    denyEvery: 0, // 接下来这么多次 clock.every 被拒绝（每次拒绝减一）；被拒绝的那一期之后整个间隔静默结束，不抛异常
+    denyAfter: false, // 为真时每次 clock.after 都被拒绝：不抛异常，回调永不执行
+    release: [] as (() => void)[], // 'late' 模式下各个挂起的调用，按调用顺序；调用 release[i]() 放出第 i 个
+    failExists: false,
+    failWritePaths: new Set<string>(), // 这些路径（norm 形式）的 fs.write 被拒绝
+    sessionId: 'sess-new' as unknown,
+    usageLimits: [] as unknown[], // session.usage 返回的限额列表；默认空，session.start 因此读不到时间
+    clock: undefined as unknown as MockClock,
+  }
+  // 最先注册，才能看到之后所有事件；clock.now 的故障注入也放在这里，因为不能再注册第二个 clock.now。
+  on('*', async (_$, e, next) => {
+    const name = String(next.event)
+    if (!BOOT_NOISE.has(name)) a.events.push(name)
+    if (name === 'clock.after') a.afterMs.push((e as unknown as { ms: number }).ms)
+    if (name === 'clock.every' && a.denyEvery > 0) {
+      a.denyEvery -= 1
+      return { deny: 'every refused' } as never
+    }
+    if (name === 'clock.after' && a.denyAfter) return { deny: 'after refused' } as never
+    if (name === 'clock.now') {
+      const step = a.clockScript.shift()
+      if (typeof step === 'number') return { value: step } as never
+      if (step === 'fail' || (step === undefined && a.failClock)) return { deny: 'clock down' } as never
+    }
+    return next(e)
+  })
+  a.clock = mock.clock(on, { now: NOW_MS })
+  on('fs.exists', (_$, e) => {
+    a.exists.push(norm(e.path))
+    if (a.failExists) return { deny: 'exists refused' }
+    return { value: a.files.has(norm(e.path)) }
+  })
+  on('fs.read', (_$, e) => {
+    const text = a.files.get(norm(e.path))
+    return text === undefined ? { deny: 'ENOENT' } : { value: text }
+  })
+  on('fs.write', (_$, e) => {
+    const p = norm(e.path)
+    if (a.failWritePaths.has(p)) return { deny: 'write refused' }
+    a.writes.push({ path: p, text: e.text })
+    a.files.set(p, e.text)
+    return { value: undefined }
+  })
+  on('mcp.call', (_$, e) => {
+    a.mcpCalls.push({ server: e.server, tool: e.tool, args: e.args })
+    const item = a.mcp[e.server]
+    if (item === 'hang') return new Promise(() => {})
+    if (item === 'late') {
+      return new Promise((resolve) => {
+        a.release.push(() => resolve({ value: APP_OK as never }))
+      })
+    }
+    if (item === 'throw' || item === undefined) throw new Error('no such server')
+    return { value: item as never }
+  })
+  on('session.id', () => ({ value: a.sessionId as string }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: a.usageLimits as never } }))
+  on('session.start', (_$, e) => ({ cwd: START_MARK + e.cwd }))
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  return a
+}
+type AppWorld = ReturnType<typeof makeAppWorld>
+
+const appScenario = (name: string, body: (a: AppWorld, $: Engine) => Promise<void>): void => {
+  test(name, { options: { dataDir: DATA_DIR } }, async ($, on) => {
+    await body(makeAppWorld(on), $)
+  })
+}
+
+// 把启动阶段的动作清掉（含 session.start 记下的事件日志文件），后面只看定时检查引起的动作。
+const quiet = (a: AppWorld): void => {
+  a.events.length = 0
+  a.writes.length = 0
+  a.exists.length = 0
+  a.mcpCalls.length = 0
+  a.afterMs.length = 0
+  a.files.delete(EVENTS)
+}
+// 启动：session.start 布下定时器，然后清记录。
+const boot = async (a: AppWorld, $: Engine): Promise<void> => {
+  await start($)
+  quiet(a)
+}
+const tick = (a: AppWorld, periods = 1): Promise<void> => a.clock.advance(POLL * periods)
+// 请求文件：requested_at 相对下一期的时刻写，ageSeconds 为正表示请求比那一刻早。
+const stageRequest = (a: AppWorld, id: unknown, ageSeconds = 1, extra: Record<string, unknown> = {}): void => {
+  a.files.set(
+    REQUEST,
+    JSON.stringify({ schema: 1, id, requested_at: (a.clock.now() + POLL) / 1000 - ageSeconds, ...extra }),
+  )
+}
+const appLog = (a: AppWorld): LogEntry[] => {
+  const parsed: unknown = JSON.parse(a.files.get(EVENTS) ?? '{"schema":1,"events":[]}')
+  const events = (parsed as { events: LogEntry[] }).events
+  return events.filter((e) => e.ev === 'refresh.app')
+}
+const whys = (a: AppWorld): string[] => appLog(a).map((e) => e.why)
+const textResult = (obj: unknown) => ({ isError: false, content: [{ type: 'text', text: JSON.stringify(obj) }] })
+// get_usage 的返回：重置时间用已有常量 R5、R7，使合并结果的 resets_at 是整数秒。
+const appPayload = (p5 = 67, p7 = 57) => ({
+  plan: {
+    status: 'ok',
+    plan: 'Max',
+    windows: [
+      { label: '5-hour limit', percentUsed: p5, resetsAt: iso(R5), resetsIn: '1h 10m' },
+      { label: 'Weekly \u00b7 all models', percentUsed: p7, resetsAt: iso(R7), resetsIn: '4d 20h' },
+      { label: 'Weekly \u00b7 Fable', percentUsed: 0, resetsAt: iso(R7), resetsIn: '4d 20h' },
+    ],
+  },
+  context: { session: 'self', status: 'ok' },
+})
+const APP_OK = textResult(appPayload())
+const okSnap = () => ({
+  schema: 1,
+  written_at: TICK1,
+  windows: {
+    five_hour: win(67, R5, TICK1, 'sess-new'),
+    seven_day: win(57, R7, TICK1, 'sess-new'),
+  },
+})
+const okAck = (id: string) => ({ schema: 1, id, status: 'ok', at: TICK1, windows: 2 })
+const wroteLog = () => ({
+  t: TICK1 * 1000,
+  ev: 'refresh.app',
+  sid: 'sess-new',
+  n: 3,
+  kinds: ['five_hour', 'seven_day'],
+  kept: 2,
+  out: 'wrote',
+  why: '',
+  held: [] as string[],
+  changed: [] as string[],
+})
+const skipLog = (tSec: number, why: string) => ({
+  t: tSec * 1000,
+  ev: 'refresh.app',
+  sid: 'sess-new',
+  n: 0,
+  kinds: [] as string[],
+  kept: 0,
+  out: 'skipped',
+  why,
+  held: [] as string[],
+  changed: [] as string[],
+})
+
+appScenario('app flow: a period with no request file only checks that the file exists', async (a, $) => {
+  await boot(a, $)
+  expect(a.events, 'boot cleared').toEqual([])
+  await tick(a)
+  expect(a.events, 'one period').toEqual(['fs.exists', 'clock.every'])
+  expect(a.exists, 'one exists').toEqual([REQUEST])
+  expect(a.writes, 'no writes').toEqual([])
+  expect(a.mcpCalls, 'no mcp').toEqual([])
+  expect(a.events.includes('fs.read'), 'no read').toBe(false)
+  await tick(a)
+  expect(a.events, 'two periods').toEqual(['fs.exists', 'clock.every', 'fs.exists', 'clock.every'])
+  expect(a.exists, 'two exists').toEqual([REQUEST, REQUEST])
+})
+
+appScenario('app flow: a new request writes usage.json, then the ack, then one log', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'one get_usage').toEqual([{ server: 'ccd_session_mgmt', tool: 'get_usage', args: {} }])
+  expect(a.afterMs, 'timeout armed').toEqual([15000])
+  expect(a.writes.map((w) => w.path), 'usage then ack then log').toEqual([TARGET, ACK, EVENTS])
+  const snap = okSnap()
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(snap)
+  expect(a.files.get(TARGET), 'snapshot layout').toBe(JSON.stringify(snap, null, 2))
+  expect(JSON.stringify(snap).includes('Fable'), 'fable not stored').toBe(false)
+  const ack = okAck('req1')
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(ack)
+  expect(Object.keys(JSON.parse(a.files.get(ACK) ?? 'null')), 'ack keys').toEqual(['schema', 'id', 'status', 'at', 'windows'])
+  expect(a.files.get(ACK), 'ack layout').toBe(JSON.stringify(ack, null, 2))
+  const logged = appLog(a)
+  expect(logged, 'one refresh.app').toEqual([wroteLog()])
+  expect(Object.keys(logged[0] ?? {}), 'log keys').toEqual(LOG_KEYS)
+  expect(a.events[a.events.length - 1], 'period closed').toBe('clock.every')
+  expect(a.events.filter((name) => name === 'mcp.call'), 'mcp once in the trace').toEqual(['mcp.call'])
+})
+
+appScenario('app flow: the same request id is not handled on later periods', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  const seen = a.events.length
+  await tick(a, 2)
+  expect(a.mcpCalls, 'still one call').toHaveLength(1)
+  expect(a.writes, 'still three writes').toHaveLength(3)
+  expect(appLog(a), 'still one log').toHaveLength(1)
+  expect(a.events.slice(seen), 'later periods only reread the request').toEqual([
+    'fs.exists',
+    'fs.read',
+    'clock.every',
+    'fs.exists',
+    'fs.read',
+    'clock.every',
+  ])
+})
+
+const ageRows: { label: string; age: number; handle: boolean }[] = [
+  { label: 'exactly 30s old is handled', age: 30, handle: true },
+  { label: '31s old is ignored', age: 31, handle: false },
+  { label: 'exactly 5s in the future is handled', age: -5, handle: true },
+  { label: '6s in the future is ignored', age: -6, handle: false },
+]
+for (const row of ageRows) {
+  appScenario('app flow: request age ' + row.label, async (a, $) => {
+    a.mcp.ccd_session_mgmt = APP_OK
+    await boot(a, $)
+    stageRequest(a, 'age1', row.age)
+    await tick(a)
+    if (row.handle) {
+      expect(a.mcpCalls, row.label).toHaveLength(1)
+      expect(whys(a), row.label).toEqual([''])
+    } else {
+      expect(a.mcpCalls, row.label).toEqual([])
+      expect(a.writes, row.label).toEqual([])
+      expect(a.files.has(EVENTS), row.label).toBe(false)
+      expect(a.events, row.label).toEqual(['fs.exists', 'fs.read', 'clock.now', 'clock.every'])
+    }
+  })
+}
+
+appScenario('app flow: an ignored request id stays seen even when the file is refreshed', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'old1', 31)
+  await tick(a)
+  expect(a.mcpCalls, 'old ignored').toEqual([])
+  stageRequest(a, 'old1', 1)
+  await tick(a)
+  expect(a.mcpCalls, 'same id still ignored').toEqual([])
+  expect(a.files.has(EVENTS), 'still no log').toBe(false)
+  stageRequest(a, 'new1', 1)
+  await tick(a)
+  expect(a.mcpCalls, 'new id handled').toHaveLength(1)
+  expect(whys(a), 'new id logged').toEqual([''])
+})
+
+const dupRows = [
+  { label: 'status ok', status: 'ok' },
+  { label: 'status zzz', status: 'zzz' },
+]
+for (const row of dupRows) {
+  appScenario('app flow: an ack with the same id is a duplicate (' + row.label + ')', async (a, $) => {
+    a.mcp.ccd_session_mgmt = APP_OK
+    await boot(a, $)
+    a.files.set(ACK, JSON.stringify({ schema: 1, id: 'dup1', status: row.status, at: T0, windows: 2 }))
+    stageRequest(a, 'dup1')
+    await tick(a)
+    expect(a.mcpCalls, row.label).toEqual([])
+    expect(a.writes.map((w) => w.path), row.label).toEqual([EVENTS])
+    const logged = appLog(a)
+    expect(logged, row.label).toEqual([skipLog(TICK1, 'duplicate_ack')])
+    expect(Object.keys(logged[0] ?? {}), row.label + ' keys').toEqual(LOG_KEYS)
+  })
+}
+
+const ackRows: { label: string; text: string }[] = [
+  { label: 'other id', text: JSON.stringify({ schema: 1, id: 'other9', status: 'ok', at: T0, windows: 2 }) },
+  { label: 'truncated', text: '{"schema":1,"id":"' },
+  { label: 'empty', text: '' },
+  { label: 'schema 2', text: JSON.stringify({ schema: 2, id: 'req2', status: 'ok' }) },
+]
+for (const row of ackRows) {
+  appScenario('app flow: a non-matching ack does not block the request (' + row.label + ')', async (a, $) => {
+    a.mcp.ccd_session_mgmt = APP_OK
+    await boot(a, $)
+    a.files.set(ACK, row.text)
+    stageRequest(a, 'req2')
+    await tick(a)
+    expect(a.mcpCalls, row.label).toHaveLength(1)
+    expect(whys(a), row.label).toEqual([''])
+    expect(JSON.parse(a.files.get(ACK) ?? 'null').id, row.label).toBe('req2')
+  })
+}
+
+appScenario('app flow: a second call inside 30s is throttled and exactly 30s is handled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  // t=3：第一次调用。t=6 与 t=30 距它不到 30 秒，限频；t=33 恰好 30 秒，再处理。
+  stageRequest(a, 'idA')
+  await tick(a)
+  stageRequest(a, 'idB')
+  await tick(a)
+  await tick(a, 7)
+  stageRequest(a, 'idC')
+  await tick(a)
+  stageRequest(a, 'idD')
+  await tick(a)
+  expect(a.mcpCalls, 'two calls').toHaveLength(2)
+  expect(whys(a), 'why sequence').toEqual(['', 'throttled', 'throttled', ''])
+  const logged = appLog(a)
+  expect(logged[1], 'throttled at t=6').toEqual(skipLog(T0 + 6, 'throttled'))
+  expect(logged[2], 'throttled at t=30').toEqual(skipLog(T0 + 30, 'throttled'))
+  expect(a.writes.map((w) => w.path), 'throttled periods only write the log').toEqual([
+    TARGET,
+    ACK,
+    EVENTS,
+    EVENTS,
+    EVENTS,
+    TARGET,
+    ACK,
+    EVENTS,
+  ])
+})
+
+appScenario('app flow: a request file with a leading BOM is handled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.files.set(
+    REQUEST,
+    '\ufeff' + JSON.stringify({ schema: 1, id: 'bom1', requested_at: (a.clock.now() + POLL) / 1000 - 1 }),
+  )
+  await tick(a)
+  expect(a.mcpCalls, 'handled').toHaveLength(1)
+  expect(whys(a), 'wrote').toEqual([''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('bom1')
+})
+
+const badRequestRows: { label: string; text: string }[] = [
+  { label: 'schema 2', text: JSON.stringify({ schema: 2, id: 'req1', requested_at: TICK1 - 1 }) },
+  { label: 'hyphen id', text: JSON.stringify({ schema: 1, id: 'ab-cd', requested_at: TICK1 - 1 }) },
+  { label: '33 char id', text: JSON.stringify({ schema: 1, id: 'a'.repeat(33), requested_at: TICK1 - 1 }) },
+  { label: 'string time', text: JSON.stringify({ schema: 1, id: 'req1', requested_at: '5' }) },
+  { label: 'bad json', text: '{no' },
+  { label: 'empty', text: '' },
+  { label: 'array', text: '[]' },
+]
+for (const row of badRequestRows) {
+  appScenario('app flow: an invalid request is ignored (' + row.label + ')', async (a, $) => {
+    a.mcp.ccd_session_mgmt = APP_OK
+    await boot(a, $)
+    a.files.set(REQUEST, row.text)
+    await tick(a)
+    expect(a.mcpCalls, row.label).toEqual([])
+    expect(a.writes, row.label).toEqual([])
+    expect(a.files.has(EVENTS), row.label).toBe(false)
+    expect(a.events, row.label).toEqual(['fs.exists', 'fs.read', 'clock.every'])
+  })
+}
+
+appScenario('app flow: a 32 character id is handled', async (a, $) => {
+  const id = 'a'.repeat(32)
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, id)
+  await tick(a)
+  expect(a.mcpCalls, 'handled').toHaveLength(1)
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe(id)
+  expect(whys(a), 'wrote').toEqual([''])
+})
+
+appScenario('app flow: a structuredContent payload writes the same snapshot and ack', async (a, $) => {
+  a.mcp.ccd_session_mgmt = { isError: false, content: [], structuredContent: appPayload() }
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  const snap = okSnap()
+  const ack = okAck('req1')
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(snap)
+  expect(a.files.get(TARGET), 'snapshot layout').toBe(JSON.stringify(snap, null, 2))
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(ack)
+  expect(a.files.get(ACK), 'ack layout').toBe(JSON.stringify(ack, null, 2))
+})
+
+appScenario('app flow: a stored spend_limit window is kept beside the app windows', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.files.set(
+    TARGET,
+    JSON.stringify({
+      schema: 1,
+      written_at: T0 - 100,
+      windows: { spend_limit: ow(105.5, R7, T0 - 600, 'old-c') },
+    }),
+  )
+  stageRequest(a, 'req1')
+  await tick(a)
+  const parsed = JSON.parse(a.files.get(TARGET) ?? 'null') as {
+    written_at: number
+    windows: Record<string, unknown>
+  }
+  expect(parsed.written_at, 'rewritten').toBe(TICK1)
+  expect(Object.keys(parsed.windows), 'kind order').toEqual(['five_hour', 'seven_day', 'spend_limit'])
+  expect(parsed.windows.five_hour, 'five_hour').toEqual(win(67, R5, TICK1, 'sess-new'))
+  expect(parsed.windows.seven_day, 'seven_day').toEqual(win(57, R7, TICK1, 'sess-new'))
+  expect(parsed.windows.spend_limit, 'spend_limit kept').toEqual(win(105.5, R7, T0 - 600, 'old-c'))
+})
+
+// ---------------------------------------------------------------- 刷新请求：失败、超时、不可用、合并
+
+const unavailAck = (id: string) => ({ schema: 1, id, status: 'unavailable', at: TICK1, windows: 0 })
+const expectUnavail = (a: AppWorld, id: string): void => {
+  const ack = unavailAck(id)
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'unavailable ack').toEqual(ack)
+  expect(Object.keys(JSON.parse(a.files.get(ACK) ?? 'null')), 'ack keys').toEqual([
+    'schema',
+    'id',
+    'status',
+    'at',
+    'windows',
+  ])
+  expect(a.files.get(ACK), 'ack layout').toBe(JSON.stringify(ack, null, 2))
+  expect(a.writes.map((w) => w.path), 'ack then log').toEqual([ACK, EVENTS])
+}
+const stageStored = (a: AppWorld, windows: unknown): void => {
+  a.files.set(TARGET, JSON.stringify({ schema: 1, written_at: T0 - 100, windows }))
+}
+const readSnap = (a: AppWorld) =>
+  JSON.parse(a.files.get(TARGET) ?? 'null') as { written_at: number; windows: Record<string, unknown> }
+
+appScenario('app flow: the dashed server name is used when the first name throws', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'throw'
+  a.mcp['ccd-session-mgmt'] = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'both names').toEqual([
+    { server: 'ccd_session_mgmt', tool: 'get_usage', args: {} },
+    { server: 'ccd-session-mgmt', tool: 'get_usage', args: {} },
+  ])
+  expect(a.afterMs, 'one timeout each').toEqual([15000, 15000])
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(okSnap())
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
+  expect(appLog(a), 'wrote').toEqual([wroteLog()])
+})
+
+appScenario('app flow: a successful first server name is not followed by the second', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  a.mcp['ccd-session-mgmt'] = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'first name only').toEqual([{ server: 'ccd_session_mgmt', tool: 'get_usage', args: {} }])
+  expect(a.afterMs, 'one timeout').toEqual([15000])
+})
+
+appScenario('app flow: both server names throwing writes only the event log', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'throw'
+  a.mcp['ccd-session-mgmt'] = 'throw'
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'both tried').toEqual([
+    { server: 'ccd_session_mgmt', tool: 'get_usage', args: {} },
+    { server: 'ccd-session-mgmt', tool: 'get_usage', args: {} },
+  ])
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.writes.map((w) => w.path), 'log only').toEqual([EVENTS])
+  const logged = appLog(a)
+  expect(logged, 'mcp error').toEqual([skipLog(TICK1, 'mcp_error:HooksError')])
+  expect(Object.keys(logged[0] ?? {}), 'log keys').toEqual(LOG_KEYS)
+})
+
+appScenario('app flow: isError skips a usable text body and does not try the second name', async (a, $) => {
+  a.mcp.ccd_session_mgmt = { isError: true, content: [{ type: 'text', text: JSON.stringify(appPayload()) }] }
+  a.mcp['ccd-session-mgmt'] = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'first name only').toHaveLength(1)
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.writes.map((w) => w.path), 'log only').toEqual([EVENTS])
+  expect(appLog(a), 'is error').toEqual([skipLog(TICK1, 'app_is_error')])
+})
+
+const parseFailRows: { label: string; res: unknown }[] = [
+  { label: 'not json', res: { isError: false, content: [{ type: 'text', text: 'not json' }] } },
+  { label: 'json array', res: { isError: false, content: [{ type: 'text', text: '[1]' }] } },
+  { label: 'image only', res: { isError: false, content: [{ type: 'image' }] } },
+  { label: 'empty content', res: { isError: false, content: [] } },
+  { label: 'null result', res: null },
+  { label: 'string result', res: 'x' },
+]
+for (const row of parseFailRows) {
+  appScenario('app flow: an unreadable app result is parse_failed (' + row.label + ')', async (a, $) => {
+    a.mcp.ccd_session_mgmt = row.res
+    await boot(a, $)
+    stageRequest(a, 'req1')
+    await tick(a)
+    expect(appLog(a), row.label).toEqual([skipLog(TICK1, 'parse_failed')])
+    expect(a.files.has(ACK), row.label).toBe(false)
+    expect(a.files.has(TARGET), row.label).toBe(false)
+    expect(a.writes.map((w) => w.path), row.label).toEqual([EVENTS])
+  })
+}
+
+appScenario('app flow: a hanging call times out once and later periods do not overlap', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'hang'
+  a.mcp['ccd-session-mgmt'] = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'one call at t=3').toHaveLength(1)
+  expect(a.afterMs, 'timeout armed').toEqual([15000])
+  expect(a.writes, 'still waiting').toEqual([])
+  expect(a.files.has(EVENTS), 'no log yet').toBe(false)
+  await a.clock.advance(14000)
+  expect(a.files.has(EVENTS), 'still no log at t=17').toBe(false)
+  expect(a.mcpCalls, 'still one call').toHaveLength(1)
+  expect(a.exists, 'no extra exists while busy').toEqual([REQUEST])
+  await a.clock.advance(1000)
+  expect(whys(a), 'timed out').toEqual(['mcp_timeout'])
+  expect(appLog(a), 'timeout log').toEqual([skipLog(T0 + 18, 'mcp_timeout')])
+  expect(a.mcpCalls, 'second name not tried').toHaveLength(1)
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  await tick(a, 2)
+  expect(a.mcpCalls, 'same id not retried').toHaveLength(1)
+  expect(appLog(a), 'still one log').toHaveLength(1)
+})
+
+const unavailableRows: { label: string; payload: unknown; log: Record<string, unknown>; keys: string[] }[] = [
+  {
+    label: 'not_applicable without windows',
+    payload: { plan: { status: 'not_applicable' } },
+    log: skipLog(TICK1, 'app_unavailable:not_applicable'),
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'not_applicable with usable windows',
+    payload: { plan: { status: 'not_applicable', windows: appPayload().plan.windows } },
+    log: { ...skipLog(TICK1, 'app_unavailable:not_applicable'), n: 3, kinds: ['five_hour', 'seven_day'], kept: 2 },
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'no plan',
+    payload: {},
+    log: skipLog(TICK1, 'app_unavailable:none'),
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'numeric status',
+    payload: { plan: { status: 5, windows: [] } },
+    log: skipLog(TICK1, 'app_unavailable:none'),
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'long status',
+    payload: { plan: { status: 'x'.repeat(100) } },
+    log: skipLog(TICK1, 'app_unavailable:' + 'x'.repeat(24)),
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'only fable',
+    payload: {
+      plan: {
+        status: 'ok',
+        windows: [{ label: 'Weekly \u00b7 Fable', percentUsed: 0, resetsAt: iso(R7) }],
+      },
+    },
+    log: { ...skipLog(TICK1, 'no_windows'), n: 1 },
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'empty windows',
+    payload: { plan: { status: 'ok', windows: [] } },
+    log: skipLog(TICK1, 'no_windows'),
+    keys: LOG_KEYS,
+  },
+  {
+    label: 'bad percent',
+    payload: { plan: { status: 'ok', windows: [{ label: '5-hour limit', percentUsed: -1, resetsAt: iso(R5) }] } },
+    log: { ...skipLog(TICK1, 'no_windows'), n: 1, drops: { bad_percent: 1 } },
+    keys: LOG_KEYS_DROPS,
+  },
+]
+for (const row of unavailableRows) {
+  appScenario('app flow: unavailable data writes an ack and leaves usage.json (' + row.label + ')', async (a, $) => {
+    a.mcp.ccd_session_mgmt = textResult(row.payload)
+    await boot(a, $)
+    stageRequest(a, 'req1')
+    await tick(a)
+    expectUnavail(a, 'req1')
+    const logged = appLog(a)
+    expect(logged, row.label).toEqual([row.log])
+    expect(Object.keys(logged[0] ?? {}), row.label + ' keys').toEqual(row.keys)
+    if (row.label === 'not_applicable with usable windows') expect(a.files.has(TARGET), row.label).toBe(false)
+  })
+}
+
+appScenario('app flow: an unavailable reply does not rewrite an existing usage.json', async (a, $) => {
+  const prior = JSON.stringify({ schema: 1, written_at: T0 - 100, windows: { five_hour: ow(40, R5, T0 - 300, 'old-a') } })
+  a.mcp.ccd_session_mgmt = textResult({ plan: { status: 'not_applicable' } })
+  await boot(a, $)
+  a.files.set(TARGET, prior)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.files.get(TARGET), 'byte for byte').toBe(prior)
+  expectUnavail(a, 'req1')
+})
+
+appScenario('app flow: a gap under 1 confirms the stored percent and refreshes the observation', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(66, 57))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(66.4, R5, T0 - 100, 'old-a') })
+  stageRequest(a, 'req1')
+  await tick(a)
+  const snap = readSnap(a)
+  expect(snap.windows.five_hour, 'confirmed').toEqual(win(66.4, R5, TICK1, 'sess-new'))
+  expect(snap.windows.seven_day, 'app value').toEqual(win(57, R7, TICK1, 'sess-new'))
+  expect(appLog(a)[0], 'not held').toMatchObject({ held: [], kept: 2, out: 'wrote' })
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
+})
+
+appScenario('app flow: a higher app percent in the same period replaces the stored window', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(67, 57))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(66, R5, T0 - 100, 'old-a') })
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(readSnap(a).windows.five_hour, 'replaced').toEqual(win(67, R5, TICK1, 'sess-new'))
+})
+
+appScenario('app flow: a gap of 3 keeps the stored window and records it as held', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(67, 57))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(70, R5, T0 - 100, 'old-a') })
+  stageRequest(a, 'req1')
+  await tick(a)
+  const snap = readSnap(a)
+  expect(snap.written_at, 'rewritten').toBe(TICK1)
+  expect(snap.windows.five_hour, 'kept').toEqual(win(70, R5, T0 - 100, 'old-a'))
+  expect(snap.windows.seven_day, 'new').toEqual(win(57, R7, TICK1, 'sess-new'))
+  expect(appLog(a)[0]?.held, 'held').toEqual(['five_hour'])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack still ok').toEqual(okAck('req1'))
+})
+
+appScenario('app flow: a gap of exactly 1 is held and a gap of 0.01 is confirmed', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(66, 57))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(67, R5, T0 - 100, 'old-a') })
+  stageRequest(a, 'gap1')
+  await tick(a)
+  expect(readSnap(a).windows.five_hour, 'gap 1 kept').toEqual(win(67, R5, T0 - 100, 'old-a'))
+  expect(appLog(a)[0]?.held, 'gap 1 held').toEqual(['five_hour'])
+  // 同一个 id 不会再处理，换一个 id 才能测差 0.01。限频要等满 30 秒。
+  await tick(a, 10)
+  stageStored(a, { five_hour: ow(66.01, R5, T0 - 100, 'old-a') })
+  stageRequest(a, 'gap001')
+  await tick(a)
+  const second = readSnap(a)
+  expect(second.windows.five_hour, 'gap 0.01 confirmed').toEqual(win(66.01, R5, T0 + 36, 'sess-new'))
+  expect(appLog(a)[1]?.held, 'gap 0.01 not held').toEqual([])
+})
+
+appScenario('app flow: a later app period replaces the stored window even when the percent is lower', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(3, 57))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(90, R5 - 5 * 3600, T0 - 100, 'old-a') })
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(readSnap(a).windows.five_hour, 'new period').toEqual(win(3, R5, TICK1, 'sess-new'))
+  expect(appLog(a)[0]?.held, 'not held').toEqual([])
+})
+
+appScenario('app flow: an earlier app period keeps the stored window', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(99, 57))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(10, R5 + 5 * 3600, T0 - 100, 'old-a') })
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(readSnap(a).windows.five_hour, 'kept').toEqual(win(10, R5 + 5 * 3600, T0 - 100, 'old-a'))
+  expect(appLog(a)[0]?.held, 'held').toEqual(['five_hour'])
+})
+
+appScenario('app flow: an unreadable stored snapshot is treated as absent', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.files.set(TARGET, 'not json{')
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'fresh snapshot').toEqual(okSnap())
+})
+
+appScenario('app flow: a stored snapshot with a leading BOM is read and its other kinds are kept', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.files.set(
+    TARGET,
+    '\ufeff' +
+      JSON.stringify({
+        schema: 1,
+        written_at: T0 - 100,
+        windows: { spend_limit: ow(105.5, R7, T0 - 600, 'old-c') },
+      }),
+  )
+  stageRequest(a, 'req1')
+  await tick(a)
+  const snap = readSnap(a)
+  expect(Object.keys(snap.windows), 'kind order').toEqual(['five_hour', 'seven_day', 'spend_limit'])
+  expect(snap.windows.spend_limit, 'kept').toEqual(win(105.5, R7, T0 - 600, 'old-c'))
+  expect(snap.windows.five_hour, 'new').toEqual(win(67, R5, TICK1, 'sess-new'))
+})
+
+// ---------------------------------------------------------------- 刷新请求：写失败、时钟与 fs 故障、卫生、启动
+
+appScenario('app flow: a refused usage.json write logs the error and writes no ack', async (a, $) => {
+  a.failWritePaths.add(TARGET)
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.writes.map((w) => w.path), 'log only').toEqual([EVENTS])
+  expect(appLog(a), 'write error').toEqual([{ ...wroteLog(), out: 'failed', why: 'write_error:HooksError' }])
+})
+
+appScenario('app flow: a refused ack write keeps the snapshot and logs the ack error', async (a, $) => {
+  a.failWritePaths.add(ACK)
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot written').toEqual(okSnap())
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.writes.map((w) => w.path), 'snapshot then log').toEqual([TARGET, EVENTS])
+  expect(appLog(a), 'ack error').toEqual([{ ...wroteLog(), out: 'failed', why: 'ack_write_error:HooksError' }])
+})
+
+appScenario('app flow: a refused unavailable ack writes only the event log', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult({ plan: { status: 'not_applicable' } })
+  a.failWritePaths.add(ACK)
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.writes.map((w) => w.path), 'log only').toEqual([EVENTS])
+  expect(appLog(a), 'ack error').toEqual([{ ...skipLog(TICK1, 'ack_write_error:HooksError'), out: 'failed' }])
+})
+
+appScenario('app flow: a refused event log does not block the snapshot or the next request', async (a, $) => {
+  a.failWritePaths.add(EVENTS)
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'idA')
+  await tick(a)
+  expect(a.writes.map((w) => w.path), 'snapshot and ack').toEqual([TARGET, ACK])
+  expect(a.files.has(EVENTS), 'no log').toBe(false)
+  a.failWritePaths.delete(EVENTS)
+  await tick(a, 10)
+  stageRequest(a, 'idB')
+  await tick(a)
+  expect(a.mcpCalls, 'both calls').toHaveLength(2)
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack is idB').toBe('idB')
+  expect(appLog(a), 'only idB was logged').toHaveLength(1)
+  expect(appLog(a)[0]?.why, 'idB wrote').toBe('')
+})
+
+appScenario('app flow: a non-string session id is stored and logged as null', async (a, $) => {
+  a.sessionId = 42
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  const snap = readSnap(a)
+  expect(snap.windows.five_hour, 'five_hour sid').toEqual(win(67, R5, TICK1, null))
+  expect(snap.windows.seven_day, 'seven_day sid').toEqual(win(57, R7, TICK1, null))
+  expect(appLog(a), 'sid null').toEqual([{ ...wroteLog(), sid: null }])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
+})
+
+appScenario('app flow: a failed clock read marks the request seen and a new id still works', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.failClock = true
+  stageRequest(a, 'clk1')
+  await tick(a)
+  expect(a.mcpCalls, 'not called').toEqual([])
+  expect(a.writes, 'nothing written').toEqual([])
+  expect(a.files.has(EVENTS), 'no log').toBe(false)
+  expect(a.events, 'stopped after the clock').toEqual(['fs.exists', 'fs.read', 'clock.now', 'clock.every'])
+  a.failClock = false
+  await tick(a)
+  expect(a.mcpCalls, 'seen id skipped').toEqual([])
+  expect(a.files.has(EVENTS), 'still no log').toBe(false)
+  stageRequest(a, 'clk2')
+  await tick(a)
+  expect(a.mcpCalls, 'new id').toHaveLength(1)
+  expect(whys(a), 'wrote').toEqual([''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('clk2')
+})
+
+appScenario('app flow: a clock failure after the app call skips the write and logs bad_clock', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.clockScript = ['ok', 'fail']
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'called once').toHaveLength(1)
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.writes.map((w) => w.path), 'log only').toEqual([EVENTS])
+  expect(appLog(a), 'bad clock').toEqual([
+    { ...skipLog(TICK1, 'bad_clock'), n: 3, kinds: ['five_hour', 'seven_day'], kept: 2 },
+  ])
+})
+
+appScenario('app flow: a refused exists check does nothing and the next period handles the request', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.failExists = true
+  stageRequest(a, 'ex1')
+  await tick(a)
+  expect(a.mcpCalls, 'not called').toEqual([])
+  expect(a.writes, 'nothing written').toEqual([])
+  expect(a.events, 'exists then the next period').toEqual(['fs.exists', 'clock.every'])
+  a.failExists = false
+  await tick(a)
+  expect(a.mcpCalls, 'handled next period').toHaveLength(1)
+  expect(whys(a), 'wrote').toEqual([''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('ex1')
+})
+
+appScenario('app flow: after a hang times out a later request is handled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'hang'
+  await boot(a, $)
+  stageRequest(a, 'h1')
+  await tick(a)
+  await a.clock.advance(15000)
+  expect(whys(a), 'timed out').toEqual(['mcp_timeout'])
+  a.mcp.ccd_session_mgmt = APP_OK
+  await a.clock.advance(15000)
+  stageRequest(a, 'h2')
+  await tick(a)
+  expect(a.mcpCalls, 'hang plus the later call').toHaveLength(2)
+  expect(whys(a), 'timeout then wrote').toEqual(['mcp_timeout', ''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('h2')
+  const snap = readSnap(a)
+  expect(snap.written_at, 'written at t=36').toBe(T0 + 36)
+  expect(snap.windows.five_hour, 'five_hour').toEqual(win(67, R5, T0 + 36, 'sess-new'))
+  expect(snap.windows.seven_day, 'seven_day').toEqual(win(57, R7, T0 + 36, 'sess-new'))
+})
+
+appScenario('app flow: written files omit the raw payload, paths, and the server name', async (a, $) => {
+  const payload = appPayload()
+  payload.plan.plan = 'SENTINEL_PLAN'
+  ;(payload.plan as { extraUsage?: unknown }).extraUsage = {
+    enabled: true,
+    spent: 'SENTINEL_SPENT',
+    monthlyLimit: 'SENTINEL_LIMIT',
+    currency: 'SENTINEL_CUR',
+  }
+  payload.context.session = 'SENTINEL_SESSION'
+  payload.plan.windows.push({ label: 'SENTINEL_LABEL Fable', percentUsed: 1, resetsAt: iso(R7), resetsIn: '4d' })
+  a.mcp.ccd_session_mgmt = textResult(payload)
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  const banned = ['SENTINEL', 'Max', 'get_usage', 'ccd_session_mgmt', 'D:/', 'D:\\', 'usage-feed-test', 'proj', 'cwd']
+  const files = [
+    ['usage.json', a.files.get(TARGET) ?? ''],
+    ['ack', a.files.get(ACK) ?? ''],
+    ['log', a.files.get(EVENTS) ?? ''],
+  ] as const
+  for (const [name, text] of files) {
+    for (const needle of banned) expect(text.includes(needle), name + ' has ' + needle).toBe(false)
+  }
+  expect((a.files.get(EVENTS) ?? '').includes('req1'), 'log has the request id').toBe(false)
+  expect(Object.keys(JSON.parse(a.files.get(ACK) ?? 'null')), 'ack keys').toEqual([
+    'schema',
+    'id',
+    'status',
+    'at',
+    'windows',
+  ])
+  expect(Object.keys(JSON.parse(a.files.get(TARGET) ?? 'null')), 'snapshot keys').toEqual([
+    'schema',
+    'written_at',
+    'windows',
+  ])
+})
+
+appScenario('app flow: both hooks still return what the chain returned', async (a, $) => {
+  expect(await start($), 'start').toStrictEqual({ cwd: START_MARK + 'D:/proj' })
+  a.mcp.ccd_session_mgmt = APP_OK
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'request handled').toHaveLength(1)
+  expect(await measure($, []), 'measure').toStrictEqual({ changed: CHANGED })
+})
+
+appScenario('app flow: session.measure alone starts the watcher', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await measure($, [])
+  quiet(a)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'handled').toHaveLength(1)
+})
+
+appScenario('app flow: start and two measures share one interval', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await start($)
+  await measure($, [])
+  await measure($, [])
+  quiet(a)
+  await tick(a)
+  expect(a.exists, 'one exists').toEqual([REQUEST])
+  expect(a.events, 'one period').toEqual(['fs.exists', 'clock.every'])
+})
+
+scenario('app timer: start and two measures arm one 3000ms interval', undefined, async (w, $) => {
+  // 这个夹具的时钟不走，三次 hook 读到的时间相同，看门狗不会判定间隔已死，所以只布一次；时间走远后会重布见下面的用例。
+  await start($)
+  await measure($, [lim('five_hour', 20, R5)])
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.timers, 'one interval').toEqual([3000])
+})
+
+scenario('app timer: measure alone arms one 3000ms interval', undefined, async (w, $) => {
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.timers, 'one interval').toEqual([3000])
+})
+
+const gateRows = REFUSED
+for (const [gateLabel, gateOptions] of gateRows) {
+  scenario('app timer: gate refuses, so no interval either: ' + gateLabel, gateOptions, async (w, $) => {
+    await start($)
+    await measure($, [lim('five_hour', 20, R5)])
+    expect(w.timers, gateLabel).toEqual([])
+    expect(w.events, gateLabel).toEqual(['session.start', 'session.measure'])
+  })
+}
+
+// ---------------------------------------------------------------- 定时检查的看门狗与卡住复位
+// 链上的 hook 拒绝 $.clock.every 的某一期时，间隔静默结束、不抛异常；拒绝 $.clock.after 时回调永不执行。
+// 夹具开关 denyEvery、denyAfter 在最外层的 '*' hook 里拒绝这两类调用，与真实引擎的表现一致。
+// 看门狗只用 feed 已经读到的时间：带 limits 的 measure 才有时间，空列表的 measure 与 start 没有。
+
+const LIMS = [lim('five_hour', 20, R5)]
+// 经过引擎的 clock.every 事件数。时钟不动的区间里它等于布下定时器的次数；
+// 时钟推进时每一期还会再出现一次，所以只在时钟没动的区间内比较。
+const everyEvents = (a: AppWorld): number => a.events.filter((name) => name === 'clock.every').length
+
+appScenario('app watchdog: a refused interval is armed again once more than two periods pass without a tick', async (a, $) => {
+  a.denyEvery = 1
+  a.mcp.ccd_session_mgmt = APP_OK
+  await start($)
+  expect(everyEvents(a), 'armed once, refused').toBe(1)
+  await measure($, LIMS)
+  expect(everyEvents(a), 'the first time reading only sets the baseline').toBe(1)
+  await a.clock.advance(6000)
+  await measure($, LIMS)
+  expect(everyEvents(a), 'exactly two periods is not enough').toBe(1)
+  await a.clock.advance(3000)
+  await measure($, LIMS)
+  expect(everyEvents(a), 'armed again').toBe(2)
+  await measure($, LIMS)
+  expect(everyEvents(a), 'the baseline moved with the new arm, no third arm').toBe(2)
+  quiet(a)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'the new interval serves the request').toHaveLength(1)
+  expect(whys(a), 'wrote').toEqual([''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('req1')
+})
+
+appScenario('app watchdog: an interval that keeps ticking is left alone and the hook adds no engine call', async (a, $) => {
+  await start($)
+  await measure($, LIMS)
+  await tick(a, 5)
+  quiet(a)
+  await measure($, LIMS)
+  expect(a.events, 'only the usual measure calls').toEqual(MEASURE_EVENTS)
+  await tick(a)
+  expect(a.exists, 'one interval, one exists per period').toEqual([REQUEST])
+})
+
+appScenario('app watchdog: a hook without a time reading skips the check and leaves the baseline alone', async (a, $) => {
+  a.denyEvery = 1
+  await start($)
+  await measure($, LIMS)
+  await a.clock.advance(20000)
+  quiet(a)
+  await measure($, [])
+  expect(a.events, 'no extra engine call, no arm').toEqual(MEASURE_LOG_ONLY)
+  await measure($, LIMS)
+  expect(everyEvents(a), 'the untouched baseline is old enough').toBe(1)
+})
+
+appScenario('app watchdog: session.start also supplies a time reading for the baseline', async (a, $) => {
+  a.denyEvery = 1
+  a.usageLimits = LIMS
+  await start($)
+  expect(everyEvents(a), 'armed once, refused').toBe(1)
+  await a.clock.advance(6001)
+  await measure($, LIMS)
+  expect(everyEvents(a), 'one later measure is enough because start set the baseline').toBe(2)
+})
+
+appScenario('app watchdog: a false alarm cancels the old interval so only one stays alive', async (a, $) => {
+  await start($)
+  await measure($, LIMS)
+  a.clockScript = [a.clock.now() + 10000]
+  await measure($, LIMS)
+  expect(everyEvents(a), 'armed again').toBe(2)
+  quiet(a)
+  await tick(a)
+  expect(a.exists, 'the old interval was cancelled').toEqual([REQUEST])
+})
+
+appScenario('app watchdog: a clock set back only moves the baseline and the check still works afterwards', async (a, $) => {
+  a.denyEvery = 1
+  await start($)
+  await measure($, LIMS)
+  const back = a.clock.now() - 3_600_000
+  a.clockScript = [back]
+  await measure($, LIMS)
+  expect(everyEvents(a), 'a negative gap decides nothing').toBe(1)
+  a.clockScript = [back + 6000]
+  await measure($, LIMS)
+  expect(everyEvents(a), 'exactly two periods after the new baseline').toBe(1)
+  a.clockScript = [back + 6001]
+  await measure($, LIMS)
+  expect(everyEvents(a), 'armed again').toBe(2)
+})
+
+appScenario('app watchdog: periods skipped as busy still count as ticks', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'hang'
+  await start($)
+  await measure($, LIMS)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'the call is under way').toHaveLength(1)
+  await a.clock.advance(3001)
+  quiet(a)
+  await measure($, LIMS)
+  expect(a.events, 'ticked since the baseline, so only the baseline moves').toEqual(MEASURE_EVENTS)
+  await a.clock.advance(9000)
+  quiet(a)
+  await measure($, LIMS)
+  expect(a.events, 'only busy periods since the new baseline, still alive, no arm').toEqual(MEASURE_EVENTS)
+})
+
+appScenario('app watchdog: a call stuck without a timeout frees the watcher after more than seven skipped periods', async (a, $) => {
+  a.denyAfter = true
+  a.mcp.ccd_session_mgmt = 'hang'
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(a.mcpCalls, 'one call').toHaveLength(1)
+  expect(a.afterMs, 'the timeout was asked for but refused').toEqual([15000])
+  expect(a.exists, 'one exists so far').toEqual([REQUEST])
+  await tick(a, 7)
+  expect(a.exists, 'seven skipped periods do not touch the file').toEqual([REQUEST])
+  expect(whys(a), 'nothing is logged for the stuck call').toEqual([])
+  a.mcp.ccd_session_mgmt = APP_OK
+  await tick(a)
+  expect(a.exists, 'the eighth period resets busy and runs').toEqual([REQUEST, REQUEST])
+  expect(a.mcpCalls, 'req1 is already seen').toHaveLength(1)
+  await tick(a)
+  stageRequest(a, 'req2')
+  await tick(a)
+  expect(a.mcpCalls, 'req2 is handled exactly 30s after the first call').toHaveLength(2)
+  expect(whys(a), 'wrote').toEqual([''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('req2')
+})
+
+appScenario('app watchdog: a stuck call that returns late does not clear the busy flag of the newer run', async (a, $) => {
+  a.denyAfter = true
+  a.mcp.ccd_session_mgmt = 'late'
+  await boot(a, $)
+  stageRequest(a, 'reqA')
+  await tick(a)
+  expect(a.release, 'call A is waiting').toHaveLength(1)
+  await tick(a, 8)
+  await tick(a)
+  stageRequest(a, 'reqB')
+  await tick(a)
+  expect(a.release, 'call B is waiting too').toHaveLength(2)
+  a.release[0]?.()
+  await a.clock.settle()
+  const before = a.exists.length
+  await tick(a)
+  expect(a.exists.length, 'the stale run did not clear busy').toBe(before)
+  a.release[1]?.()
+  await a.clock.settle()
+  await tick(a)
+  expect(a.exists.length, 'the watcher runs again once the newer run is done').toBe(before + 1)
+})
+
+appScenario('app flow: a clock set back does not extend the 30s throttle', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'idA')
+  await tick(a)
+  expect(a.mcpCalls, 'first call').toHaveLength(1)
+  const back = a.clock.now() + POLL - 3_600_000
+  a.files.set(REQUEST, JSON.stringify({ schema: 1, id: 'idB', requested_at: back / 1000 - 1 }))
+  a.clockScript = [back]
+  await tick(a)
+  expect(a.mcpCalls, 'handled, not throttled').toHaveLength(2)
+  expect(whys(a), 'both wrote').toEqual(['', ''])
+})
+
+appScenario('app flow: a request read at exactly the time of the last call is still throttled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'idA')
+  await tick(a)
+  expect(a.mcpCalls, 'first call').toHaveLength(1)
+  const same = a.clock.now()
+  a.files.set(REQUEST, JSON.stringify({ schema: 1, id: 'idB', requested_at: same / 1000 - 1 }))
+  a.clockScript = [same]
+  await tick(a)
+  expect(a.mcpCalls, 'throttled, not handled').toHaveLength(1)
+  expect(whys(a), 'second request was throttled').toEqual(['', 'throttled'])
+})
+
+appScenario('app flow: a request read 1 ms short of 30s after the last call is still throttled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'idA')
+  await tick(a)
+  expect(a.mcpCalls, 'first call').toHaveLength(1)
+  const almost = a.clock.now() + 29999
+  a.files.set(REQUEST, JSON.stringify({ schema: 1, id: 'idB', requested_at: almost / 1000 - 1 }))
+  a.clockScript = [almost]
+  await tick(a)
+  expect(a.mcpCalls, 'throttled, not handled').toHaveLength(1)
+  expect(whys(a), 'second request was throttled').toEqual(['', 'throttled'])
+})
+
+scenario('app timer: a refused interval is armed again once the engine time has moved on', undefined, async (w, $) => {
+  await start($)
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.timers, 'armed once').toEqual([3000])
+  w.nowMs = NOW_MS + 6000
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.timers, 'exactly two periods is not enough').toEqual([3000])
+  w.nowMs = NOW_MS + 6001
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.timers, 'armed again').toEqual([3000, 3000])
+  w.nowMs = NOW_MS + 7001
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.timers, 'the baseline moved with the new arm').toEqual([3000, 3000])
 })

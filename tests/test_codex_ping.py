@@ -139,6 +139,8 @@ def make_app(claude=None, codex=None, pinger=True, options=None):
     app.reader = FakeReader(claude, "missing" if claude is None else "")
     app.codex = FakeReader(codex, "" if codex else "no_rate_limits", available=True)
     app.pinger = FakePinger() if pinger else None
+    # Keep the app refresh off here: a real one would write a request file into the data directory.
+    app.app_refresher = None
     return app
 
 
@@ -1013,7 +1015,7 @@ class ParsePingOptionsTests(NoRealProcessTestCase):
 
     def test_options_field_order_and_positional_defaults(self):
         self.assertEqual(
-            widget.Options._fields[-3:],
+            widget.Options._fields[6:9],
             ("codex_bin", "no_codex_ping", "codex_ping_model"))
         plain = widget.Options(".", None, None, None)
         flagged = widget.Options(".", None, None, None, no_codex=True)
@@ -1744,9 +1746,9 @@ class PingSampleTests(unittest.TestCase):
     NAMES = ("dual_caption_asking", "dual_caption_cooldown", "dual_caption_ping_failed")
 
     def test_new_samples_keep_the_old_indexes(self):
-        self.assertEqual(widget.ALL_SAMPLE_STATES[-3:], self.NAMES)
-        self.assertEqual(widget.EXTRA_SAMPLE_STATES[-3:], self.NAMES)
-        self.assertEqual(widget.EXTRA_DUAL_SAMPLE_STATES[-3:], self.NAMES)
+        self.assertEqual(widget.ALL_SAMPLE_STATES[23:26], self.NAMES)
+        self.assertEqual(widget.EXTRA_SAMPLE_STATES[12:15], self.NAMES)
+        self.assertEqual(widget.EXTRA_DUAL_SAMPLE_STATES[5:8], self.NAMES)
         indexes = [widget.ALL_SAMPLE_STATES.index(name) + 1 for name in self.NAMES]
         self.assertEqual(indexes, [24, 25, 26])
         self.assertEqual(

@@ -9,12 +9,17 @@
 唯一例外是用户点 Refresh now 且 Codex 已启用时，会启动用户自己的 Codex 命令行
 （原生 codex.exe，固定参数，不经 shell，隐藏窗口）发一个很小的请求，让 Codex
 把最新额度写进它的会话日志，随后小窗照常只读这份日志；--no-codex-ping 可关闭。
+用户点 Refresh now 时，小窗还会往数据目录写一个很小的请求文件 refresh-request.json，
+并读 usage-feed 插件写的确认文件 refresh-ack.json，让装了插件的桌面会话报一次账号级
+用量；本程序仍然不联网（联网的是插件所在的 Claude Code 会话，不是本程序）；
+--no-app-refresh 可关闭。
 窗口是无父窗口的顶层分层窗口（逐像素 alpha），以主任务栏为所有者，
 随任务栏一起抬升层级。对资源管理器窗口只读查询；跨线程所有权会连接输入队列，主线程
 不能阻塞。
 
 运行：pythonw usage_widget.py [--data-dir DIR] [--no-codex] [--codex-home DIR]
         [--codex-bin FILE] [--no-codex-ping] [--codex-ping-model NAME]
+        [--no-app-refresh]
 测试用参数：--exit-after SEC、--selftest-render OUTDIR、--selftest-gdi N
 
 代码分三层：
@@ -229,6 +234,7 @@ TIMER_GDI_END = 7
 TIMER_FLASH = 8
 TIMER_CAPTION = 9
 TIMER_PING = 10
+TIMER_APP = 11
 FLASH_MS = 300
 FLASH_ALPHA_SCALE = 0.35
 # Refresh now 之后反馈文字显示的毫秒数。
@@ -915,6 +921,176 @@ class CodexPinger:
 
 
 # ---------------------------------------------------------------------------
+# App refresh：Refresh now 时请桌面会话里的 usage-feed 插件报一次账号级用量
+# 小窗只往数据目录写一个很小的请求文件并读确认文件，联网的是插件所在的
+# Claude Code 会话，不是本程序。
+# ---------------------------------------------------------------------------
+
+# 小窗写、插件读的请求文件名。
+APP_REFRESH_REQUEST_NAME = "refresh-request.json"
+# 插件写、小窗读的确认文件名。插件不是原子写，半截内容要当还没有确认。
+APP_REFRESH_ACK_NAME = "refresh-ack.json"
+# 从写出请求起算，最多等这么多秒。
+APP_REFRESH_WAIT_SECONDS = 8.0
+# 主线程轮询确认文件的间隔。本模块不设计时器，只给出毫秒数。
+APP_REFRESH_POLL_MS = 500
+# 收到 ok 或 unavailable 之后的冷却。这段时间里再点不再写请求。
+APP_REFRESH_COOLDOWN_SECONDS = 60.0
+# 等到超时之后的冷却，比成功回应短，方便再试一次。
+APP_REFRESH_RETRY_SECONDS = 10.0
+# 确认文件超过这个字节数就当还没有确认。恰好这么多字节仍然有效。
+APP_ACK_MAX_BYTES = 4096
+# 反馈文字。小窗上的字必须是纯 ASCII。asking 与 cooldown 复用 Codex ping 一节。
+CAPTION_NO_SESSION = "no session"
+CAPTION_NO_LIMITS = "no limits"
+CAPTION_NOT_SENT = "not sent"
+
+
+def read_app_ack(path, expected_id):
+    """读确认文件，返回 "ok"、"unavailable" 或 None。
+
+    缺失、读失败、超长、坏 JSON、schema 不是 1、id 对不上、status 不是这两个值，
+    一律当还没有确认。插件不是原子写，半截内容下一轮再读。
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(APP_ACK_MAX_BYTES + 1)
+        if len(raw) > APP_ACK_MAX_BYTES:
+            return None
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    schema = doc.get("schema")
+    if isinstance(schema, bool) or not isinstance(schema, (int, float)) or schema != 1:
+        return None
+    if doc.get("id") != expected_id:
+        return None
+    status = doc.get("status")
+    if status == "ok" or status == "unavailable":
+        return status
+    return None
+
+
+def app_refresh_caption(read_caption, state):
+    """Claude 块的反馈文字。
+
+    冷却期里“没有新东西可报”的读数文字才换成 cooldown，已经有新数据或读取失败的文字保留。
+    """
+    if state == "asking":
+        return CAPTION_ASKING
+    if state == "cooldown":
+        if (read_caption == "" or read_caption == "no data"
+                or read_caption.startswith("same")):
+            return CAPTION_COOLDOWN
+        return read_caption
+    if state == "no_session":
+        return CAPTION_NO_SESSION
+    if state == "no_limits":
+        return CAPTION_NO_LIMITS
+    if state == "not_sent":
+        return CAPTION_NOT_SENT
+    return read_caption
+
+
+class AppRefresher:
+    """管理一次账号级用量刷新请求。主线程只轮询确认文件，不阻塞、不联网。
+
+    冷却在 poll() 得出结果那一刻设定：回应用长冷却，超时用短冷却。
+    冷却记的是设定那一刻的单调钟和时长，钟回退按已结束处理。
+    """
+
+    def __init__(self, data_dir, clock=time.time, monotonic=time.monotonic, token=None):
+        self.data_dir = data_dir
+        self._clock = clock
+        self._monotonic = monotonic
+        self._token = (lambda: os.urandom(6).hex()) if token is None else token
+        self._pending_id = None
+        self._started_at = None
+        self._cooldown_at = None
+        self._cooldown_for = 0.0
+
+    @property
+    def waiting(self):
+        """已发出、尚未得到回应或超时的请求。"""
+        return self._pending_id is not None
+
+    def cooldown_left(self):
+        """剩余冷却秒数；未设冷却或单调钟回退都返回 0.0。"""
+        if self._cooldown_at is None:
+            return 0.0
+        now = self._monotonic()
+        if now < self._cooldown_at:
+            return 0.0
+        left = self._cooldown_for - (now - self._cooldown_at)
+        if left > 0:
+            return left
+        return 0.0
+
+    def _begin_cooldown(self, seconds):
+        self._cooldown_at = self._monotonic()
+        self._cooldown_for = seconds
+
+    def _clear_wait(self):
+        """只清掉这次等待。冷却与请求文件都不动。"""
+        self._pending_id = None
+        self._started_at = None
+
+    def start(self):
+        """尝试写请求文件。返回原因字符串，绝不抛异常。"""
+        if self.waiting:
+            return "waiting"
+        if self.cooldown_left() > 0:
+            return "cooldown"
+        if not self.data_dir or not os.path.isdir(self.data_dir):
+            return "no_dir"
+        path = os.path.join(self.data_dir, APP_REFRESH_REQUEST_NAME)
+        temp = path + ".tmp"
+        try:
+            new_id = self._token()
+            payload = json.dumps(
+                {"schema": 1, "id": new_id, "requested_at": self._clock()},
+                allow_nan=False) + "\n"
+            with open(temp, "wb") as handle:
+                handle.write(payload.encode("utf-8"))
+            os.replace(temp, path)
+        except (OSError, ValueError) as exc:
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+            return "write_error:%s" % type(exc).__name__
+        self._pending_id = new_id
+        self._started_at = self._monotonic()
+        return "started"
+
+    def poll(self):
+        """没有在等的请求返回 None，结束时返回 (outcome, detail)。detail 恒为空串。"""
+        if not self.waiting:
+            return None
+        status = read_app_ack(
+            os.path.join(self.data_dir, APP_REFRESH_ACK_NAME), self._pending_id)
+        if status == "ok" or status == "unavailable":
+            self._clear_wait()
+            self._begin_cooldown(APP_REFRESH_COOLDOWN_SECONDS)
+            return (status, "")
+        now = self._monotonic()
+        elapsed = 0.0
+        if self._started_at is not None and now >= self._started_at:
+            elapsed = now - self._started_at
+        if elapsed >= APP_REFRESH_WAIT_SECONDS:
+            self._clear_wait()
+            self._begin_cooldown(APP_REFRESH_RETRY_SECONDS)
+            return ("timeout", "")
+        return None
+
+    def stop(self):
+        """清掉等待状态。不删请求文件，不改冷却，重复调用无效果。"""
+        self._clear_wait()
+
+
+# ---------------------------------------------------------------------------
 # 纯函数层：显示状态、文字、显示元组
 # ---------------------------------------------------------------------------
 
@@ -1593,12 +1769,14 @@ EXTRA_SAMPLE_STATES = (
     "dual_caption_new_same", "dual_caption_nodata_error",
     "caption_nodata", "caption_nodata_error", "dual_caption_all_nodata",
     "dual_caption_asking", "dual_caption_cooldown", "dual_caption_ping_failed",
+    "caption_asking", "caption_no_session", "dual_caption_app_no_limits",
 )
 EXTRA_DUAL_SAMPLE_STATES = (
     "dual_stale_both", "dual_stale_claude",
     "dual_caption_new_same", "dual_caption_nodata_error",
     "dual_caption_all_nodata",
     "dual_caption_asking", "dual_caption_cooldown", "dual_caption_ping_failed",
+    "dual_caption_app_no_limits",
 )
 ALL_SAMPLE_STATES = SAMPLE_STATES + EXTRA_SAMPLE_STATES
 SHEET_BACKGROUNDS = (
@@ -1618,7 +1796,7 @@ def _sample_snapshot(name, now):
 
     if name in ("nodata", "caption_nodata", "caption_nodata_error", "dual_caption_all_nodata"):
         return None
-    if name == "green":
+    if name in ("green", "caption_asking", "caption_no_session"):
         return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
     if name == "amber":
         return {"five_hour": win(65), "seven_day": win(33, resets_7d)}
@@ -1634,7 +1812,7 @@ def _sample_snapshot(name, now):
                 "seven_day": win(55, resets_7d)}
     if name in ("dual_green", "dual_codex_reset",
                 "dual_caption_asking", "dual_caption_cooldown",
-                "dual_caption_ping_failed"):
+                "dual_caption_ping_failed", "dual_caption_app_no_limits"):
         # 左侧 Claude：与 green 样张相同
         return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
     if name == "dual_mixed":
@@ -1675,7 +1853,7 @@ def _sample_codex_snapshot(name, now):
         return Win(float(pct), resets, observed)
 
     if name in ("dual_green", "dual_caption_asking", "dual_caption_cooldown",
-                "dual_caption_ping_failed"):
+                "dual_caption_ping_failed", "dual_caption_app_no_limits"):
         return {"five_hour": win(3), "seven_day": win(36, resets_7d)}
     if name == "dual_mixed":
         # 右侧 Codex：与 stale 样张相同
@@ -1709,6 +1887,8 @@ def _sample_captions(name, now):
     caption_nodata_error、dual_caption_all_nodata 这三个样张演示它。
     dual_caption_asking、dual_caption_cooldown、dual_caption_ping_failed
     是 Codex 刷新时的三条反馈：asking、cooldown、ping failed。
+    caption_asking、caption_no_session 是单栏 Claude 的 asking 与 no session；
+    dual_caption_app_no_limits 是双栏里 Claude 的 no limits 与 Codex 的 cooldown。
     """
     if name == "caption_new":
         return (caption_text(now - 3600.0, now - 60.0, ""), "")
@@ -1744,6 +1924,15 @@ def _sample_captions(name, now):
         )
     if name == "dual_caption_ping_failed":
         return ("", codex_ping_caption("", "failed"))
+    if name == "caption_asking":
+        return (app_refresh_caption("", "asking"), "")
+    if name == "caption_no_session":
+        return (app_refresh_caption("", "no_session"), "")
+    if name == "dual_caption_app_no_limits":
+        return (
+            app_refresh_caption("", "no_limits"),
+            codex_ping_caption(caption_text(now - 31 * 60.0, now - 31 * 60.0, ""), "cooldown"),
+        )
     return None
 
 
@@ -2621,6 +2810,9 @@ class WidgetApp:
                 model=opts.codex_ping_model or CODEX_PING_MODEL,
                 exe_override=opts.codex_bin,
                 codex_home=opts.codex_home)
+        # 只在 Refresh now 时才写请求文件；被 --no-app-refresh 关掉时为 None。
+        # 与 Codex 是否启用无关：--no-codex 时 Claude 块照样能用。
+        self.app_refresher = None if opts.no_app_refresh else AppRefresher(self.data_dir)
         # 同一种 Codex 原因只记一次；原因变回空串后，下次再出现才重新记。
         self._codex_log_reason = ""
         self.pos_path = os.path.join(self.data_dir, POS_FILE_NAME)
@@ -2656,6 +2848,8 @@ class WidgetApp:
         self._caption_before = None   # 只在 Refresh now 读数据源期间非 None：刷新前各提供方最新的 observed_at
         # 点 Refresh now 那一刻 Codex 最新的 observed_at，ping 结束后拿它判断 new 还是 same。
         self._ping_before = None
+        # 点 Refresh now 那一刻 Claude 最新的 observed_at，确认回来后拿它判断 new 还是 same。
+        self._app_before = None
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -2784,6 +2978,8 @@ class WidgetApp:
             self.refresh_view()
         elif timer_id == TIMER_PING:
             self._on_ping_timer()
+        elif timer_id == TIMER_APP:
+            self._on_app_timer()
 
     def on_destroy(self):
         if self._recreating:
@@ -3005,12 +3201,18 @@ class WidgetApp:
                 captions = texts
             else:
                 self._caption = None
-        # asking 在 ping 期间持续显示，不受 2.5 秒反馈到期影响。
-        # Claude 那一项照旧按自己的 2.5 秒走。
+        # asking 在 ping 或等待桌面会话期间持续显示，不受 2.5 秒反馈到期影响。
+        # Codex 那一项只因 pinger.running 变成 asking，Claude 那一项只因
+        # app_refresher.waiting 变成 asking，两项互不影响，可以同时成立。
         if self.pinger is not None and self.pinger.running:
             base = list(captions) if captions else []
             base = (base + ["", ""])[:2]
             base[1] = CAPTION_ASKING
+            captions = tuple(base)
+        if self.app_refresher is not None and self.app_refresher.waiting:
+            base = list(captions) if captions else []
+            base = (base + ["", ""])[:2]
+            base[0] = CAPTION_ASKING
             captions = tuple(base)
         display = build_display(
             self._current_snapshot(), now, theme, scale, height,
@@ -3120,6 +3322,31 @@ class WidgetApp:
         pair = (tuple(texts) + ("", ""))[:2]
         self._caption = (deadline, (pair[0], rewrite(pair[1])))
 
+    def _rewrite_claude_caption(self, rewrite):
+        """改掉已有反馈文字里 Claude 那一项。没有反馈文字时什么也不做，截止时间不变。"""
+        if self._caption is None:
+            return
+        deadline, texts = self._caption
+        pair = (tuple(texts) + ("", ""))[:2]
+        self._caption = (deadline, (rewrite(pair[0]), pair[1]))
+
+    def _set_slot_caption(self, index, text):
+        """把反馈文字里下标 index（0 是 Claude，1 是 Codex）那一项换成 text。
+
+        只保留未过期的另一项，没有或已过期则另一项为空串。截止时间重新从现在算起，
+        起 TIMER_CAPTION 并重绘一次。
+        """
+        now = time.time()
+        pair = ["", ""]
+        if self._caption is not None:
+            deadline, texts = self._caption
+            if now < deadline:
+                pair = list((tuple(texts) + ("", ""))[:2])
+        pair[index] = text
+        self._caption = (now + CAPTION_MS / 1000.0, (pair[0], pair[1]))
+        self.set_timer(TIMER_CAPTION, CAPTION_MS)
+        self.refresh_view()
+
     def _start_codex_ping(self, before_codex):
         """只在 Refresh now 里调用，TIMER_POLL 不会走到。
 
@@ -3156,8 +3383,8 @@ class WidgetApp:
             self._log_exception(exc)
 
     def _on_ping_timer(self):
-        """ping 的结果只在这里统一收口。Claude 那一项写空串：ping 通常要几秒，
-        它自己的 2.5 秒反馈这时已结束；ping 很快失败时会提前盖掉它。"""
+        """ping 的结果只在这里统一收口。只换 Codex 那一项（下标 1），
+        Claude 那一项若仍未过期就保留。"""
         try:
             pinger = self.pinger
             if pinger is None:
@@ -3180,9 +3407,7 @@ class WidgetApp:
                     _snapshot_observed_at(self.codex.snapshot),
                     self.codex.last_reason)
             self._ping_before = None
-            self._caption = (time.time() + CAPTION_MS / 1000.0, ("", text))
-            self.set_timer(TIMER_CAPTION, CAPTION_MS)
-            self.refresh_view()
+            self._set_slot_caption(1, text)
         except Exception as exc:
             self._log_exception(exc)
 
@@ -3199,6 +3424,86 @@ class WidgetApp:
         self.log.log("CodexPing", "poll timer unavailable; ping abandoned")
         self._stop_ping()
         self._ping_before = None
+
+    def _start_app_refresh(self, before_claude):
+        """只在 Refresh now 里调用，TIMER_POLL 绝不会走到。内部绝不抛异常。"""
+        try:
+            refresher = self.app_refresher
+            if refresher is None or self.exiting or not self.hwnd:
+                return
+            reason = refresher.start()
+            if reason == "started":
+                self._app_before = before_claude
+                if not self.set_timer(TIMER_APP, APP_REFRESH_POLL_MS):
+                    self._drop_app_refresh()
+                    self._rewrite_claude_caption(
+                        lambda _text: app_refresh_caption("", "no_session"))
+                self.refresh_view()
+            elif reason == "waiting":
+                pass
+            elif reason == "cooldown":
+                if self._caption is not None:
+                    self._rewrite_claude_caption(
+                        lambda text: app_refresh_caption(text, "cooldown"))
+                self.refresh_view()
+            elif reason == "no_dir":
+                pass
+            elif reason.startswith("write_error:"):
+                self.log.log("AppRefresh", reason)
+                if self._caption is not None:
+                    self._rewrite_claude_caption(
+                        lambda _text: app_refresh_caption("", "not_sent"))
+                self.refresh_view()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _on_app_timer(self):
+        """TIMER_APP：读确认文件，收口后只换 Claude 那一项。"""
+        try:
+            refresher = self.app_refresher
+            if refresher is None:
+                self.kill_timer(TIMER_APP)
+                return
+            result = refresher.poll()
+            if result is None:
+                if not refresher.waiting:
+                    self.kill_timer(TIMER_APP)
+                return
+            self.kill_timer(TIMER_APP)
+            outcome, _detail = result
+            if outcome == "ok":
+                self.reader.refresh(force=True)
+                reason = self.reader.last_reason
+                if reason and reason != "missing":
+                    self.log.log("SnapshotInvalid", reason)
+                text = caption_text(
+                    self._app_before,
+                    _snapshot_observed_at(self.reader.snapshot),
+                    self.reader.last_reason)
+            elif outcome == "unavailable":
+                text = app_refresh_caption("", "no_limits")
+            else:
+                text = app_refresh_caption("", "no_session")
+                self.log.log(
+                    "AppRefresh", "no answer within %d s" % APP_REFRESH_WAIT_SECONDS)
+            self._app_before = None
+            self._set_slot_caption(0, text)
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _stop_app_refresh(self):
+        """停掉正在等的请求。可重复调用，绝不抛异常。"""
+        try:
+            if self.app_refresher is not None:
+                self.app_refresher.stop()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _drop_app_refresh(self):
+        """轮询计时器建不起来，没有计时器就没人收尾，Claude 项会一直停在 asking，所以放弃这次请求。"""
+        self.log.log("AppRefresh", "poll timer unavailable; request abandoned")
+        self._stop_app_refresh()
+        self._app_before = None
 
     def poll_theme(self):
         light = read_light_theme()
@@ -3282,7 +3587,7 @@ class WidgetApp:
         poll_snapshot 仍是对外入口，不给它加参数：TIMER_POLL 与现有测试都按 force 单参数
         调用或替换它。反馈文字靠 _caption_before 接进去：只在读数据源期间非 None，
         poll_snapshot 读完就清掉；这里的 finally 保住异常路径也清掉。
-        之后（读完数据源、反馈文字已经挂上）才请求 Codex，这样 Codex 那一项的
+        之后（读完数据源、反馈文字已经挂上）才请求 Codex 与桌面会话，这样
         asking / cooldown 是在已有反馈文字上改。
         """
         if before is None:
@@ -3293,6 +3598,7 @@ class WidgetApp:
         finally:
             self._caption_before = None
         self._safe(self._start_codex_ping, before[1])
+        self._safe(self._start_app_refresh, before[0])
         self._begin_flash()
 
     def _begin_flash(self):
@@ -3372,6 +3678,7 @@ class WidgetApp:
             return
         self.exiting = True
         self._stop_ping()
+        self._stop_app_refresh()
         self._flashing = False
         self._caption = None
         self.w32.unwatch_window_events()
@@ -3429,6 +3736,10 @@ class WidgetApp:
                 # 窗口重建清掉了全部计时器；补不上就放弃，否则没人再收尾这个 ping。
                 if not self.set_timer(TIMER_PING, CODEX_PING_POLL_MS):
                     self._drop_ping()
+            if self.app_refresher is not None and self.app_refresher.waiting:
+                # 窗口重建清掉了全部计时器；补不上就放弃，否则没人再收尾这个请求。
+                if not self.set_timer(TIMER_APP, APP_REFRESH_POLL_MS):
+                    self._drop_app_refresh()
         elif self.opts.exit_after is not None:
             self.set_timer(TIMER_EXIT, int(self.opts.exit_after * 1000))
         if self.opts.selftest_gdi and not recreated:
@@ -3455,6 +3766,7 @@ class WidgetApp:
                 self.w32.unregister_class()
         finally:
             self._stop_ping()
+            self._stop_app_refresh()
             _APP = None
         return 0
 
@@ -3466,8 +3778,8 @@ class WidgetApp:
 Options = collections.namedtuple(
     "Options",
     ["data_dir", "exit_after", "selftest_render", "selftest_gdi", "no_codex", "codex_home",
-     "codex_bin", "no_codex_ping", "codex_ping_model"],
-    defaults=(False, None, None, False, None))
+     "codex_bin", "no_codex_ping", "codex_ping_model", "no_app_refresh"],
+    defaults=(False, None, None, False, None, False))
 
 
 def parse_args(argv):
@@ -3481,6 +3793,7 @@ def parse_args(argv):
     codex_bin_arg = None
     no_codex_ping = False
     ping_model = None
+    no_app_refresh = False
     names = ("--data-dir", "--exit-after", "--selftest-render", "--selftest-gdi",
              "--codex-home", "--codex-bin", "--codex-ping-model")
     index = 0
@@ -3492,6 +3805,10 @@ def parse_args(argv):
             continue
         if name == "--no-codex-ping":
             no_codex_ping = True
+            index += 1
+            continue
+        if name == "--no-app-refresh":
+            no_app_refresh = True
             index += 1
             continue
         if name not in names:
@@ -3530,7 +3847,7 @@ def parse_args(argv):
             if count >= 1:
                 gdi_count = count
     return Options(data_dir, exit_after, render_dir, gdi_count, no_codex, codex_home_arg,
-                   codex_bin_arg, no_codex_ping, ping_model)
+                   codex_bin_arg, no_codex_ping, ping_model, no_app_refresh)
 
 
 def run_app(opts, log):

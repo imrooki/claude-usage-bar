@@ -5,12 +5,16 @@
 <data-dir>\\usage.json（由别的程序写入）。读数超过 30 分钟视为陈旧：进度条变成
 灰色，并显示读数的年龄（单栏写在重置时间右边，双栏写在页眉里）。右键 Refresh now
 之后，页眉或附加列（没有任何数据时是第二行）会短暂（约 2.5 秒）改写成刷新结果，
-如 new 14:58、same 14:29、no data、read error。本程序不联网、不起其它程序、不碰
-任何凭证文件；窗口是无父窗口的顶层分层窗口（逐像素 alpha），以主任务栏为所有者，
+如 new 14:58、same 14:29、no data、read error。本程序自己不联网、不读任何凭证文件；
+唯一例外是用户点 Refresh now 且 Codex 已启用时，会启动用户自己的 Codex 命令行
+（原生 codex.exe，固定参数，不经 shell，隐藏窗口）发一个很小的请求，让 Codex
+把最新额度写进它的会话日志，随后小窗照常只读这份日志；--no-codex-ping 可关闭。
+窗口是无父窗口的顶层分层窗口（逐像素 alpha），以主任务栏为所有者，
 随任务栏一起抬升层级。对资源管理器窗口只读查询；跨线程所有权会连接输入队列，主线程
 不能阻塞。
 
 运行：pythonw usage_widget.py [--data-dir DIR] [--no-codex] [--codex-home DIR]
+        [--codex-bin FILE] [--no-codex-ping] [--codex-ping-model NAME]
 测试用参数：--exit-after SEC、--selftest-render OUTDIR、--selftest-gdi N
 
 代码分三层：
@@ -24,9 +28,12 @@ import ctypes
 import ctypes.wintypes as wintypes
 import datetime
 import functools
+import glob
 import json
 import math
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -221,6 +228,7 @@ TIMER_GDI_TICK = 6
 TIMER_GDI_END = 7
 TIMER_FLASH = 8
 TIMER_CAPTION = 9
+TIMER_PING = 10
 FLASH_MS = 300
 FLASH_ALPHA_SCALE = 0.35
 # Refresh now 之后反馈文字显示的毫秒数。
@@ -650,6 +658,260 @@ class CodexReader:
         self.source_path = found_path
         self.last_reason = ""
         return changed
+
+
+# ---------------------------------------------------------------------------
+# Codex ping：Refresh now 时向 Codex 发一个很小的请求
+# 让 Codex 把最新额度写进它的会话日志。小窗仍然只读这份日志，不解析命令行输出。
+# ---------------------------------------------------------------------------
+
+# 发往 Codex 的模型名。最终进命令行，须再过 valid_ping_model。
+CODEX_PING_MODEL = "gpt-6-luna"
+# 最短提示词。只要 Codex 写出带限额的会话日志即可。
+CODEX_PING_PROMPT = "ok"
+# 从成功启动起算，超过这个秒数仍未退出就开始终止。
+CODEX_PING_TIMEOUT_SECONDS = 60.0
+# terminate 之后再等这么久仍未退出才 kill；kill 之后再等这么久仍未回收就放弃跟踪。
+CODEX_PING_KILL_WAIT_SECONDS = 2.0
+# 成功启动之后的冷却。失败或超时的那次也占冷却，避免连点反复拉起进程。
+CODEX_PING_COOLDOWN_SECONDS = 300.0
+# 主线程轮询子进程的间隔。本模块不设计时器，只给出毫秒数。
+CODEX_PING_POLL_MS = 500
+# 子进程的工作目录名，建在 data_dir 下，不借用用户正在用的目录。
+CODEX_PING_DIR_NAME = "codex-ping"
+# 反馈文字。小窗上的字必须是纯 ASCII。
+CAPTION_ASKING = "asking"
+CAPTION_COOLDOWN = "cooldown"
+CAPTION_PING_FAILED = "ping failed"
+
+
+def valid_ping_model(name):
+    """模型名会进命令行，只放行保守字符集。"""
+    if not isinstance(name, str):
+        return False
+    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", name) is not None
+
+
+def find_codex_exe(override=None, path_env=None, appdata=None):
+    """返回原生 codex.exe 的路径，找不到返回 None。任何 OSError 都当没找到。
+
+    不接受 .cmd / .bat / .ps1：npm 垫片经 node 再起原生程序，杀掉垫片留不住孙进程。
+    PATH 与 APPDATA 里只认绝对路径：空项和相对项会按小窗当前的工作目录解析，
+    那个目录取决于小窗怎么被启动，不能让里面的 codex.exe 被点一下就跑起来。
+    override（--codex-bin）是显式指定的文件，不受此限。
+    """
+    try:
+        if override is not None:
+            if os.path.isfile(override) and override.lower().endswith(".exe"):
+                return override
+            return None
+    except OSError:
+        return None
+
+    if path_env is None:
+        path_env = os.environ.get("PATH", "")
+    for directory in path_env.split(os.pathsep):
+        if not directory.strip() or not os.path.isabs(directory):
+            continue
+        candidate = os.path.join(directory, "codex.exe")
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+
+    if appdata is None:
+        appdata = os.environ.get("APPDATA")
+    if appdata and os.path.isabs(appdata):
+        pattern = os.path.join(
+            glob.escape(appdata),
+            "npm", "node_modules", "@openai", "codex", "node_modules",
+            "@openai", "codex-win32-*", "vendor", "*", "bin", "codex.exe")
+        try:
+            matches = sorted(glob.glob(pattern))
+        except OSError:
+            matches = []
+        for match in matches:
+            try:
+                if os.path.isfile(match):
+                    return match
+            except OSError:
+                continue
+    return None
+
+
+def build_ping_argv(exe, model, cwd):
+    """固定参数。第 6 项是带双引号的一整段配置，不能拆开。"""
+    return [
+        exe, "exec", "-m", model, "-c", 'model_reasoning_effort="low"',
+        "--ignore-user-config", "--ignore-rules", "-s", "read-only", "-C", cwd,
+        "--skip-git-repo-check", "--json", CODEX_PING_PROMPT,
+    ]
+
+
+def codex_ping_caption(read_caption, state):
+    """Codex 块的反馈文字。
+
+    冷却期里“没有新东西可报”的读数文字才换成 cooldown，已经有新数据或读取失败的文字保留。
+    """
+    if state == "asking":
+        return CAPTION_ASKING
+    if state == "failed":
+        return CAPTION_PING_FAILED
+    if state == "cooldown":
+        if (read_caption == "" or read_caption == "no data"
+                or read_caption.startswith("same")):
+            return CAPTION_COOLDOWN
+        return read_caption
+    return read_caption
+
+
+class CodexPinger:
+    """管理一次 Codex 刷新子进程。主线程只轮询，不阻塞、不读管道。
+
+    冷却从成功启动那一刻算起：随后失败或超时的那次也占冷却，免得连点反复拉起。
+    no_exe 与创建失败不算启动。超时先 terminate，仍不退出再 kill；两步都不等待。
+    """
+
+    def __init__(self, data_dir, model=CODEX_PING_MODEL, exe_override=None,
+                 codex_home=None, popen=None, find_exe=None, clock=time.monotonic):
+        self.data_dir = data_dir
+        self.model = model
+        self.exe_override = exe_override
+        self.codex_home = codex_home
+        self._popen = subprocess.Popen if popen is None else popen
+        self._find_exe = find_codex_exe if find_exe is None else find_exe
+        self._clock = clock
+        self._proc = None
+        self._started_at = None
+        self._last_started_at = None
+        self._terminated_at = None
+        self._killed_at = None
+
+    @property
+    def running(self):
+        """已启动且尚未回收。"""
+        return self._proc is not None
+
+    def cooldown_left(self):
+        """距上次成功启动不足冷却时长时返回剩余秒数，否则 0.0。时钟回拨视为已结束。"""
+        if self._last_started_at is None:
+            return 0.0
+        now = self._clock()
+        if now < self._last_started_at:
+            return 0.0
+        left = CODEX_PING_COOLDOWN_SECONDS - (now - self._last_started_at)
+        if left > 0:
+            return left
+        return 0.0
+
+    def _clear_proc(self):
+        """丢掉这次子进程的跟踪。上次启动时刻留给冷却，不清。"""
+        self._proc = None
+        self._started_at = None
+        self._terminated_at = None
+        self._killed_at = None
+
+    def start(self):
+        """尝试启动。返回原因字符串，绝不抛异常。"""
+        if self.running:
+            return "running"
+        if self.cooldown_left() > 0:
+            return "cooldown"
+        exe = self._find_exe(self.exe_override)
+        if exe is None:
+            return "no_exe"
+        work = os.path.join(self.data_dir, CODEX_PING_DIR_NAME)
+        argv = build_ping_argv(exe, self.model, work)
+        if self.codex_home is None:
+            env = None
+        else:
+            env = dict(os.environ)
+            env["CODEX_HOME"] = self.codex_home
+        try:
+            os.makedirs(work, exist_ok=True)
+            self._proc = self._popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=work,
+                env=env,
+                close_fds=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except (OSError, ValueError) as exc:
+            self._proc = None
+            return "spawn_error:%s" % type(exc).__name__
+        started = self._clock()
+        self._started_at = started
+        self._last_started_at = started
+        self._terminated_at = None
+        self._killed_at = None
+        return "started"
+
+    def poll(self):
+        """没有子进程或仍在跑时返回 None，结束时返回 (outcome, detail)。"""
+        proc = self._proc
+        if proc is None:
+            return None
+        try:
+            code = proc.poll()
+        except OSError:
+            self._clear_proc()
+            return ("failed", "poll_error")
+        if code is None:
+            now = self._clock()
+            if (self._terminated_at is None
+                    and self._started_at is not None
+                    and now - self._started_at >= CODEX_PING_TIMEOUT_SECONDS):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                self._terminated_at = now
+                return None
+            if (self._terminated_at is not None and self._killed_at is None
+                    and now - self._terminated_at >= CODEX_PING_KILL_WAIT_SECONDS):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                self._killed_at = now
+                return None
+            if (self._killed_at is not None
+                    and now - self._killed_at >= CODEX_PING_KILL_WAIT_SECONDS):
+                self._clear_proc()
+                return ("timeout", "unreaped")
+            return None
+        timed_out = self._terminated_at is not None
+        self._clear_proc()
+        if timed_out:
+            return ("timeout", "exit:%d" % code)
+        if code == 0:
+            return ("ok", "exit:0")
+        return ("failed", "exit:%d" % code)
+
+    def stop(self):
+        """有子进程就终止再杀，然后清掉跟踪。不等待，重复调用无效果。"""
+        proc = self._proc
+        if proc is None:
+            return
+        still = True
+        try:
+            still = proc.poll() is None
+        except OSError:
+            still = True
+        if still:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self._clear_proc()
 
 
 # ---------------------------------------------------------------------------
@@ -1330,11 +1592,13 @@ EXTRA_SAMPLE_STATES = (
     "caption_new", "caption_same", "caption_error",
     "dual_caption_new_same", "dual_caption_nodata_error",
     "caption_nodata", "caption_nodata_error", "dual_caption_all_nodata",
+    "dual_caption_asking", "dual_caption_cooldown", "dual_caption_ping_failed",
 )
 EXTRA_DUAL_SAMPLE_STATES = (
     "dual_stale_both", "dual_stale_claude",
     "dual_caption_new_same", "dual_caption_nodata_error",
     "dual_caption_all_nodata",
+    "dual_caption_asking", "dual_caption_cooldown", "dual_caption_ping_failed",
 )
 ALL_SAMPLE_STATES = SAMPLE_STATES + EXTRA_SAMPLE_STATES
 SHEET_BACKGROUNDS = (
@@ -1368,7 +1632,9 @@ def _sample_snapshot(name, now):
     if name == "reset":
         return {"five_hour": win(80, resets=now - 10.0, observed=now - 70.0),
                 "seven_day": win(55, resets_7d)}
-    if name in ("dual_green", "dual_codex_reset"):
+    if name in ("dual_green", "dual_codex_reset",
+                "dual_caption_asking", "dual_caption_cooldown",
+                "dual_caption_ping_failed"):
         # 左侧 Claude：与 green 样张相同
         return {"five_hour": win(30), "seven_day": win(10, resets_7d)}
     if name == "dual_mixed":
@@ -1408,7 +1674,8 @@ def _sample_codex_snapshot(name, now):
     def win(pct, resets=resets_5h, observed=fresh):
         return Win(float(pct), resets, observed)
 
-    if name == "dual_green":
+    if name in ("dual_green", "dual_caption_asking", "dual_caption_cooldown",
+                "dual_caption_ping_failed"):
         return {"five_hour": win(3), "seven_day": win(36, resets_7d)}
     if name == "dual_mixed":
         # 右侧 Codex：与 stale 样张相同
@@ -1440,6 +1707,8 @@ def _sample_captions(name, now):
 
     没有任何窗口时整个小窗是无数据布局，反馈文字顶替第二行；caption_nodata、
     caption_nodata_error、dual_caption_all_nodata 这三个样张演示它。
+    dual_caption_asking、dual_caption_cooldown、dual_caption_ping_failed
+    是 Codex 刷新时的三条反馈：asking、cooldown、ping failed。
     """
     if name == "caption_new":
         return (caption_text(now - 3600.0, now - 60.0, ""), "")
@@ -1466,6 +1735,15 @@ def _sample_captions(name, now):
             caption_text(None, None, "missing"),
             caption_text(None, None, "bad_json"),
         )
+    if name == "dual_caption_asking":
+        return ("", codex_ping_caption("", "asking"))
+    if name == "dual_caption_cooldown":
+        return (
+            caption_text(now - 3600.0, now - 60.0, ""),
+            codex_ping_caption(caption_text(now - 31 * 60.0, now - 31 * 60.0, ""), "cooldown"),
+        )
+    if name == "dual_caption_ping_failed":
+        return ("", codex_ping_caption("", "failed"))
     return None
 
 
@@ -2335,6 +2613,14 @@ class WidgetApp:
             self.codex = None
         else:
             self.codex = CodexReader(opts.codex_home)
+        # pinger 只在 Refresh now 时才会启动子进程；没有 Codex 数据源或被 --no-codex-ping 关掉时为 None。
+        self.pinger = None
+        if self.codex is not None and not opts.no_codex_ping:
+            self.pinger = CodexPinger(
+                self.data_dir,
+                model=opts.codex_ping_model or CODEX_PING_MODEL,
+                exe_override=opts.codex_bin,
+                codex_home=opts.codex_home)
         # 同一种 Codex 原因只记一次；原因变回空串后，下次再出现才重新记。
         self._codex_log_reason = ""
         self.pos_path = os.path.join(self.data_dir, POS_FILE_NAME)
@@ -2368,6 +2654,8 @@ class WidgetApp:
         self._flashing = False
         self._caption = None          # (截止时间, 各提供方反馈文字)，None 表示没有
         self._caption_before = None   # 只在 Refresh now 读数据源期间非 None：刷新前各提供方最新的 observed_at
+        # 点 Refresh now 那一刻 Codex 最新的 observed_at，ping 结束后拿它判断 new 还是 same。
+        self._ping_before = None
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -2494,6 +2782,8 @@ class WidgetApp:
             # 计时器到点就直接擦。系统计时器可能比墙钟略早触发，不能再拿截止时间去比。
             self._caption = None
             self.refresh_view()
+        elif timer_id == TIMER_PING:
+            self._on_ping_timer()
 
     def on_destroy(self):
         if self._recreating:
@@ -2715,6 +3005,13 @@ class WidgetApp:
                 captions = texts
             else:
                 self._caption = None
+        # asking 在 ping 期间持续显示，不受 2.5 秒反馈到期影响。
+        # Claude 那一项照旧按自己的 2.5 秒走。
+        if self.pinger is not None and self.pinger.running:
+            base = list(captions) if captions else []
+            base = (base + ["", ""])[:2]
+            base[1] = CAPTION_ASKING
+            captions = tuple(base)
         display = build_display(
             self._current_snapshot(), now, theme, scale, height,
             codex=codex_snapshot, codex_available=codex_available, captions=captions)
@@ -2815,6 +3112,94 @@ class WidgetApp:
         self._codex_log_reason = reason
         self.log.log("CodexRead", reason)
 
+    def _rewrite_codex_caption(self, rewrite):
+        """改掉已有反馈文字里 Codex 那一项。没有反馈文字时什么也不做。"""
+        if self._caption is None:
+            return
+        deadline, texts = self._caption
+        pair = (tuple(texts) + ("", ""))[:2]
+        self._caption = (deadline, (pair[0], rewrite(pair[1])))
+
+    def _start_codex_ping(self, before_codex):
+        """只在 Refresh now 里调用，TIMER_POLL 不会走到。
+
+        Codex 没装或还没用过（没有 sessions 目录）时，不替用户去启动它。
+        """
+        try:
+            pinger = self.pinger
+            if pinger is None or self.codex is None or not self.codex.available:
+                return
+            if self.exiting or not self.hwnd:
+                return
+            reason = pinger.start()
+            if reason == "started":
+                self._ping_before = before_codex
+                if not self.set_timer(TIMER_PING, CODEX_PING_POLL_MS):
+                    self._drop_ping()
+                    self._rewrite_codex_caption(
+                        lambda _text: codex_ping_caption("", "failed"))
+                self.refresh_view()
+            elif reason == "cooldown":
+                if self._caption is not None:
+                    self._rewrite_codex_caption(
+                        lambda text: codex_ping_caption(text, "cooldown"))
+                self.refresh_view()
+            elif reason == "no_exe":
+                self.log.log("CodexPing", "codex.exe not found; ping skipped")
+            elif reason.startswith("spawn_error:"):
+                self.log.log("CodexPing", reason)
+                if self._caption is not None:
+                    self._rewrite_codex_caption(
+                        lambda _text: codex_ping_caption("", "failed"))
+                self.refresh_view()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _on_ping_timer(self):
+        """ping 的结果只在这里统一收口。Claude 那一项写空串：ping 通常要几秒，
+        它自己的 2.5 秒反馈这时已结束；ping 很快失败时会提前盖掉它。"""
+        try:
+            pinger = self.pinger
+            if pinger is None:
+                self.kill_timer(TIMER_PING)
+                return
+            result = pinger.poll()
+            if result is None:
+                if not pinger.running:
+                    self.kill_timer(TIMER_PING)
+                return
+            self.kill_timer(TIMER_PING)
+            self._poll_codex(True)
+            outcome, detail = result
+            if outcome == "failed" or outcome == "timeout":
+                text = codex_ping_caption("", "failed")
+                self.log.log("CodexPing", "ping %s (%s)" % (outcome, detail))
+            else:
+                text = caption_text(
+                    self._ping_before,
+                    _snapshot_observed_at(self.codex.snapshot),
+                    self.codex.last_reason)
+            self._ping_before = None
+            self._caption = (time.time() + CAPTION_MS / 1000.0, ("", text))
+            self.set_timer(TIMER_CAPTION, CAPTION_MS)
+            self.refresh_view()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _stop_ping(self):
+        """停掉正在跑的 ping。可重复调用，绝不抛异常。"""
+        try:
+            if self.pinger is not None:
+                self.pinger.stop()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _drop_ping(self):
+        """轮询计时器建不起来：没有计时器就没人收尾，ping 会一直停在 asking，所以放弃它。"""
+        self.log.log("CodexPing", "poll timer unavailable; ping abandoned")
+        self._stop_ping()
+        self._ping_before = None
+
     def poll_theme(self):
         light = read_light_theme()
         if light != self.light:
@@ -2897,6 +3282,8 @@ class WidgetApp:
         poll_snapshot 仍是对外入口，不给它加参数：TIMER_POLL 与现有测试都按 force 单参数
         调用或替换它。反馈文字靠 _caption_before 接进去：只在读数据源期间非 None，
         poll_snapshot 读完就清掉；这里的 finally 保住异常路径也清掉。
+        之后（读完数据源、反馈文字已经挂上）才请求 Codex，这样 Codex 那一项的
+        asking / cooldown 是在已有反馈文字上改。
         """
         if before is None:
             before = self._latest_observed()
@@ -2905,6 +3292,7 @@ class WidgetApp:
             self.poll_snapshot(force=True)
         finally:
             self._caption_before = None
+        self._safe(self._start_codex_ping, before[1])
         self._begin_flash()
 
     def _begin_flash(self):
@@ -2983,6 +3371,7 @@ class WidgetApp:
         if self.exiting:
             return
         self.exiting = True
+        self._stop_ping()
         self._flashing = False
         self._caption = None
         self.w32.unwatch_window_events()
@@ -3036,6 +3425,10 @@ class WidgetApp:
         if recreated:
             if self._exit_deadline is not None:
                 self.set_timer(TIMER_EXIT, max(10, int((self._exit_deadline - time.monotonic()) * 1000)))
+            if self.pinger is not None and self.pinger.running:
+                # 窗口重建清掉了全部计时器；补不上就放弃，否则没人再收尾这个 ping。
+                if not self.set_timer(TIMER_PING, CODEX_PING_POLL_MS):
+                    self._drop_ping()
         elif self.opts.exit_after is not None:
             self.set_timer(TIMER_EXIT, int(self.opts.exit_after * 1000))
         if self.opts.selftest_gdi and not recreated:
@@ -3061,6 +3454,7 @@ class WidgetApp:
                 self.w32.unwatch_window_events()
                 self.w32.unregister_class()
         finally:
+            self._stop_ping()
             _APP = None
         return 0
 
@@ -3071,8 +3465,9 @@ class WidgetApp:
 
 Options = collections.namedtuple(
     "Options",
-    ["data_dir", "exit_after", "selftest_render", "selftest_gdi", "no_codex", "codex_home"],
-    defaults=(False, None))
+    ["data_dir", "exit_after", "selftest_render", "selftest_gdi", "no_codex", "codex_home",
+     "codex_bin", "no_codex_ping", "codex_ping_model"],
+    defaults=(False, None, None, False, None))
 
 
 def parse_args(argv):
@@ -3083,12 +3478,20 @@ def parse_args(argv):
     gdi_count = None
     no_codex = False
     codex_home_arg = None
-    names = ("--data-dir", "--exit-after", "--selftest-render", "--selftest-gdi", "--codex-home")
+    codex_bin_arg = None
+    no_codex_ping = False
+    ping_model = None
+    names = ("--data-dir", "--exit-after", "--selftest-render", "--selftest-gdi",
+             "--codex-home", "--codex-bin", "--codex-ping-model")
     index = 0
     while index < len(argv):
         name, equals, inline = argv[index].partition("=")
         if name == "--no-codex":
             no_codex = True
+            index += 1
+            continue
+        if name == "--no-codex-ping":
+            no_codex_ping = True
             index += 1
             continue
         if name not in names:
@@ -3108,6 +3511,10 @@ def parse_args(argv):
             render_dir = os.path.abspath(value)
         elif name == "--codex-home" and value:
             codex_home_arg = os.path.abspath(value)
+        elif name == "--codex-bin" and value:
+            codex_bin_arg = os.path.abspath(value)
+        elif name == "--codex-ping-model" and valid_ping_model(value):
+            ping_model = value
         elif name == "--exit-after":
             try:
                 seconds = float(value)
@@ -3122,7 +3529,8 @@ def parse_args(argv):
                 continue
             if count >= 1:
                 gdi_count = count
-    return Options(data_dir, exit_after, render_dir, gdi_count, no_codex, codex_home_arg)
+    return Options(data_dir, exit_after, render_dir, gdi_count, no_codex, codex_home_arg,
+                   codex_bin_arg, no_codex_ping, ping_model)
 
 
 def run_app(opts, log):

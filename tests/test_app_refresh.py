@@ -1013,7 +1013,8 @@ class RefreshNowAppTests(AppRefreshTestCase):
         menu_swaps_in_newer_claude(app)
         with patch.object(app, "_start_app_refresh") as start:
             click_refresh(app)
-        start.assert_called_once_with(OBS_OLD)
+        # The second argument is "redraw": the flash redraw that follows shows the asking text.
+        start.assert_called_once_with(OBS_OLD, False)
 
     def test_refresh_now_orders_poll_then_codex_then_app_then_flash(self):
         # The two observations differ on purpose, so a swapped index fails here.
@@ -1027,8 +1028,9 @@ class RefreshNowAppTests(AppRefreshTestCase):
         self.assertEqual(
             [item[0] for item in parent.mock_calls],
             ["poll_snapshot", "_start_codex_ping", "_start_app_refresh", "_begin_flash"])
-        parent._start_codex_ping.assert_called_once_with(OBS_NEW)
-        parent._start_app_refresh.assert_called_once_with(OBS_OLD)
+        # Not flashing yet, so the flash redraw is still to come and neither request redraws.
+        parent._start_codex_ping.assert_called_once_with(OBS_NEW, False)
+        parent._start_app_refresh.assert_called_once_with(OBS_OLD, False)
 
     def test_refresh_now_without_before_observes_at_call_time(self):
         app = make_app(claude=data_at(OBS_OLD))
@@ -1123,6 +1125,47 @@ class RefreshNowAppTests(AppRefreshTestCase):
                     redraw()
                     self.assertEqual(
                         last_display(app).captions, expected[(waiting, running)])
+
+    def test_the_requests_leave_the_redraw_to_the_flash(self):
+        app = make_app(claude=data_at(OBS_OLD), codex=data_at(OBS_OLD), pinger=True)
+        click_refresh(app)
+        self.assertTrue(app.pinger.running)
+        self.assertTrue(app.app_refresher.waiting)
+        # Two pictures: the read result the poll draws, then the flash with both blocks asking.
+        # The two requests do not draw one picture each in between.
+        self.assertEqual(app._apply.call_count, 2)
+        self.assertEqual(
+            app._apply.call_args_list[0][0][0].captions, ("same 14:00", "same 14:00"))
+        self.assertEqual(last_display(app).captions, ("asking", "asking"))
+        self.assertTrue(app._flashing)
+
+    def test_what_the_requests_change_shows_in_the_flash_picture(self):
+        # (driver, what start() says, caption index, text the picture must carry)
+        cases = (
+            ("pinger", "cooldown", 1, "cooldown"),
+            ("pinger", "spawn_error:OSError", 1, "ping failed"),
+            ("app_refresher", "cooldown", 0, "cooldown"),
+            ("app_refresher", "write_error:PermissionError", 0, "not sent"),
+        )
+        for driver, start_result, index, text in cases:
+            with self.subTest(driver=driver, start_result=start_result):
+                app = make_app(claude=data_at(OBS_OLD), codex=data_at(OBS_OLD), pinger=True)
+                getattr(app, driver).start_result = start_result
+                click_refresh(app)
+                self.assertEqual(app._apply.call_count, 2)
+                self.assertEqual(last_display(app).captions[index], text)
+                self.assertTrue(app._flashing)
+
+    def test_a_click_during_a_flash_lets_the_requests_redraw_for_themselves(self):
+        # _begin_flash draws nothing when the widget is already dim, so a text the requests
+        # change (cooldown on the Codex block, asking on the Claude block) would otherwise
+        # only show when that flash ends.
+        app = make_app(claude=data_at(OBS_OLD), codex=data_at(OBS_OLD), pinger=True)
+        app.pinger.start_result = "cooldown"
+        app._flashing = True
+        click_refresh(app)
+        self.assertEqual(last_display(app).captions, ("asking", "cooldown"))
+        self.assertTrue(app._flashing)
 
     def test_cooldown_rewrites_only_the_claude_text(self):
         deadline = APP_NOW + 100.0
@@ -1450,6 +1493,50 @@ class AppTimerTests(AppRefreshTestCase):
         self.assertIsNone(app._app_before)
         app.refresh_view.assert_called_once_with()
 
+    def timed_out_text(self, claude, last_reason=None):
+        """The Claude caption after an unanswered request, with the reader in the given state."""
+        app = make_app(claude=claude)
+        if last_reason is not None:
+            app.reader.last_reason = last_reason
+        app.app_refresher.poll_results = [("timeout", "")]
+        app._app_before = OBS_OLD
+        _arm_app_timer(app)
+        app.refresh_view = Mock()
+        with patch.object(widget.time, "time", return_value=APP_NOW):
+            app._on_app_timer()
+        self.assertEqual(app._caption[0], APP_NOW + widget.CAPTION_MS / 1000.0)
+        # The reader is not read again, and the timeout is logged whatever the caption says.
+        self.assertEqual(app.reader.calls, [])
+        app.log.log.assert_any_call("AppRefresh", "no answer within 8 s")
+        return app._caption[1]
+
+    def test_timeout_with_the_snapshot_file_missing_shows_no_file(self):
+        # A missing usage.json usually means the widget and the plugin use different folders;
+        # no session would hide that.
+        self.assertEqual(self.timed_out_text(None), ("no file", ""))
+        self.assertEqual(self.timed_out_text(data_at(OBS_OLD), "missing"), ("no file", ""))
+
+    def test_timeout_with_any_other_reader_state_keeps_no_session(self):
+        reasons = ("", "bad_json", "bad_schema", "bad_windows", "not_object", "too_large",
+                   "read_error:OSError", "stat_error:OSError")
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.timed_out_text(data_at(OBS_OLD), reason), ("no session", ""))
+
+    def test_an_answer_never_turns_into_no_file(self):
+        # The plugin got the request, so the folders match: no limits is the truth even
+        # when usage.json does not exist yet.
+        app = make_app()
+        self.assertEqual(app.reader.last_reason, "missing")
+        app.app_refresher.poll_results = [("unavailable", "")]
+        app._app_before = None
+        _arm_app_timer(app)
+        app.refresh_view = Mock()
+        with patch.object(widget.time, "time", return_value=APP_NOW):
+            app._on_app_timer()
+        self.assertEqual(app._caption[1], ("no limits", ""))
+
     def test_result_keeps_a_live_codex_text_and_drops_an_expired_one(self):
         cases = (
             ("live", (APP_NOW + 100.0, ("", "new 14:59")), ("no limits", "new 14:59")),
@@ -1500,21 +1587,21 @@ class AppTimerTests(AppRefreshTestCase):
 
     def test_stop_and_drop_helpers(self):
         app = make_app(claude=data_at(OBS_OLD))
-        app._stop_app_refresh()
-        app._stop_app_refresh()
+        app._stop_slot(widget.APP_SLOT)
+        app._stop_slot(widget.APP_SLOT)
         self.assertEqual(app.app_refresher.stop_calls, 2)
 
         bare = make_app(refresher=False)
-        bare._stop_app_refresh()
+        bare._stop_slot(widget.APP_SLOT)
 
         broken = make_app(claude=data_at(OBS_OLD))
         broken.app_refresher.stop_error = RuntimeError("boom")
-        broken._stop_app_refresh()
+        broken._stop_slot(widget.APP_SLOT)
         broken.log.log_exception.assert_called()
 
         dropped = make_app(claude=data_at(OBS_OLD))
         dropped._app_before = OBS_OLD
-        dropped._drop_app_refresh()
+        dropped._drop_slot(widget.APP_SLOT)
         dropped.log.log.assert_called_with(
             "AppRefresh", "poll timer unavailable; request abandoned")
         self.assertEqual(dropped.app_refresher.stop_calls, 1)
@@ -2160,6 +2247,33 @@ class AppRefreshEndToEndTests(AppRefreshTestCase):
         self.mono.now = 1018.0
         click_refresh(app)
         self.assertEqual(self._request_id(), "0f9e8d7c6b5a")
+
+    def test_timeout_flow_follows_the_real_reader(self):
+        # The real reader on the data folder the request goes to: no usage.json there means no
+        # file, a readable one means the request really went unanswered.
+        for present in (False, True):
+            with self.subTest(snapshot_file=present):
+                app = self._make()
+                app.reader = widget.SnapshotReader(
+                    os.path.join(self.root, widget.SNAPSHOT_NAME))
+                if present:
+                    window = {"used_percentage": 30.0, "resets_at": APP_NOW + 7200.0,
+                              "observed_at": OBS_OLD}
+                    with open(app.reader.path, "w", encoding="utf-8") as handle:
+                        json.dump({"schema": 1, "written_at": OBS_OLD,
+                                   "windows": {"five_hour": window, "seven_day": window}},
+                                  handle)
+                click_refresh(app)
+                self.assertEqual(app.reader.last_reason, "" if present else "missing")
+                self.assertEqual(last_display(app).captions, ("asking",))
+                self.mono.now = 1008.0
+                with patch.object(widget.time, "time", return_value=APP_NOW):
+                    app.on_timer(widget.TIMER_APP)
+                self.assertFalse(app.app_refresher.waiting)
+                expected = "no session" if present else "no file"
+                self.assertEqual(app._caption[1][0], expected)
+                self.assertEqual(last_display(app).captions, (expected,))
+                app.log.log.assert_any_call("AppRefresh", "no answer within 8 s")
 
     def test_request_exit_leaves_the_request_file(self):
         app = self._make()

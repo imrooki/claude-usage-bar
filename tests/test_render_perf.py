@@ -5,12 +5,17 @@ pixels, no repeated work), not wall-clock numbers, except one relative speed che
 premultiply must beat a per-pixel Python loop by a factor of 10 (measured: about 90).
 """
 
+import datetime
+import json
+import os
 import pathlib
 import random
+import subprocess
 import sys
+import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
@@ -185,6 +190,77 @@ class ComposeBarCacheTests(unittest.TestCase):
             self.assertEqual(image.tobytes(), snapshot)
 
 
+class FakeCodexProcess:
+    """The Popen object of a Codex request that is still running."""
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def default_configuration_app(case, root):
+    """A WidgetApp as it starts with no switches, under the temp directory ``root``.
+
+    The data side is real: usage.json and a Codex session log on disk, the two readers, the
+    CodexPinger (its process is fake, the real subprocess.Popen is guarded) and the AppRefresher
+    (it writes its request file into the temp data directory). Only the window layer is a mock;
+    _apply is the real one, so render_display and update_layered see every picture.
+    """
+    patcher = patch.object(
+        subprocess, "Popen", side_effect=AssertionError("real subprocess.Popen must not run"))
+    popen_guard = patcher.start()
+    case.addCleanup(patcher.stop)
+    # The app swallows exceptions in its callbacks, so check the call itself at the end.
+    case.addCleanup(lambda: case.assertFalse(popen_guard.called, "real subprocess.Popen was reached"))
+    data_dir = os.path.join(root, "data")
+    codex_home = os.path.join(root, "codex")
+    session_dir = os.path.join(codex_home, "sessions", "2026", "10", "01")
+    os.makedirs(data_dir)
+    os.makedirs(session_dir)
+    observed = NOW - 60.0
+    windows = {
+        "five_hour": {
+            "used_percentage": 30.0, "resets_at": NOW + 3600.0, "observed_at": observed},
+        "seven_day": {
+            "used_percentage": 60.0, "resets_at": NOW + 86400.0, "observed_at": observed},
+    }
+    with open(os.path.join(data_dir, widget.SNAPSHOT_NAME), "w", encoding="utf-8") as handle:
+        json.dump({"schema": 1, "written_at": observed, "windows": windows}, handle)
+    limits = {
+        "primary": {"used_percent": 20.0, "window_minutes": 300, "resets_at": NOW + 3600.0},
+        "secondary": {"used_percent": 40.0, "window_minutes": 10080, "resets_at": NOW + 86400.0},
+    }
+    record = {
+        "timestamp": datetime.datetime.fromtimestamp(observed, datetime.timezone.utc).isoformat(),
+        "type": "event_msg",
+        "payload": {"type": "token_count", "rate_limits": limits},
+    }
+    with open(os.path.join(session_dir, "rollout-2026-10-01T00-00-00-x.jsonl"),
+              "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+    options = widget.Options(data_dir, None, None, None, codex_home=codex_home)
+    with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
+            patch.object(widget, "read_light_theme", return_value=False):
+        app = widget.WidgetApp(options, make_app().w32, Mock())
+    app.hwnd = 10
+    app.visible = True
+    # The constructor built the pieces a default start has; the pinger only gets a fake process.
+    case.assertIsInstance(app.reader, widget.SnapshotReader)
+    case.assertIsInstance(app.codex, widget.CodexReader)
+    case.assertIsInstance(app.pinger, widget.CodexPinger)
+    case.assertIsInstance(app.app_refresher, widget.AppRefresher)
+    app.pinger = widget.CodexPinger(
+        data_dir, popen=lambda *args, **kwargs: FakeCodexProcess(),
+        find_exe=lambda _override: "codex.exe")
+    case.addCleanup(app.pinger.stop)
+    return app
+
+
 class RenderedFrameCacheTests(unittest.TestCase):
     def live_app(self):
         app = make_app()
@@ -285,7 +361,9 @@ class RenderedFrameCacheTests(unittest.TestCase):
         self.assertEqual(render.call_count, 1)
         self.assertEqual(app.shown_display, display)
 
-    def test_a_whole_refresh_click_renders_once(self):
+    def test_a_click_that_changes_nothing_on_screen_renders_once(self):
+        # No provider asks for anything and the poll is a no-op: the flash-on frame is the only
+        # new picture, and the flash-off frame reuses its render.
         app = self.live_app()
         app.poll_snapshot = lambda force=False: None
         app.snapshot_override = {"five_hour": widget.Win(30.0, NOW + 3600.0, NOW - 60.0),
@@ -301,6 +379,43 @@ class RenderedFrameCacheTests(unittest.TestCase):
         dimmed, plain = self.payloads(app)
         self.assertEqual(plain, widget.premultiply_bgra(widget.render_display(app.shown_display)))
         self.assertNotEqual(dimmed[3::4], plain[3::4])
+
+    def test_a_whole_refresh_click_renders_each_picture_once(self):
+        """Default configuration: both readers, the Codex ping and the app request all take part.
+
+        A click shows two pictures: the one the poll draws with the read result, and the one the
+        flash draws once both requests have started (asking next to both blocks). The requests
+        themselves do not draw in between, and the flash-off frame reuses the flash-on render.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            app = default_configuration_app(self, root)
+            app.w32.track_menu.return_value = widget.MENU_REFRESH
+            with patch.object(widget.time, "time", return_value=NOW), \
+                    patch.object(widget, "render_display", wraps=widget.render_display) as render:
+                app.on_right_up()
+                # Both requests really started: the picture on screen asks on both blocks.
+                self.assertTrue(app.pinger.running)
+                self.assertTrue(app.app_refresher.waiting)
+                self.assertTrue(app._flashing)
+                self.assertEqual(app.shown_display.kind, "dual")
+                self.assertEqual(app.shown_display.captions, ("asking", "asking"))
+                dimmed_frames = app.w32.update_layered.call_count
+                app.on_timer(widget.TIMER_FLASH)
+            self.assertFalse(app._flashing)
+            rendered = [item.args[0] for item in render.call_args_list]
+            self.assertEqual(len(rendered), 2)
+            read_picture, asking_picture = rendered
+            self.assertNotIn("asking", read_picture.captions)
+            self.assertTrue(all(read_picture.captions))
+            self.assertEqual(asking_picture, app.shown_display)
+            # Submitted frames: the read result, the dimmed asking picture, the restored one.
+            self.assertEqual(dimmed_frames, 2)
+            self.assertEqual(app.w32.update_layered.call_count, 3)
+            _read, dimmed, plain = self.payloads(app)
+            self.assertEqual(plain, widget.premultiply_bgra(widget.render_display(asking_picture)))
+            self.assertEqual(dimmed, widget.premultiply_bgra(widget.dim_image(
+                widget.render_display(asking_picture), widget.FLASH_ALPHA_SCALE)))
+            self.assertNotEqual(dimmed[3::4], plain[3::4])
 
 
 if __name__ == "__main__":

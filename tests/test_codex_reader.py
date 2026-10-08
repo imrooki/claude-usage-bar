@@ -624,12 +624,65 @@ class MultiSessionTests(unittest.TestCase):
             self.assertTrue(reader.refresh())
             self.assertEqual(reader.source_path, path_b)
             self.assertEqual(reader.snapshot["five_hour"].pct, 12.0)
-            # 之后 A 写了更新的记录。候选顺序到下一次扫描才变，所以先过一个扫描间隔。
+            # 之后 A 写了更新的记录。A 不是候选里的第一个（B 才是），候选顺序到下一次扫描才变，
+            # 但签名覆盖全部候选，所以不用等扫描：这一次轮询就读到。
             append_line(path_a, record_line(45, "2026-10-03T05:00:00.000Z"), mtime=4000)
-            clock["now"] += widget.CODEX_RESCAN_SECONDS
             self.assertTrue(reader.refresh())
             self.assertEqual(reader.source_path, path_a)
             self.assertEqual(reader.snapshot["five_hour"].pct, 45.0)
+
+    def test_a_record_in_a_log_that_was_not_the_newest_is_seen_on_the_next_poll(self):
+        """候选顺序只在扫描时更新；门槛的签名若只看第一个候选，别的日志里的新记录要等下一次扫描。"""
+        poll = widget.SNAPSHOT_POLL_MS / 1000.0
+        self.assertLess(poll, widget.CODEX_RESCAN_SECONDS)
+        clock = {"now": self.NOW}
+        with tempfile.TemporaryDirectory() as root:
+            _folder, path_a, path_b = self.make_pair(root)
+            reader = widget.CodexReader(home=root, clock=lambda: clock["now"])
+            self.assertTrue(reader.refresh())
+            self.assertEqual(reader.source_path, path_a)
+            self.assertEqual(reader.snapshot["five_hour"].pct, 40.0)
+            # A 的会话答完一轮，追加了更晚的记录；它的 mtime 现在最新，但候选里 B 仍排第一。
+            append_line(path_a, record_line(45, "2026-10-03T05:00:00.000Z"), mtime=4000)
+            reads = []
+            real_read = widget._read_codex_tail
+
+            def counting(path):
+                reads.append(path)
+                return real_read(path)
+
+            with patch.object(widget, "_read_codex_tail", side_effect=counting), \
+                    patch.object(widget, "find_codex_rollouts",
+                                 wraps=widget.find_codex_rollouts) as scan:
+                clock["now"] += poll
+                self.assertTrue(reader.refresh())
+                self.assertEqual(reader.source_path, path_a)
+                self.assertEqual(reader.snapshot["five_hour"].pct, 45.0)
+                # 这一次不是靠重新扫描看到的，也只重读了变了的那个文件。
+                scan.assert_not_called()
+                self.assertEqual(reads, [path_a])
+                # 之后什么都没变：连评估都不做。
+                del reads[:]
+                clock["now"] += poll
+                self.assertFalse(reader.refresh())
+                self.assertEqual(reads, [])
+                self.assertEqual(reader.snapshot["five_hour"].pct, 45.0)
+            # 前提：B 确实一直排在候选的第一个。
+            self.assertEqual(reader._candidates, [path_b, path_a])
+
+    def test_a_log_that_vanishes_after_the_scan_is_noticed_on_the_next_poll(self):
+        """签名里有一个候选 stat 不了，就不能当作“没变”：照常评估，读不到的文件直接跳过。"""
+        with tempfile.TemporaryDirectory() as root:
+            _folder, path_a, path_b = self.make_pair(root)
+            reader = widget.CodexReader(home=root, clock=lambda: self.NOW)
+            self.assertTrue(reader.refresh())
+            self.assertEqual(set(reader._tail_cache), {path_a, path_b})
+            os.remove(path_a)
+            self.assertFalse(reader.refresh())
+            # 重新评估过了：消失的那个文件的缓存项没了。已显示的读数不退回 B 里更旧的那条。
+            self.assertEqual(set(reader._tail_cache), {path_b})
+            self.assertEqual(reader.snapshot["five_hour"].pct, 40.0)
+            self.assertEqual(reader.last_reason, "")
 
     def test_forced_refresh_never_lowers_the_observed_time(self):
         clock = {"now": self.NOW}
@@ -708,6 +761,130 @@ class MultiSessionTests(unittest.TestCase):
             self.assertTrue(reader.refresh(force=True))
             self.assertEqual(reader.snapshot["five_hour"].pct, 4.0)
             self.assertEqual(widget._snapshot_observed_at(reader.snapshot), normal_unix)
+
+
+class ClockAheadTests(unittest.TestCase):
+    """写记录时时钟拨快了：观测时间超前 now 的记录，排在所有没超前的记录之后。
+
+    只取观测时间最大的，这样的记录会一直压着之后写下的正常记录，直到时钟追上它。
+    """
+
+    NOW = iso_unix("2026-10-03T06:00:00.000Z")
+    # 超前一天，远超容差；STAMP_NEWER / STAMP_OLDER 都早于 NOW，是正常记录。
+    AHEAD = "2026-10-04T06:00:00.000Z"
+    AHEAD_MORE = "2026-10-05T06:00:00.000Z"
+
+    @staticmethod
+    def stamp(unix_seconds):
+        return datetime.datetime.fromtimestamp(
+            unix_seconds, datetime.timezone.utc).isoformat()
+
+    def test_the_stamps_mean_what_the_tests_assume(self):
+        for text in (self.AHEAD, self.AHEAD_MORE):
+            self.assertGreater(iso_unix(text) - self.NOW, widget.CODEX_FUTURE_TOLERANCE_SECONDS)
+        for text in (STAMP_NEWER, STAMP_OLDER):
+            self.assertLess(iso_unix(text), self.NOW)
+        self.assertEqual(iso_unix(self.stamp(self.NOW + 300.0)), self.NOW + 300.0)
+
+    def test_a_normal_record_in_another_log_outranks_a_future_stamped_one(self):
+        # 正常记录的文件 mtime 较新或较旧都一样：结果不取决于候选顺序。
+        for normal_mtime, ahead_mtime in ((2000, 1000), (1000, 2000)):
+            with self.subTest(normal_mtime=normal_mtime), tempfile.TemporaryDirectory() as root:
+                folder = day_folder(root, 2026, 10, 3)
+                write_rollout(
+                    folder, "rollout-ahead.jsonl",
+                    [record_line(90, self.AHEAD)], mtime=ahead_mtime)
+                normal = write_rollout(
+                    folder, "rollout-normal.jsonl",
+                    [record_line(4, STAMP_NEWER)], mtime=normal_mtime)
+                reader = widget.CodexReader(home=root, clock=lambda: self.NOW)
+                self.assertTrue(reader.refresh())
+                self.assertEqual(reader.source_path, normal)
+                self.assertEqual(reader.snapshot["five_hour"].pct, 4.0)
+                self.assertEqual(
+                    widget._snapshot_observed_at(reader.snapshot), iso_unix(STAMP_NEWER))
+                self.assertEqual(reader.last_reason, "")
+
+    def test_refresh_now_replaces_a_future_stamped_reading_with_a_normal_one(self):
+        """时钟拨快时写下的读数在屏幕上；时钟校正后 ping 在另一个日志里写下正常记录。"""
+        clock = {"now": self.NOW}
+        with tempfile.TemporaryDirectory() as root:
+            folder = day_folder(root, 2026, 10, 3)
+            write_rollout(
+                folder, "rollout-ahead.jsonl", [record_line(90, self.AHEAD)], mtime=1000)
+            reader = widget.CodexReader(home=root, clock=lambda: clock["now"])
+            # 只有超前的记录：没有可比的正常记录，照旧显示它。
+            self.assertTrue(reader.refresh())
+            self.assertEqual(reader.snapshot["five_hour"].pct, 90.0)
+            normal = write_rollout(
+                folder, "rollout-ping.jsonl", [record_line(4, STAMP_NEWER)], mtime=2000)
+            clock["now"] += 5.0
+            self.assertTrue(reader.refresh(force=True))
+            self.assertEqual(reader.source_path, normal)
+            self.assertEqual(reader.snapshot["five_hour"].pct, 4.0)
+            # 再评估一次（Refresh now 每次都评估）也不会被压回超前的那条。
+            clock["now"] += widget.CODEX_RESCAN_SECONDS
+            self.assertFalse(reader.refresh(force=True))
+            self.assertEqual(reader.snapshot["five_hour"].pct, 4.0)
+            self.assertEqual(reader.source_path, normal)
+
+    def test_when_every_record_is_ahead_the_latest_observed_time_still_wins(self):
+        for a_mtime, b_mtime in ((2000, 1000), (1000, 2000)):
+            with self.subTest(a_mtime=a_mtime), tempfile.TemporaryDirectory() as root:
+                folder = day_folder(root, 2026, 10, 3)
+                write_rollout(
+                    folder, "rollout-a.jsonl", [record_line(10, self.AHEAD)], mtime=a_mtime)
+                later = write_rollout(
+                    folder, "rollout-b.jsonl", [record_line(20, self.AHEAD_MORE)], mtime=b_mtime)
+                reader = widget.CodexReader(home=root, clock=lambda: self.NOW)
+                self.assertTrue(reader.refresh())
+                self.assertEqual(reader.source_path, later)
+                self.assertEqual(reader.snapshot["five_hour"].pct, 20.0)
+
+    def test_equal_observed_time_among_ahead_records_prefers_the_newer_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = day_folder(root, 2026, 10, 3)
+            write_rollout(
+                folder, "rollout-a.jsonl", [record_line(10, self.AHEAD)], mtime=1000)
+            newer = write_rollout(
+                folder, "rollout-b.jsonl", [record_line(20, self.AHEAD)], mtime=2000)
+            reader = widget.CodexReader(home=root, clock=lambda: self.NOW)
+            self.assertTrue(reader.refresh())
+            self.assertEqual(reader.source_path, newer)
+            self.assertEqual(reader.snapshot["five_hour"].pct, 20.0)
+
+    def test_a_record_ahead_by_exactly_the_tolerance_is_not_ahead(self):
+        tolerance = widget.CODEX_FUTURE_TOLERANCE_SECONDS
+        for extra, expected_pct in ((0.0, 10.0), (1.0, 4.0)):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as root:
+                folder = day_folder(root, 2026, 10, 3)
+                write_rollout(
+                    folder, "rollout-edge.jsonl",
+                    [record_line(10, self.stamp(self.NOW + tolerance + extra))], mtime=1000)
+                write_rollout(
+                    folder, "rollout-normal.jsonl",
+                    [record_line(4, STAMP_NEWER)], mtime=2000)
+                reader = widget.CodexReader(home=root, clock=lambda: self.NOW)
+                self.assertTrue(reader.refresh())
+                # 容差之内算正常记录，观测时间更大的赢；多一秒就是超前，让位给正常记录。
+                self.assertEqual(reader.snapshot["five_hour"].pct, expected_pct)
+
+    def test_a_record_stops_being_ahead_when_the_clock_catches_up(self):
+        clock = {"now": self.NOW}
+        with tempfile.TemporaryDirectory() as root:
+            folder = day_folder(root, 2026, 10, 3)
+            ahead = write_rollout(
+                folder, "rollout-ahead.jsonl", [record_line(90, self.AHEAD)], mtime=1000)
+            write_rollout(
+                folder, "rollout-normal.jsonl", [record_line(4, STAMP_NEWER)], mtime=2000)
+            reader = widget.CodexReader(home=root, clock=lambda: clock["now"])
+            self.assertTrue(reader.refresh())
+            self.assertEqual(reader.snapshot["five_hour"].pct, 4.0)
+            # 时钟走到了那条记录的时刻：它不再超前，观测时间更大，重新评估时它赢。
+            clock["now"] = iso_unix(self.AHEAD)
+            self.assertTrue(reader.refresh(force=True))
+            self.assertEqual(reader.source_path, ahead)
+            self.assertEqual(reader.snapshot["five_hour"].pct, 90.0)
 
 
 class TailCacheTests(unittest.TestCase):

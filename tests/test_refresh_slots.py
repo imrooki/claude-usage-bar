@@ -1,7 +1,8 @@
 """What the Codex ping and the desktop-app request share on Refresh now.
 
 The "nothing new" caption set, the cooldown arithmetic, the RefreshSlot table, and the generic
-start / poll / stop / drop / re-arm path that both providers run through. The generic path is
+start / poll / stop / drop / re-arm path that both providers run through, plus the window code
+that walks the whole table (the asking overlay, request_exit, run). The generic path is
 exercised with a made-up third provider, so nothing here depends on Codex or Claude internals.
 What each provider does on its own stays in test_codex_ping.py and test_app_refresh.py.
 """
@@ -10,10 +11,13 @@ import pathlib
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+# The sibling import below also has to work when this module is run by its dotted name.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import usage_widget as widget
+from test_refresh_feedback import make_app as make_window_app
 
 
 NOW = 1790000000.0
@@ -319,6 +323,42 @@ class StandInSlotTests(unittest.TestCase):
         self.app.log.log_exception.assert_called_once()
         self.app.refresh_view.assert_not_called()
 
+    def test_redraw_only_decides_whether_the_screen_is_redrawn(self):
+        # Refresh now passes redraw=False because its flash redraw follows. Everything else a
+        # start does (text, timer, observation, log) must be the same either way.
+        def start(start_result, timer_ok, redraw):
+            app = make_app()
+            driver = FakeDriver("active")
+            driver.start_result = start_result
+            app.third = driver
+            app._third_before = None
+            app._caption = (DEADLINE, ("keep", "same 14:00"))
+            app.w32.set_timer.return_value = timer_ok
+            app._start_slot(self.slot, 12.5, redraw)
+            state = (app._caption, app._third_before, sorted(app.timers), driver.active,
+                     driver.stops, [item.args for item in app.log.log.call_args_list])
+            return state, app.refresh_view.call_count
+
+        cases = (
+            # (name, what start() says, whether the poll timer can be made, redraws by default)
+            ("started", "started", True, 1),
+            ("timer refused", "started", False, 1),
+            ("cooldown", "cooldown", True, 1),
+            ("start failed", "boom:OSError", True, 1),
+            ("skipped", "nope", True, 0),
+            ("busy", "busy", True, 0),
+        )
+        for name, start_result, timer_ok, redraws in cases:
+            with self.subTest(name=name):
+                drawn_state, drawn = start(start_result, timer_ok, True)
+                deferred_state, deferred = start(start_result, timer_ok, False)
+                self.assertEqual(drawn, redraws)
+                self.assertEqual(deferred, 0)
+                self.assertEqual(deferred_state, drawn_state)
+        # The default is to redraw.
+        self.app._start_slot(self.slot, 12.5)
+        self.app.refresh_view.assert_called_once_with()
+
     # poll
 
     def test_a_result_is_finished_once_and_replaces_only_this_slot(self):
@@ -421,6 +461,112 @@ class StandInSlotTests(unittest.TestCase):
         self.assertIn(("Third", "timer gone"), self.logged())
 
 
+class WholeTableTests(unittest.TestCase):
+    """The window code that is not a Refresh now step walks REFRESH_SLOTS instead of naming the
+    two providers, so a slot added to the table needs no change there.
+
+    A made-up third slot is added to the table; the real drivers are off (no Codex, no app
+    refresher), so whatever these paths do for the third slot they do from the table alone.
+    """
+
+    def setUp(self):
+        self.app = make_window_app()
+        self.driver = FakeDriver("active")
+        self.app.third = self.driver
+        self.app._third_before = None
+        self.slot = widget.RefreshSlot(
+            index=1, driver="third", busy="active", before="_third_before",
+            timer_id=77, poll_ms=123, caption=lambda read_caption, state: read_caption,
+            log_kind="Third", error_prefix="boom:", error_state="failed",
+            drop_state="gone", drop_note="timer gone", skip_notes={})
+        patcher = patch.object(widget, "REFRESH_SLOTS", widget.REFRESH_SLOTS + (self.slot,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def use_dual_layout(self):
+        snapshot = {"five_hour": widget.Win(30.0, NOW + 3600.0, NOW - 60.0),
+                    "seven_day": widget.Win(60.0, NOW + 86400.0, NOW - 60.0)}
+        self.app.reader.snapshot = snapshot
+        self.app.codex = Mock(snapshot=snapshot, available=True)
+
+    def drawn_captions(self):
+        with patch.object(widget.time, "time", return_value=NOW):
+            self.app._refresh_once(False, False)
+        return self.app._apply.call_args_list[-1][0][0].captions
+
+    def test_asking_goes_to_the_index_of_every_busy_slot_in_the_table(self):
+        self.use_dual_layout()
+        stored = (NOW + 100.0, ("new 14:58", "same 14:00"))
+        cases = (
+            # (index of the stand-in slot, busy, stored text, what the picture says)
+            (0, True, None, ("asking", "")),
+            (1, True, None, ("", "asking")),
+            (0, True, stored, ("asking", "same 14:00")),
+            (1, True, stored, ("new 14:58", "asking")),
+            (1, False, None, ()),
+            (1, False, stored, ("new 14:58", "same 14:00")),
+        )
+        for index, busy, caption, expected in cases:
+            with self.subTest(index=index, busy=busy, stored=caption is not None):
+                slot = self.slot._replace(index=index)
+                with patch.object(widget, "REFRESH_SLOTS", (slot,)):
+                    self.driver.active = busy
+                    self.app._caption = caption
+                    self.assertEqual(self.drawn_captions(), expected)
+
+    def test_every_busy_slot_asks_at_once(self):
+        self.use_dual_layout()
+        claude = self.slot._replace(index=0, driver="second", busy="waiting", before="_second_before")
+        self.app.second = FakeDriver("waiting")
+        self.app._second_before = None
+        with patch.object(widget, "REFRESH_SLOTS", (claude, self.slot)):
+            for waiting, active, expected in (
+                    (True, True, ("asking", "asking")),
+                    (True, False, ("asking", "")),
+                    (False, True, ("", "asking")),
+                    (False, False, ())):
+                with self.subTest(waiting=waiting, active=active):
+                    self.app.second.waiting = waiting
+                    self.driver.active = active
+                    self.app._caption = None
+                    self.assertEqual(self.drawn_captions(), expected)
+
+    def test_request_exit_stops_every_slot_in_the_table(self):
+        self.driver.active = True
+        self.app._arm_watchdog = Mock()
+        self.app.w32.destroy_window.return_value = True
+        self.app.request_exit()
+        self.assertEqual(self.driver.stops, 1)
+        self.assertFalse(self.driver.active)
+        self.app.request_exit()
+        self.assertEqual(self.driver.stops, 1)
+
+    def test_run_stops_every_slot_in_the_table_on_the_way_out(self):
+        for loop_fails in (False, True):
+            with self.subTest(loop_fails=loop_fails):
+                app = make_window_app()
+                driver = FakeDriver("active")
+                driver.active = True
+                app.third = driver
+                app._third_before = None
+                app.hwnd = 0
+                app.w32.create_window.return_value = 11
+                if loop_fails:
+                    app.w32.run_message_loop.side_effect = RuntimeError("loop failed")
+                else:
+                    app.w32.run_message_loop.return_value = 0
+                app.poll_snapshot = Mock()
+                app.refresh_view = Mock()
+                app._start_timers = Mock()
+                if loop_fails:
+                    with self.assertRaises(RuntimeError):
+                        app.run()
+                else:
+                    self.assertEqual(app.run(), 0)
+                self.assertEqual(driver.stops, 1)
+                self.assertIsNone(widget._APP)
+
+
 class RewriteSlotCaptionTests(unittest.TestCase):
     def test_only_the_named_item_changes_and_the_deadline_stays(self):
         for index, expected in ((0, ("A!", "b")), (1, ("a", "B!"))):
@@ -469,9 +615,13 @@ class RealSlotsOnTheSharedPathTests(unittest.TestCase):
         with patch.object(app, "_start_slot") as start:
             app._start_codex_ping(1.0)
             app._start_app_refresh(2.0)
+            # Refresh now passes redraw=False through the thin entry points.
+            app._start_codex_ping(3.0, False)
+            app._start_app_refresh(4.0, redraw=False)
         self.assertEqual(
             start.call_args_list,
-            [((widget.CODEX_SLOT, 1.0),), ((widget.APP_SLOT, 2.0),)])
+            [call(widget.CODEX_SLOT, 1.0, True), call(widget.APP_SLOT, 2.0, True),
+             call(widget.CODEX_SLOT, 3.0, False), call(widget.APP_SLOT, 4.0, False)])
         with patch.object(app, "_poll_slot") as poll:
             app._on_ping_timer()
             app._on_app_timer()
@@ -479,16 +629,31 @@ class RealSlotsOnTheSharedPathTests(unittest.TestCase):
             poll.call_args_list,
             [((widget.CODEX_SLOT, app._finish_ping),),
              ((widget.APP_SLOT, app._finish_app_refresh),)])
-        with patch.object(app, "_stop_slot") as stop:
-            app._stop_ping()
-            app._stop_app_refresh()
-        self.assertEqual(
-            stop.call_args_list, [((widget.CODEX_SLOT,),), ((widget.APP_SLOT,),)])
-        with patch.object(app, "_drop_slot") as drop:
-            app._drop_ping()
-            app._drop_app_refresh()
-        self.assertEqual(
-            drop.call_args_list, [((widget.CODEX_SLOT,),), ((widget.APP_SLOT,),)])
+
+    def test_stop_and_drop_reach_only_the_slots_own_driver_and_observation(self):
+        for slot in widget.REFRESH_SLOTS:
+            with self.subTest(driver=slot.driver):
+                app = make_app()
+                drivers = {}
+                for other in widget.REFRESH_SLOTS:
+                    drivers[other.driver] = FakeDriver(other.busy)
+                    setattr(app, other.driver, drivers[other.driver])
+                    setattr(app, other.before, 1.0)
+                stops = {other.driver: 0 for other in widget.REFRESH_SLOTS}
+                app._stop_slot(slot)
+                stops[slot.driver] += 1
+                self.assertEqual({name: item.stops for name, item in drivers.items()}, stops)
+                # Dropping stops the driver once more, logs the slot's own note and forgets
+                # only this slot's click-time observation.
+                app._drop_slot(slot)
+                stops[slot.driver] += 1
+                self.assertEqual({name: item.stops for name, item in drivers.items()}, stops)
+                self.assertEqual(
+                    [item.args for item in app.log.log.call_args_list],
+                    [(slot.log_kind, slot.drop_note)])
+                for other in widget.REFRESH_SLOTS:
+                    expected = None if other is slot else 1.0
+                    self.assertEqual(getattr(app, other.before), expected)
 
     def test_codex_is_only_asked_when_its_data_source_is_there(self):
         for name, codex in (("no reader", None), ("unavailable", Mock(available=False))):

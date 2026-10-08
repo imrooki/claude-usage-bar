@@ -223,7 +223,8 @@ class RefreshNowPingTests(NoRealProcessTestCase):
         _menu_swaps_in_newer_codex(app)
         with patch.object(app, "_start_codex_ping") as start:
             click_refresh(app)
-        start.assert_called_once_with(OBS_OLD)
+        # The second argument is "redraw": the flash redraw that follows shows the asking text.
+        start.assert_called_once_with(OBS_OLD, False)
 
     def test_refresh_now_orders_poll_then_ping_then_flash(self):
         app = make_app(claude=data_at(OBS_OLD), codex=data_at(OBS_OLD))
@@ -583,16 +584,16 @@ class PingTimerTests(NoRealProcessTestCase):
 
     def test_stop_ping_is_idempotent_and_swallows_errors(self):
         app = make_app(claude=data_at(OBS_OLD), codex=data_at(OBS_OLD))
-        app._stop_ping()
-        app._stop_ping()
+        app._stop_slot(widget.CODEX_SLOT)
+        app._stop_slot(widget.CODEX_SLOT)
         self.assertEqual(app.pinger.stop_calls, 2)
 
         bare = make_app(pinger=False)
-        bare._stop_ping()
+        bare._stop_slot(widget.CODEX_SLOT)
 
         broken = make_app(claude=data_at(OBS_OLD), codex=data_at(OBS_OLD))
         broken.pinger.stop_error = RuntimeError("boom")
-        broken._stop_ping()
+        broken._stop_slot(widget.CODEX_SLOT)
         broken.log.log_exception.assert_called()
 
 

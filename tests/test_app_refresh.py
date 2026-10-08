@@ -1352,13 +1352,14 @@ class AppTimerTests(AppRefreshTestCase):
         cases = (
             ("new", OBS_OLD, data_at(OBS_OLD), (data_at(OBS_NEW), ""), "new 14:58"),
             ("same", OBS_OLD, data_at(OBS_OLD), (data_at(OBS_OLD), ""), "same 14:00"),
-            ("no data", OBS_OLD, data_at(OBS_OLD), (None, "missing"), "no data"),
+            ("no file", OBS_OLD, data_at(OBS_OLD), (None, "missing"), "no file"),
+            ("no data", OBS_OLD, data_at(OBS_OLD), (None, ""), "no data"),
             ("read error", OBS_OLD, data_at(OBS_OLD), (data_at(OBS_OLD), "bad_json"), "read error"),
             ("already read", OBS_OLD, data_at(OBS_NEW), None, "new 14:58"),
             ("already read, refresh repeats it", OBS_OLD, data_at(OBS_NEW),
              (data_at(OBS_NEW), ""), "new 14:58"),
             ("no earlier observation", None, data_at(OBS_OLD), (data_at(OBS_OLD), ""), "new 14:00"),
-            ("no earlier observation, no data", None, data_at(OBS_OLD), (None, "missing"), "no data"),
+            ("no earlier observation, no file", None, data_at(OBS_OLD), (None, "missing"), "no file"),
         )
         deadline = APP_NOW + widget.CAPTION_MS / 1000.0
         for name, before, current, queued, text in cases:
@@ -1777,11 +1778,12 @@ class ParseAppOptionsTests(AppRefreshTestCase):
         self.assertEqual(
             widget.Options._fields,
             ("data_dir", "exit_after", "selftest_render", "selftest_gdi", "no_codex",
-             "codex_home", "codex_bin", "no_codex_ping", "codex_ping_model", "no_app_refresh"))
+             "codex_home", "codex_bin", "no_codex_ping", "codex_ping_model", "no_app_refresh",
+             "warnings"))
         self.assertEqual(
             widget.Options._field_defaults,
             {"no_codex": False, "codex_home": None, "codex_bin": None, "no_codex_ping": False,
-             "codex_ping_model": None, "no_app_refresh": False})
+             "codex_ping_model": None, "no_app_refresh": False, "warnings": ()})
         plain = widget.Options(".", None, None, None)
         flagged = widget.Options(".", None, None, None, no_codex=True)
         self.assertFalse(plain.no_codex)

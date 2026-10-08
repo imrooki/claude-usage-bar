@@ -1214,10 +1214,19 @@ def _clock_text(unix_seconds):
     return "%02d:%02d" % (local.tm_hour, local.tm_min)
 
 
+# 数据文件不存在时的反馈文字（只有 Claude 块的 usage.json 会报 missing）。
+CAPTION_NO_FILE = "no file"
+
+
 def caption_text(before, after, reason):
-    """点 Refresh now 之后某个提供方的反馈文字，纯 ASCII。"""
+    """点 Refresh now 之后某个提供方的反馈文字，纯 ASCII。
+
+    文件已经不在时一律是 no file，哪怕小窗还留着上一次的读数，也不能写成 same HH:MM。
+    """
     if reason and reason not in CAPTION_BENIGN_REASONS:
         return CAPTION_READ_ERROR
+    if reason == "missing":
+        return CAPTION_NO_FILE
     if after is None:
         return "no data"
     if before is None or after > before:
@@ -2055,7 +2064,8 @@ def selftest_render(out_dir):
 # ---------------------------------------------------------------------------
 
 class ErrorLog:
-    """错误日志：data-dir 不存在就不写；超过 64 KB 先清空；同一种异常 10 分钟只记一次。"""
+    """错误日志：data-dir 不存在就不写；超过 64 KB 时换成 widget_error.log.1（覆盖更旧的那份）后从空文件写起；
+    同一种异常 10 分钟只记一次。换名失败时才退回直接截断。"""
 
     def __init__(self, data_dir):
         self.path = os.path.join(data_dir, ERROR_LOG_NAME) if data_dir else None
@@ -2089,7 +2099,16 @@ class ErrorLog:
                 oversized = os.path.getsize(self.path) > LOG_MAX_BYTES
             except OSError:
                 oversized = False
-            with open(self.path, "wb" if oversized else "ab") as handle:
+            mode = "ab"
+            if oversized:
+                # 最早的记录往往正好解释问题，所以先换到 .1 留着；换不成才截断。
+                mode = "wb"
+                try:
+                    os.replace(self.path, self.path + ".1")
+                    mode = "ab"
+                except OSError:
+                    pass
+            with open(self.path, mode) as handle:
                 handle.write(line.encode("utf-8"))
             return True
         except (OSError, ValueError):
@@ -3791,12 +3810,18 @@ class WidgetApp:
 Options = collections.namedtuple(
     "Options",
     ["data_dir", "exit_after", "selftest_render", "selftest_gdi", "no_codex", "codex_home",
-     "codex_bin", "no_codex_ping", "codex_ping_model", "no_app_refresh"],
-    defaults=(False, None, None, False, None, False))
+     "codex_bin", "no_codex_ping", "codex_ping_model", "no_app_refresh", "warnings"],
+    defaults=(False, None, None, False, None, False, ()))
+
+
+def _arg_text(text):
+    """写进警告的参数文字：ascii() 保证纯 ASCII，超过 40 个字符截断。"""
+    shown = ascii(text)
+    return shown if len(shown) <= 40 else shown[:37] + "..."
 
 
 def parse_args(argv):
-    """宽松解析：未知参数、缺值或值不合法的参数一律忽略。"""
+    """宽松解析：未知参数、缺值或值不合法的参数一律忽略，每一处各记一条到 warnings。不做任何 I/O。"""
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
     exit_after = None
     render_dir = None
@@ -3807,6 +3832,7 @@ def parse_args(argv):
     no_codex_ping = False
     ping_model = None
     no_app_refresh = False
+    warnings = []
     names = ("--data-dir", "--exit-after", "--selftest-render", "--selftest-gdi",
              "--codex-home", "--codex-bin", "--codex-ping-model")
     index = 0
@@ -3825,6 +3851,7 @@ def parse_args(argv):
             index += 1
             continue
         if name not in names:
+            warnings.append("ignored unknown argument " + _arg_text(argv[index]))
             index += 1
             continue
         if equals:
@@ -3832,35 +3859,45 @@ def parse_args(argv):
         elif index + 1 < len(argv) and not argv[index + 1].startswith("--"):
             value, step = argv[index + 1], 2
         else:
+            warnings.append("ignored " + name + ", no value given")
             index += 1
             continue
         index += step
-        if name == "--data-dir" and value:
+        if not value:
+            warnings.append("ignored " + name + ", no value given")
+        elif name == "--data-dir":
             data_dir = os.path.abspath(value)
-        elif name == "--selftest-render" and value:
+        elif name == "--selftest-render":
             render_dir = os.path.abspath(value)
-        elif name == "--codex-home" and value:
+        elif name == "--codex-home":
             codex_home_arg = os.path.abspath(value)
-        elif name == "--codex-bin" and value:
+        elif name == "--codex-bin":
             codex_bin_arg = os.path.abspath(value)
-        elif name == "--codex-ping-model" and valid_ping_model(value):
-            ping_model = value
+        elif name == "--codex-ping-model":
+            if valid_ping_model(value):
+                ping_model = value
+            else:
+                warnings.append("ignored invalid --codex-ping-model " + _arg_text(value))
         elif name == "--exit-after":
             try:
                 seconds = float(value)
             except ValueError:
-                continue
-            if math.isfinite(seconds) and seconds >= 0:
+                seconds = None
+            if seconds is not None and math.isfinite(seconds) and seconds >= 0:
                 exit_after = seconds
+            else:
+                warnings.append("ignored invalid number for --exit-after: " + _arg_text(value))
         elif name == "--selftest-gdi":
             try:
                 count = int(value)
             except ValueError:
-                continue
+                count = 0
             if count >= 1:
                 gdi_count = count
+            else:
+                warnings.append("ignored invalid number for --selftest-gdi: " + _arg_text(value))
     return Options(data_dir, exit_after, render_dir, gdi_count, no_codex, codex_home_arg,
-                   codex_bin_arg, no_codex_ping, ping_model, no_app_refresh)
+                   codex_bin_arg, no_codex_ping, ping_model, no_app_refresh, warnings)
 
 
 def run_app(opts, log):
@@ -3884,7 +3921,16 @@ def main(argv=None):
     opts = parse_args(sys.argv[1:] if argv is None else argv)
     if opts.selftest_render:
         return selftest_render(opts.selftest_render)
+    # 数据目录不存在就建（小窗的文件都写在这里）。建不成也照常启动，只说一声：日志也写不进去。
+    try:
+        os.makedirs(opts.data_dir, exist_ok=True)
+    except (OSError, ValueError) as exc:
+        say("data folder %s could not be created: %s: %s"
+            % (opts.data_dir, type(exc).__name__, exc))
     log = ErrorLog(opts.data_dir)
+    for text in opts.warnings:
+        log.log("Argument", text)
+        say(text)
     try:
         return run_app(opts, log)
     except Exception as exc:

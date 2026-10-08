@@ -1037,8 +1037,8 @@ class CodexPinger:
 APP_REFRESH_REQUEST_NAME = "refresh-request.json"
 # 插件写、小窗读的确认文件名。插件不是原子写，半截内容要当还没有确认。
 APP_REFRESH_ACK_NAME = "refresh-ack.json"
-# 从写出请求起算，最多等这么多秒。
-APP_REFRESH_WAIT_SECONDS = 8.0
+# 从写出请求起算，最多等这么多秒。插件最迟 3 秒发现请求，一次调用最多 5 秒，再加几次写文件，端到端约 8 秒；这里多给约 1 秒余量。
+APP_REFRESH_WAIT_SECONDS = 9.0
 # 主线程轮询确认文件的间隔。本模块不设计时器，只给出毫秒数。
 APP_REFRESH_POLL_MS = 500
 # 收到 ok 或 unavailable 之后的冷却。这段时间里再点不再写请求。

@@ -312,7 +312,7 @@ class AppRefreshCaptionTests(AppRefreshTestCase):
         self.assertEqual(widget.TIMER_APP, 11)
         self.assertEqual(widget.APP_REFRESH_REQUEST_NAME, "refresh-request.json")
         self.assertEqual(widget.APP_REFRESH_ACK_NAME, "refresh-ack.json")
-        self.assertEqual(widget.APP_REFRESH_WAIT_SECONDS, 8.0)
+        self.assertEqual(widget.APP_REFRESH_WAIT_SECONDS, 9.0)
         self.assertEqual(widget.APP_REFRESH_POLL_MS, 500)
         self.assertEqual(widget.APP_REFRESH_COOLDOWN_SECONDS, 60.0)
         self.assertEqual(widget.APP_REFRESH_RETRY_SECONDS, 10.0)
@@ -424,12 +424,12 @@ class AppRefresherStartTests(AppRefreshTestCase):
         refresher = self.make_refresher()
         self.mono.now = 2000.0
         self.assertEqual(refresher.start(), "started")
-        self.mono.now = 2008.0
+        self.mono.now = 2009.0
         self.assertEqual(refresher.poll(), ("timeout", ""))
         self.assertAlmostEqual(refresher.cooldown_left(), 10.0, places=6)
-        self.mono.now = 2008.0 + 9.999
+        self.mono.now = 2009.0 + 9.999
         self.assertEqual(refresher.start(), "cooldown")
-        self.mono.now = 2018.0
+        self.mono.now = 2019.0
         self.assertEqual(refresher.cooldown_left(), 0.0)
         self.assertEqual(refresher.start(), "started")
         self.assertEqual(self.parsed_request()["id"], REFRESH_TOKENS[1])
@@ -629,10 +629,10 @@ class AppRefresherPollTests(AppRefreshTestCase):
         refresher = self.make_refresher()
         self.mono.now = 1000.0
         self.assertEqual(refresher.start(), "started")
-        self.mono.now = 1007.999
+        self.mono.now = 1008.999
         self.assertIsNone(refresher.poll())
         self.assertTrue(refresher.waiting)
-        self.mono.now = 1008.0
+        self.mono.now = 1009.0
         self.assertEqual(refresher.poll(), ("timeout", ""))
         self.assertFalse(refresher.waiting)
         self.assertAlmostEqual(refresher.cooldown_left(), 10.0, places=6)
@@ -642,7 +642,7 @@ class AppRefresherPollTests(AppRefreshTestCase):
         self.mono.now = 1000.0
         self.assertEqual(refresher.start(), "started")
         self.write_ack(REFRESH_TOKENS[0], status="ok")
-        self.mono.now = 1008.0
+        self.mono.now = 1009.0
         self.assertEqual(refresher.poll(), ("ok", ""))
         self.assertAlmostEqual(refresher.cooldown_left(), 60.0, places=6)
 
@@ -650,9 +650,9 @@ class AppRefresherPollTests(AppRefreshTestCase):
         refresher = self.make_refresher()
         self.mono.now = 1000.0
         self.assertEqual(refresher.start(), "started")
-        self.mono.now = 1008.0
+        self.mono.now = 1009.0
         self.assertEqual(refresher.poll(), ("timeout", ""))
-        self.mono.now = 1018.0
+        self.mono.now = 1019.0
         self.assertEqual(refresher.start(), "started")
         self.write_ack(REFRESH_TOKENS[0], status="ok")
         self.assertIsNone(refresher.poll())
@@ -664,12 +664,12 @@ class AppRefresherPollTests(AppRefreshTestCase):
         refresher = self.make_refresher()
         self.mono.now = 1000.0
         self.assertEqual(refresher.start(), "started")
-        for now in (900.0, -5.0, 1007.9):
+        for now in (900.0, -5.0, 1008.9):
             with self.subTest(now=now):
                 self.mono.now = now
                 self.assertIsNone(refresher.poll())
                 self.assertTrue(refresher.waiting)
-        self.mono.now = 1008.0
+        self.mono.now = 1009.0
         self.assertEqual(refresher.poll(), ("timeout", ""))
 
     def test_a_read_error_keeps_waiting_until_the_timeout(self):
@@ -680,7 +680,7 @@ class AppRefresherPollTests(AppRefreshTestCase):
             self.assertIsNone(refresher.poll())
             self.assertTrue(refresher.waiting)
             self.assertTrue(opened.called)
-            self.mono.now = 1008.0
+            self.mono.now = 1009.0
             self.assertEqual(refresher.poll(), ("timeout", ""))
 
     def test_poll_after_a_result_stays_idle(self):
@@ -740,7 +740,7 @@ class AppRefresherStopTests(AppRefreshTestCase):
             refresher = self.make_refresher()
             self.mono.now = 2000.0
             self.assertEqual(refresher.start(), "started")
-            self.mono.now = 2008.0
+            self.mono.now = 2009.0
             self.assertEqual(refresher.poll(), ("timeout", ""))
             before = refresher.cooldown_left()
             refresher.stop()
@@ -1483,7 +1483,7 @@ class AppTimerTests(AppRefreshTestCase):
             app._on_app_timer()
         self.assertEqual(app.reader.calls, [])
         self.assertEqual(app._caption, (deadline, ("no session", "")))
-        app.log.log.assert_any_call("AppRefresh", "no answer within 8 s")
+        app.log.log.assert_any_call("AppRefresh", "no answer within 9 s")
         app.w32.kill_timer.assert_called_with(10, widget.TIMER_APP)
         self.assertNotIn(widget.TIMER_APP, app.timers)
         self.assertIn(
@@ -1507,7 +1507,7 @@ class AppTimerTests(AppRefreshTestCase):
         self.assertEqual(app._caption[0], APP_NOW + widget.CAPTION_MS / 1000.0)
         # The reader is not read again, and the timeout is logged whatever the caption says.
         self.assertEqual(app.reader.calls, [])
-        app.log.log.assert_any_call("AppRefresh", "no answer within 8 s")
+        app.log.log.assert_any_call("AppRefresh", "no answer within 9 s")
         return app._caption[1]
 
     def test_timeout_with_the_snapshot_file_missing_shows_no_file(self):
@@ -2228,23 +2228,23 @@ class AppRefreshEndToEndTests(AppRefreshTestCase):
     def test_timeout_flow(self):
         app = self._make()
         click_refresh(app)
-        self.mono.now = 1007.9
+        self.mono.now = 1008.9
         with patch.object(widget.time, "time", return_value=APP_NOW):
             app.on_timer(widget.TIMER_APP)
         self.assertTrue(app.app_refresher.waiting)
 
-        self.mono.now = 1008.0
+        self.mono.now = 1009.0
         with patch.object(widget.time, "time", return_value=APP_NOW):
             app.on_timer(widget.TIMER_APP)
         self.assertEqual(app._caption[1][0], "no session")
         self.assertEqual(last_display(app).captions, ("no session",))
-        app.log.log.assert_any_call("AppRefresh", "no answer within 8 s")
+        app.log.log.assert_any_call("AppRefresh", "no answer within 9 s")
         self.assertNotIn(widget.TIMER_APP, app.timers)
 
-        self.mono.now = 1017.9
+        self.mono.now = 1018.9
         click_refresh(app)
         self.assertEqual(self._request_id(), "a1b2c3d4e5f6")
-        self.mono.now = 1018.0
+        self.mono.now = 1019.0
         click_refresh(app)
         self.assertEqual(self._request_id(), "0f9e8d7c6b5a")
 
@@ -2266,14 +2266,14 @@ class AppRefreshEndToEndTests(AppRefreshTestCase):
                 click_refresh(app)
                 self.assertEqual(app.reader.last_reason, "" if present else "missing")
                 self.assertEqual(last_display(app).captions, ("asking",))
-                self.mono.now = 1008.0
+                self.mono.now = 1009.0
                 with patch.object(widget.time, "time", return_value=APP_NOW):
                     app.on_timer(widget.TIMER_APP)
                 self.assertFalse(app.app_refresher.waiting)
                 expected = "no session" if present else "no file"
                 self.assertEqual(app._caption[1][0], expected)
                 self.assertEqual(last_display(app).captions, (expected,))
-                app.log.log.assert_any_call("AppRefresh", "no answer within 8 s")
+                app.log.log.assert_any_call("AppRefresh", "no answer within 9 s")
 
     def test_request_exit_leaves_the_request_file(self):
         app = self._make()

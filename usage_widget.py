@@ -561,7 +561,11 @@ def _stamp_observed(snapshot, mtime):
 
 
 def _read_codex_tail(path):
-    """只读文件尾部。返回 (snapshot 或 None, mtime)。调用方负责捕获 OSError。"""
+    """只读文件尾部。返回 (snapshot 或 None, mtime)。调用方负责捕获 OSError。
+
+    JSONL 只以 \\n 分行。str.splitlines 还会在 U+2028、U+2029、NEL、FF、0x1C 到 0x1E 处断行，
+    会把含这些字符的一行拆碎，所以先在原始字节上按 b"\\n" 切，只对通过预过滤的行解码。
+    """
     file_stat = os.stat(path)
     with open(path, "rb") as handle:
         handle.seek(0, os.SEEK_END)
@@ -569,22 +573,25 @@ def _read_codex_tail(path):
         start = size - CODEX_TAIL_BYTES if size > CODEX_TAIL_BYTES else 0
         handle.seek(start)
         raw = handle.read(CODEX_TAIL_BYTES)
-    text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
+    lines = raw.split(b"\n")
     # 不是从文件头开始时，首行多半被截断，丢掉
-    if start != 0 and lines:
+    if start != 0:
         lines = lines[1:]
     for line in reversed(lines):
-        if '"rate_limits"' not in line or '"token_count"' not in line:
+        if b'"rate_limits"' not in line or b'"token_count"' not in line:
             continue
-        parsed = parse_codex_rate_limits(line)
+        parsed = parse_codex_rate_limits(line.decode("utf-8", errors="replace"))
         if parsed is not None:
             return _stamp_observed(parsed, file_stat.st_mtime), file_stat.st_mtime
     return None, file_stat.st_mtime
 
 
 class CodexReader:
-    """按日期目录找 rollout，只在最新文件签名变化时重读尾部。"""
+    """按日期目录找最近的几个 rollout，取其中观测时间最晚的限额记录。
+
+    只在最新文件的签名变化时重新评估；各文件尾部的解析结果按 (mtime_ns, size) 缓存，
+    没变的文件不重读。
+    """
 
     def __init__(self, home=None, clock=time.time):
         self.home = codex_home(home)
@@ -596,6 +603,8 @@ class CodexReader:
         self._candidates = None
         self._last_scan = None
         self._signature = None
+        # 路径 -> ((mtime_ns, size), 该文件尾部解析出的快照或 None)。只保留当前候选，不会增长。
+        self._tail_cache = {}
 
     def refresh(self, force=False):
         """返回快照是否变化。任何 OSError / ValueError 都吞掉，不把文件内容写进原因。"""
@@ -615,6 +624,7 @@ class CodexReader:
             self._candidates = None
             self._last_scan = None
             self._signature = None
+            self._tail_cache = {}
             return changed
 
         now = self.clock()
@@ -624,10 +634,15 @@ class CodexReader:
                 or now - self._last_scan >= CODEX_RESCAN_SECONDS):
             self._candidates = find_codex_rollouts(sessions)
             self._last_scan = now
+            # 缓存只留当前候选：掉出候选的路径立即丢掉。
+            kept = set(self._candidates)
+            self._tail_cache = {
+                path: entry for path, entry in self._tail_cache.items() if path in kept}
 
         if not self._candidates:
             self.last_reason = "no_rate_limits"
             self._signature = None
+            self._tail_cache = {}
             return False
 
         newest = self._candidates[0]
@@ -640,35 +655,73 @@ class CodexReader:
         if not force and signature is not None and signature == self._signature:
             return False
 
-        found = None
-        found_path = None
-        for path in self._candidates:
-            try:
-                parsed, _mtime = _read_codex_tail(path)
-            except (OSError, ValueError):
-                continue
-            if parsed is None:
-                continue
-            found = parsed
-            found_path = path
-            break
-
-        if signature is not None:
+        found, found_path, read_error = self._latest_record(force)
+        if read_error:
+            # 有候选读失败：不记签名，下次轮询再试（SnapshotReader 也只在读成功后更新签名）。
+            self._signature = None
+        elif signature is not None:
             self._signature = signature
-        # 不拿更旧的观测时间盖掉已有快照。强制刷新时允许退回旧记录。
-        # 当前快照的观测时间远在未来时，时钟校正后的新记录也要接受。
-        if (found is not None and not force
-                and _snapshot_is_older(found, self.snapshot, now)):
-            self.last_reason = ""
-            return False
         if found is None:
-            self.last_reason = "no_rate_limits"
+            # 一条记录都没有：读不了（read error）与还没有记录（no data）要分开。
+            self.last_reason = read_error or "no_rate_limits"
+            return False
+        # 观测时间只增不减，强制刷新也一样：找到的记录比已有快照更旧就不采用。
+        # 从前 force 会放行更旧的记录，为的是时钟曾拨快后又校正的情形；那种情形由
+        # _snapshot_is_older 自己处理：当前快照的观测时间比 now 超前超过
+        # CODEX_FUTURE_TOLERANCE_SECONDS 时它不再拒绝较新的记录，所以不必再靠 force 放行。
+        if _snapshot_is_older(found, self.snapshot, now):
+            self.last_reason = ""
             return False
         changed = found != self.snapshot
         self.snapshot = found
         self.source_path = found_path
         self.last_reason = ""
         return changed
+
+    def _latest_record(self, force):
+        """解析每个候选文件的尾部，返回 (快照或 None, 路径或 None, 读取失败的原因或 "")。
+
+        快照取观测时间最晚的那条。文件的 mtime 只说明谁最后被写过：在某个会话里敲提示词
+        也会抬高它日志的 mtime，却不带新的限额记录；应用加命令行同时开着两个会话很常见，
+        所以 mtime 最新的文件未必有最新的记录。候选都看，按记录自己的观测时间取最大；
+        观测时间相同取排在前面的，即 mtime 较新的文件。
+
+        没变的文件不重读：按 (mtime_ns, size) 缓存各路径的解析结果，缓存只留当前候选。
+        签名在读取之前取，读到的内容至少和签名一样新；读的当中文件又被追加，下次签名
+        不同，会重读。force 绕过缓存，Refresh now 总是真读一遍。
+        读失败的路径不进缓存，下次再试。扫描之后才被删掉的文件（FileNotFoundError）只说明
+        候选列表过期，不算读取失败。
+        """
+        fresh = {}
+        best = None
+        best_path = None
+        best_at = None
+        read_error = ""
+        for path in self._candidates:
+            try:
+                file_stat = os.stat(path)
+                token = (file_stat.st_mtime_ns, file_stat.st_size)
+                cached = None if force else self._tail_cache.get(path)
+                if cached is not None and cached[0] == token:
+                    parsed = cached[1]
+                else:
+                    parsed, _mtime = _read_codex_tail(path)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                if not read_error:
+                    read_error = "read_error:" + type(exc).__name__
+                continue
+            fresh[path] = (token, parsed)
+            if parsed is None:
+                continue
+            observed_at = _snapshot_observed_at(parsed)
+            if best is None or observed_at > best_at:
+                best = parsed
+                best_path = path
+                best_at = observed_at
+        self._tail_cache = fresh
+        return best, best_path, read_error
 
 
 # ---------------------------------------------------------------------------

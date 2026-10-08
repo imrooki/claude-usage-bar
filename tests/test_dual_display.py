@@ -229,9 +229,12 @@ class DualDisplayTests(unittest.TestCase):
             left, right = edges["bar"]
             band = image.crop((left, 0, right, header_height))
             best = 0
-            for pixel in band.getdata():
-                if pixel[0] == text[0] and pixel[1] == text[1] and pixel[2] == text[2]:
-                    best = max(best, pixel[3])
+            pixels = band.load()
+            for x in range(band.width):
+                for y in range(band.height):
+                    pixel = pixels[x, y]
+                    if pixel[0] == text[0] and pixel[1] == text[1] and pixel[2] == text[2]:
+                        best = max(best, pixel[3])
             return best
 
         normal_alpha = peak_alpha(columns[0])
@@ -379,6 +382,90 @@ class OptionsAndPollTests(unittest.TestCase):
         override = app._apply.call_args[0][0]
         self.assertEqual(override.kind, "data")
         self.assertEqual(override.rows[0].pct_text, "30%")
+
+
+GEOMETRY_QUERIES = ("taskbar_pos", "taskbar_autohide", "notification_state", "scale_for", "tray_notify_rect")
+
+
+def geometry_calls(app):
+    return sum(getattr(app.w32, name).call_count for name in GEOMETRY_QUERIES)
+
+
+class UnchangedReader:
+    """SnapshotReader / CodexReader 的替身：refresh() 报告没有变化。"""
+
+    def __init__(self, snapshot=None):
+        self.snapshot = snapshot
+        self.last_reason = ""
+        self.available = True
+
+    def refresh(self, force=False):
+        return False
+
+
+def polling_app(snapshot=None, codex=True):
+    app = make_app()
+    app.reader = UnchangedReader(snapshot)
+    app.codex = UnchangedReader() if codex else None
+    # 与 _start_timers 一样，两秒一次的 TIMER_CHECK 在跑。
+    app.set_timer(widget.TIMER_CHECK, widget.WINDOW_CHECK_MS)
+    return app
+
+
+class PollRedrawTests(unittest.TestCase):
+    """TIMER_POLL 只在数据变了或要挂反馈文字时重绘；几何查询与随时间变化的文字交给 TIMER_CHECK。"""
+
+    def test_unchanged_poll_skips_the_geometry_pass(self):
+        app = polling_app()
+        app.poll_snapshot()
+        app.poll_snapshot(force=True)
+        self.assertEqual(geometry_calls(app), 0)
+        app._apply.assert_not_called()
+
+    def test_a_changed_reader_still_redraws_at_once(self):
+        for name in ("reader", "codex"):
+            with self.subTest(reader=name):
+                app = polling_app()
+                getattr(app, name).refresh = Mock(return_value=True)
+                app.poll_snapshot()
+                self.assertGreater(geometry_calls(app), 0)
+                app._apply.assert_called_once()
+
+    def test_an_armed_caption_redraws_even_when_nothing_changed(self):
+        app = polling_app(codex=False)
+        app._caption_before = (None, None)  # what Refresh now leaves in place while it polls
+        app.poll_snapshot()
+        self.assertIsNotNone(app._caption)
+        app._apply.assert_called_once()
+
+    def test_without_the_check_timer_the_poll_still_redraws(self):
+        app = polling_app()
+        app.kill_timer(widget.TIMER_CHECK)
+        app.poll_snapshot()
+        app._apply.assert_called_once()
+
+    def test_a_codex_error_still_redraws(self):
+        app = polling_app()
+        app.codex.refresh = Mock(side_effect=RuntimeError("codex broke"))
+        app.poll_snapshot()
+        app.log.log_exception.assert_called_once()
+        app._apply.assert_called_once()
+
+    def test_the_check_tick_rebuilds_time_driven_text_without_a_poll(self):
+        observed = SAMPLE_NOW
+        snapshot = {
+            "five_hour": widget.Win(30.0, observed + 3600.0, observed),
+            "seven_day": widget.Win(10.0, observed + 86400.0, observed),
+        }
+        app = polling_app(snapshot)
+        app.poll_snapshot()
+        app._apply.assert_not_called()
+        later = observed + widget.STALE_SECONDS + 60.0
+        with patch.object(widget.time, "time", return_value=later):
+            app.on_timer(widget.TIMER_CHECK)
+        self.assertGreater(geometry_calls(app), 0)
+        app._apply.assert_called_once()
+        self.assertEqual(app._apply.call_args[0][0].ages[0], widget.format_age(later - observed))
 
 
 if __name__ == "__main__":

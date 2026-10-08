@@ -48,7 +48,8 @@ class DimImageTests(unittest.TestCase):
         result = widget.dim_image(source, widget.FLASH_ALPHA_SCALE)
         self.assertEqual(result.size, (2, 1))
         self.assertEqual(result.mode, "RGBA")
-        self.assertEqual(list(result.getdata()), [
+        pixels = result.load()
+        self.assertEqual([pixels[x, y] for y in range(result.height) for x in range(result.width)], [
             (10, 20, 30, widget.BACKGROUND_ALPHA),
             (40, 50, 60, int(200 * widget.FLASH_ALPHA_SCALE)),
         ])

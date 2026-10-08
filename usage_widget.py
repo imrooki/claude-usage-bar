@@ -284,6 +284,12 @@ def _parse_window(raw, written_at):
     return Win(pct, resets_at, observed_at)
 
 
+def _schema_is(doc, n):
+    """doc 的 schema 字段是不是数字 n。布尔值不算数字；字符串、缺失或其他类型都不相等。"""
+    schema = doc.get("schema")
+    return not isinstance(schema, bool) and isinstance(schema, (int, float)) and schema == n
+
+
 def parse_snapshot(raw):
     """解析快照字节串，返回 (snapshot, reason)。
 
@@ -299,8 +305,7 @@ def parse_snapshot(raw):
         return None, "bad_json"
     if not isinstance(doc, dict):
         return None, "not_object"
-    schema = doc.get("schema")
-    if isinstance(schema, bool) or not isinstance(schema, (int, float)) or schema != 1:
+    if not _schema_is(doc, 1):
         return None, "bad_schema"
     windows = doc.get("windows")
     if not isinstance(windows, dict):
@@ -1023,8 +1028,7 @@ def read_app_ack(path, expected_id):
         return None
     if not isinstance(doc, dict):
         return None
-    schema = doc.get("schema")
-    if isinstance(schema, bool) or not isinstance(schema, (int, float)) or schema != 1:
+    if not _schema_is(doc, 1):
         return None
     if doc.get("id") != expected_id:
         return None
@@ -1291,10 +1295,13 @@ def caption_text(before, after, reason):
 # 纯函数层：布局（右端锚定）
 # ---------------------------------------------------------------------------
 
-def logical_columns():
-    """按逻辑像素排出各列的 (左, 右)，返回 (字典, 总宽)。"""
+def _place_columns(origin):
+    """从 origin 起按列宽与列间隙排出各列的 (左, 右)，返回 (字典, 排完后的右端)。
+
+    单栏的列从左边距起，双栏的块从 0 起；两者共用这一套列定义，只差起点和末尾是否加右边距。
+    """
     columns = {}
-    x = MARGIN_L
+    x = origin
     for name, width, gap_after in (
         ("label", LABEL_W, GAP_LABEL_BAR),
         ("bar", BAR_W, GAP_BAR_PCT),
@@ -1303,6 +1310,12 @@ def logical_columns():
     ):
         columns[name] = (x, x + width)
         x += width + gap_after
+    return columns, x
+
+
+def logical_columns():
+    """按逻辑像素排出各列的 (左, 右)，返回 (字典, 总宽)。"""
+    columns, x = _place_columns(MARGIN_L)
     return columns, x + MARGIN_R
 
 
@@ -1322,17 +1335,7 @@ def dual_block_columns():
 
     列与单栏相同，名称画在进度条上方，不再占左侧一列。
     """
-    columns = {}
-    x = 0
-    for name, width, gap_after in (
-        ("label", LABEL_W, GAP_LABEL_BAR),
-        ("bar", BAR_W, GAP_BAR_PCT),
-        ("pct", PCT_W, GAP_PCT_RESET),
-        ("reset", RESET_W, 0),
-    ):
-        columns[name] = (x, x + width)
-        x += width + gap_after
-    return columns, x
+    return _place_columns(0)
 
 
 def dual_logical_width():
@@ -1361,14 +1364,19 @@ def window_height(taskbar_rect, scale):
     return max(MIN_HEIGHT_PX, min(scaled(LOGICAL_H, scale), (bottom - top) - 4))
 
 
+def _vscale(scale, height):
+    """窗口高度相对标称高度的比例，上限 1：任务栏矮时缩小，任务栏高时不放大。"""
+    nominal_height = max(1, scaled(LOGICAL_H, scale))
+    return min(1.0, height / float(nominal_height))
+
+
 def render_metrics(scale, height):
     """窗口高度对应的字号、进度槽高度与圆角（像素）。
 
     任务栏太矮时窗口高度小于标称高度，字号、行高、进度槽按比例缩小；宽度由列布局
     决定，不随之变化。
     """
-    nominal_height = max(1, scaled(LOGICAL_H, scale))
-    vscale = min(1.0, height / float(nominal_height))
+    vscale = _vscale(scale, height)
     return {
         "vscale": vscale,
         "font_px": max(MIN_FONT_PX, scaled(FONT_PX * vscale, scale)),
@@ -1379,8 +1387,7 @@ def render_metrics(scale, height):
 
 def dual_render_metrics(scale, height):
     """双栏的页眉高度、行高、字号与进度槽。单栏的 render_metrics 不走这里。"""
-    nominal_height = max(1, scaled(LOGICAL_H, scale))
-    vscale = min(1.0, height / float(nominal_height))
+    vscale = _vscale(scale, height)
     header_height = scaled(DUAL_HEADER_H * vscale, scale)
     return {
         "vscale": vscale,
@@ -2127,7 +2134,10 @@ class ErrorLog:
         return self.log(type(exc).__name__, str(exc))
 
     def log(self, kind, message):
-        """返回是否真的写入。日志自身的 I/O 失败只能吞掉，没有地方再报。"""
+        """返回是否真的写入。日志自身的 I/O 失败只能吞掉，没有地方再报。
+
+        去重只针对真正写进去的记录：写失败（比如 data-dir 还没建好）不占去重名额，同样的消息下次照常再试。
+        """
         if not self.path:
             return False
         message = " ".join(str(message).split())[:LOG_MAX_MESSAGE]
@@ -2136,12 +2146,6 @@ class ErrorLog:
         last = self._seen.get(key)
         if last is not None and now - last < LOG_DEDUP_SECONDS:
             return False
-        if len(self._seen) >= LOG_MAX_KEYS:
-            # 去重表有上限，内存不随时间增长
-            self._seen = {k: t for k, t in self._seen.items() if now - t < LOG_DEDUP_SECONDS}
-            if len(self._seen) >= LOG_MAX_KEYS:
-                self._seen.clear()
-        self._seen[key] = now
         try:
             if not os.path.isdir(self._dir):
                 return False
@@ -2161,9 +2165,16 @@ class ErrorLog:
                     pass
             with open(self.path, mode) as handle:
                 handle.write(line.encode("utf-8"))
-            return True
         except (OSError, ValueError):
             return False
+        # 只有真的写进去了才记下这个键；写失败时去重表保持原样。
+        if len(self._seen) >= LOG_MAX_KEYS:
+            # 去重表有上限，内存不随时间增长
+            self._seen = {k: t for k, t in self._seen.items() if now - t < LOG_DEDUP_SECONDS}
+            if len(self._seen) >= LOG_MAX_KEYS:
+                self._seen.clear()
+        self._seen[key] = now
+        return True
 
 
 def load_position(path):
@@ -2181,8 +2192,7 @@ def load_position(path):
         return MODE_AUTO, DEFAULT_OFFSET
     if not isinstance(doc, dict):
         return MODE_AUTO, DEFAULT_OFFSET
-    schema = doc.get("schema")
-    if isinstance(schema, bool) or not isinstance(schema, (int, float)) or schema != POS_SCHEMA:
+    if not _schema_is(doc, POS_SCHEMA):
         return MODE_AUTO, DEFAULT_OFFSET
     value = _finite(doc.get("offset_from_right"))
     offset = DEFAULT_OFFSET
@@ -2933,6 +2943,8 @@ class WidgetApp:
         self._ping_before = None
         # 点 Refresh now 那一刻 Claude 最新的 observed_at，确认回来后拿它判断 new 还是 same。
         self._app_before = None
+        # 最近一次渲染的未变暗画面：(显示元组, RGBA 图)，None 表示还没渲染过；见 _frame_image。
+        self._frame = None
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -3154,6 +3166,13 @@ class WidgetApp:
             self._log_exception(exc)
             self.request_exit()
             return
+        self._after_window_created()
+
+    def _after_window_created(self):
+        """新窗口建好之后的共用收尾：清掉上一扇窗口的显示状态，补上计时器，马上画一次。
+
+        _recreate_window 与 on_thread_message 都走这里。
+        """
         self.visible = False
         self.geom = None
         self.shown_display = None
@@ -3172,14 +3191,7 @@ class WidgetApp:
             self._log_exception(exc)
             self.w32.post_quit()
             return
-        self.visible = False
-        self.geom = None
-        self.shown_display = None
-        self._z_order_pending = False
-        self._flashing = False
-        self._caption = None
-        self._start_timers(recreated=True)
-        self.refresh_view(force=True, reassert_topmost=True)
+        self._after_window_created()
 
     # 显示与定位 --------------------------------------------------------------
 
@@ -3324,9 +3336,6 @@ class WidgetApp:
         if raise_window:
             self.w32.keep_topmost(self.hwnd)
 
-    # 最近一次渲染的未变暗画面：(显示元组, RGBA 图)。类级默认 None，首次渲染后落到实例上。
-    _frame = None
-
     def _frame_image(self, display):
         """显示元组对应的未变暗画面，与上一次相同的元组直接复用。
 
@@ -3380,22 +3389,28 @@ class WidgetApp:
     # 周期任务 ----------------------------------------------------------------
 
     def poll_snapshot(self, force=False):
-        """读两个数据源再重绘。TIMER_POLL 与 Refresh now 共用。
+        """读两个数据源，有变化或有反馈文字要挂上时再重绘。TIMER_POLL 与 Refresh now 共用。
 
         Refresh now 会先把刷新前的最新观测时间放进 self._caption_before。读完数据源后
         立刻取走并清掉这个标记，再算出反馈文字；第一次重绘就带着它。
         """
-        self.reader.refresh(force=force)
+        changed = self.reader.refresh(force=force)
         reason = self.reader.last_reason
         if reason and reason != "missing":
             self.log.log("SnapshotInvalid", reason)
-        self._poll_codex(force)
+        codex_changed = self._poll_codex(force)
         # refresh_view 内部的 UpdateLayeredWindow / SetWindowPos 会处理别的线程发来的消息，
         # 不能让那些路径看到仍然"刷新中"的标记，所以先取到局部变量并立刻置 None。
         before = self._caption_before
         self._caption_before = None
         if before is not None:
             self._arm_caption(before)
+        # 数据没变、也没有反馈文字要挂上，且 2 秒一次的 TIMER_CHECK 还在跑时，这一轮不再做几何查询。
+        # TIMER_CHECK 每次都会 refresh_view，用当前时间重建显示元组，陈旧变暗、年龄与重置文字都在那里更新。
+        # 计时器没建成时保留这里的重绘，否则这些随时间变化的文字就只会在数据变化时才更新。
+        idle = not (changed or codex_changed or self._caption is not None)
+        if idle and TIMER_CHECK in self.timers:
+            return
         self.refresh_view()
 
     def _latest_observed(self):
@@ -3420,23 +3435,27 @@ class WidgetApp:
         self.set_timer(TIMER_CAPTION, CAPTION_MS)
 
     def _poll_codex(self, force):
-        """刷新 Codex。异常只记日志，不打断已经完成的 Claude 刷新，也不挡住后面的重绘。"""
+        """刷新 Codex。异常只记日志，不打断已经完成的 Claude 刷新，也不挡住后面的重绘。
+
+        返回是否需要重绘：快照变了，或刷新抛了异常（宁可多画一次）。没有 Codex 数据源时为假。
+        """
         reader = self.codex
         if reader is None:
-            return
+            return False
         try:
-            reader.refresh(force=force)
+            changed = reader.refresh(force=force)
         except Exception as exc:
             self._log_exception(exc)
-            return
+            return True
         reason = reader.last_reason
         if reason == "":
             self._codex_log_reason = ""
-            return
+            return changed
         if reason == "no_codex" or reason == self._codex_log_reason:
-            return
+            return changed
         self._codex_log_reason = reason
         self.log.log("CodexRead", reason)
+        return changed
 
     def _rewrite_codex_caption(self, rewrite):
         """改掉已有反馈文字里 Codex 那一项。没有反馈文字时什么也不做。"""

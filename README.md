@@ -183,7 +183,7 @@ When you click `Refresh now`, the widget writes a small request file, `refresh-r
 
 ## Codex usage
 
-The Codex block needs no setup. The Codex CLI and the Codex app write a local session log for each session under `%USERPROFILE%\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl` (or under `CODEX_HOME` if you set that variable). After every model response they append a `token_count` record that carries the current rate limits: the 5-hour window (`primary`) and the weekly window (`secondary`), each with the used percentage and the reset time. The widget reads the last such record of the most recently written session log.
+The Codex block needs no setup. The Codex CLI and the Codex app write a local session log for each session under `%USERPROFILE%\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl` (or under `CODEX_HOME` if you set that variable). After every model response they append a `token_count` record that carries the current rate limits: the 5-hour window (`primary`) and the weekly window (`secondary`), each with the used percentage and the reset time. The widget reads the most recent such record among the newest session logs.
 
 - **Automatic detection.** The widget looks in the Codex folder of the Windows user it runs as. Without a `sessions` folder it shows only the Claude block, exactly as before; once Codex has been used, the Codex block appears on its own.
 - **Read-only and local.** Only lines that contain both `"token_count"` and `"rate_limits"` are parsed, so your prompts and answers in the same files are never read into the widget. It never opens `auth.json` or any other Codex credential file, and the widget itself makes no network connection. Only records whose `limit_id` is missing or `codex` are used.
@@ -275,7 +275,8 @@ Known limitations:
 - Windows 11 does not let ordinary windows live inside the notification area, so the widget sits beside it, not inside.
 - After the right-click menu closes, keyboard focus stays on the widget until you click another window.
 - Only the primary monitor's taskbar is handled.
-- If the system clock ran far ahead while Codex was writing and was corrected later, the Codex block can stay on an old reading for about as long as the clock was ahead, or until Codex writes again.
+- With several Codex sessions open (for example the app and the CLI), the Codex block shows the most recent rate-limit record across the newest session logs, not the record in the most recently written file, because typing a prompt touches a log without adding a record.
+- If the system clock ran far ahead while Codex was writing and was corrected later, the Codex block can stay on an old reading for about as long as the clock was ahead, or until that session writes again.
 - When Explorer restarts, the widget recreates its window under the new taskbar. This was tested with one real restart; two restarts within 30 s can leave the widget without an owner for up to about 30 s, during which an open Start menu covers it.
 
 ## Design notes

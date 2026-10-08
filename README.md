@@ -241,7 +241,7 @@ Each block gets its own text, so a fresh Claude block and a stale Codex block ca
 
 For the Codex block this also fixes the first cause above: Codex use on another computer is invisible to a local log, but the answer to the request carries the account's current limits, so a click gives you the real numbers.
 
-If a Code session is running and the widget still says `same`, look at the plugin's own log, `usage-feed-events.json`, in the same folder as `usage.json`. The plugin adds one entry per hook call (and one per handled click on `Refresh now`) and keeps the latest 200. It is plain JSON, written compactly on a single line (turn on word wrap in your editor), newest entry last:
+If a Code session is running and the widget still says `same`, look at the plugin's own log, `usage-feed-events.json`, in the same folder as `usage.json`. The plugin adds one entry per hook call (and one per handled click on `Refresh now`) and keeps the latest 200. It is plain JSON with one entry per line, each entry compact and the newest one last:
 
 ```json
 {"t": 1790900000123, "ev": "session.measure", "sid": "...", "n": 2, "kinds": ["five_hour", "seven_day"], "kept": 2, "out": "wrote", "why": "", "held": [], "changed": []}

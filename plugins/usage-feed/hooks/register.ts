@@ -35,7 +35,7 @@
 //    drops（被丢弃窗口的原因计数，没有丢弃时省略）、held（合并时保留了旧值的窗口）、
 //    changed（session.measure 事件报告变化的度量项名，其余事件为空）。
 //    不含路径、工作目录、提示词、模型名。取不到有限时间、或写日志失败时，这次调用什么都不记。
-//    日志写成紧凑 JSON（不缩进，用量快照仍是缩进的）。已有日志非空却读不出（不是合法 JSON、结构不对、
+//    日志是 {"schema":1,"events":[ 开头的 JSON：每条紧凑一行、不缩进，最新的在最后（用量快照仍是缩进的）。已有日志非空却读不出（不是合法 JSON、结构不对、
 //    超过大小上限）时，第一次遇到只记下这段文本的特征、这一次不写；下一次 hook 读到的仍是同一段才重新开始
 //    （两次确认，见 logEvent 和下面的并发说明）。文件不存在、读失败或是空文件则直接从空日志开始。
 //    重写时只留下是普通对象、且紧凑后不超过 MAX_EVENT_ENTRY_CHARS 的旧条目，别的写入方留下的臃肿日志不会被永久保留。
@@ -145,6 +145,12 @@ type Drops = { [R in DropReason]?: number }
 type Fresh = { used_percentage: number; resets_at: number }
 type Stored = { used_percentage: number; resets_at: number; observed_at: number; session_id: string | null }
 type Windows<T> = { [K in Kind]?: T }
+// 两边都有值时的决定：take 用本次读数（会话 id 也换成本次的）；confirm 保留已存的用量与重置时间，只刷新 observed_at 与会话 id；
+// hold 保留已存的值并记入 held。
+type Decision = 'take' | 'confirm' | 'hold'
+// 同一周期（resets_at 相差不超过 SAME_PERIOD_SECONDS）时的决定，merge 与 mergeApp 只在这里不同。
+type SamePeriod = (n: Fresh, o: Stored, sessionId: string | null) => Decision
+type MergeResult = { windows: Windows<Stored>; held: Kind[] }
 
 // feed 的结果，交给 logEvent 记成一行日志。nowMs 与 sessionId 让日志复用 feed 已经读到的值。
 type Outcome = {
@@ -158,6 +164,21 @@ type Outcome = {
   nowMs: number | null // feed 已读到的有效时间（有限数）；没读到或无效为 null
   sessionId: string | null | undefined // feed 已读到的会话 id（读失败是 null）；feed 根本没去读为 undefined
 }
+
+// 一次结果的默认值只在这里写一次。默认是 skipped：没写快照、没读到时钟、没读到会话 id 是最常见的情形。
+// 键的顺序与原先的字面量相同，...o 只覆盖取值、不改顺序。日志的键序由 logEvent 自己排定，与这里无关。
+const outcome = (o: Partial<Outcome> = {}): Outcome => ({
+  n: 0,
+  kinds: [],
+  kept: 0,
+  drops: {},
+  held: [],
+  out: 'skipped',
+  why: '',
+  nowMs: null,
+  sessionId: undefined,
+  ...o,
+})
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -193,6 +214,19 @@ const noteDrop = (drops: Drops, reason: DropReason): void => {
   drops[reason] = (drops[reason] ?? 0) + 1
 }
 
+// 一个窗口的用量与重置时间是否可用：可用就返回快照窗口（resets_at 取整到秒），否则返回丢弃原因。
+// 引擎窗口与桌面应用窗口共用这一套规则，两边的判断顺序也一样。
+const freshFrom = (percentUsed: unknown, resetsAt: unknown): Fresh | DropReason => {
+  const used = finite(percentUsed)
+  if (used === null || used < 0) return 'bad_percent'
+  if (typeof resetsAt !== 'string') return 'no_resets_at'
+  const ms = Date.parse(resetsAt)
+  if (!Number.isFinite(ms)) return 'bad_resets_at'
+  const resets = Math.floor(ms / 1000)
+  if (!(resets > 0)) return 'bad_resets_at'
+  return { used_percentage: used, resets_at: resets }
+}
+
 // 引擎窗口 -> 快照窗口。不满足条件的窗口丢弃并计入 drops；同一 kind 出现多次取第一个有效的。
 // 前面被丢弃的无效条目不占 kind，不会挡住后面的有效条目。
 const fromEngine = (list: unknown): { windows: Windows<Fresh>; drops: Drops } => {
@@ -213,29 +247,26 @@ const fromEngine = (list: unknown): { windows: Windows<Fresh>; drops: Drops } =>
       noteDrop(drops, 'duplicate_kind')
       continue
     }
-    const used = finite(w.percentUsed)
-    if (used === null || used < 0) {
-      noteDrop(drops, 'bad_percent')
+    const f = freshFrom(w.percentUsed, w.resetsAt)
+    if (typeof f === 'string') {
+      noteDrop(drops, f)
       continue
     }
-    const resetsAt = w.resetsAt
-    if (typeof resetsAt !== 'string') {
-      noteDrop(drops, 'no_resets_at')
-      continue
-    }
-    const ms = Date.parse(resetsAt)
-    if (!Number.isFinite(ms)) {
-      noteDrop(drops, 'bad_resets_at')
-      continue
-    }
-    const resets = Math.floor(ms / 1000)
-    if (!(resets > 0)) {
-      noteDrop(drops, 'bad_resets_at')
-      continue
-    }
-    windows[kind] = { used_percentage: used, resets_at: resets }
+    windows[kind] = f
   }
   return { windows, drops }
+}
+
+// 读进来的文本先看长度再 JSON.parse。不是字符串、超过 maxChars（按字符数）、解析失败都返回 null（不可用）。
+// stripBom 为真时去掉开头的一个 BOM（只去一个：两个就不可用）；别的写入方或编辑器可能留下它。
+// 返回 null 也可能是合法 JSON 的 null，调用方一律只看它是不是对象，所以两者不必区分。
+const parseJson = (text: unknown, maxChars: number, stripBom = true): unknown => {
+  if (typeof text !== 'string' || text.length > maxChars) return null
+  try {
+    return JSON.parse(stripBom && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+  } catch {
+    return null
+  }
 }
 
 // 读已有快照。读不出、超过 MAX_SNAPSHOT_CHARS、非 JSON、schema 不是 1、windows 不是对象都当作没有；
@@ -243,14 +274,8 @@ const fromEngine = (list: unknown): { windows: Windows<Fresh>; drops: Drops } =>
 // （表示年龄未知、很旧），不能记成现在，否则会把来历不明的数据伪装成刚确认过的。
 const readStored = (text: unknown): Windows<Stored> => {
   const out: Windows<Stored> = {}
-  if (typeof text !== 'string' || text.length > MAX_SNAPSHOT_CHARS) return out
-  let obj: unknown
-  try {
-    // 已有快照可能带开头的 BOM（别的写入方或编辑器留下的），这里同样容忍。
-    obj = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
-  } catch {
-    return out
-  }
+  // 已有快照可能带开头的 BOM（别的写入方或编辑器留下的），这里同样容忍。
+  const obj = parseJson(text, MAX_SNAPSHOT_CHARS)
   if (!isRecord(obj) || obj.schema !== 1) return out
   const windows = obj.windows
   if (!isRecord(windows)) return out
@@ -269,26 +294,22 @@ const readStored = (text: unknown): Windows<Stored> => {
   return out
 }
 
-// 两个都有时，本次的数（n）是否取代已有的（o）。
-const replaces = (n: Fresh, o: Stored): boolean => {
-  // 同一周期内用量只增不减；更小的是旧数。相等时取新，用来刷新 observed_at。
-  if (Math.abs(n.resets_at - o.resets_at) <= SAME_PERIOD_SECONDS) return n.used_percentage >= o.used_percentage
-  // 更晚的周期是新窗口（百分比小也取新）；更早的周期是旧数。
-  return n.resets_at > o.resets_at
-}
+// 同一周期内 merge 的决定：用量只增不减，更小的是旧数；相等时取新，用来刷新 observed_at。
+const mergeSame: SamePeriod = (n, o) => (n.used_percentage >= o.used_percentage ? 'take' : 'hold')
 
-// 逐窗口合并。闲置会话重跑时拿到的是旧数，
-// 不能覆盖已确认的新数。held 只收录"本次有新读数、但替换规则留下旧值"的 kind，按 KINDS 顺序。
-// 例外：新读数的会话 id 与已存窗口的 session_id 相同（都不是 null）时一律取新。同一个会话的读数有先后之分，
-// 这一条一定比它自己写的上一条新；套餐升级之类让上限变高时，同一周期里百分比会掉下来，
-// 不放行的话要等到 resets_at 往后走（seven_day 最长七天）才显示新的数。别的会话写的更高的数仍然挡住更低的读数。
-// 两边的 id 只要有一个读不到（null），就不知道是不是同一个会话，不算。
-const merge = (
+// 逐窗口合并的循环，merge 与 mergeApp 共用，只有两件事由参数决定：同一周期内怎么办（samePeriod），以及
+// 会话 id 相同时是否一律取新（sessionWins）。缺席的一侧原样保留或直接取新；两边都有值时：
+// 先看会话（sessionWins 为真，且新读数与已存窗口的 session_id 相同、都不是 null），再看周期：
+// 同一周期交给 samePeriod；不同周期更晚的取新（百分比小也取新），更早的留旧。
+// held 只收录"本次有新读数、但留下了旧值"的 kind，按 KINDS 顺序。
+const mergeWindows = (
   old: Windows<Stored>,
   fresh: Windows<Fresh>,
   now: number,
   sessionId: string | null,
-): { windows: Windows<Stored>; held: Kind[] } => {
+  samePeriod: SamePeriod,
+  sessionWins: boolean,
+): MergeResult => {
   const merged: Windows<Stored> = {}
   const held: Kind[] = []
   for (const kind of KINDS) {
@@ -297,26 +318,40 @@ const merge = (
     if (n === undefined) {
       // 只有已有的：原样保留（含 observed_at、session_id）。
       if (o !== undefined) merged[kind] = o
-    } else if (o === undefined || (sessionId !== null && o.session_id === sessionId) || replaces(n, o)) {
+      continue
+    }
+    if (o === undefined) {
       merged[kind] = stored(n.used_percentage, n.resets_at, now, sessionId)
-    } else {
+      continue
+    }
+    let decision: Decision
+    if (sessionWins && sessionId !== null && o.session_id === sessionId) decision = 'take'
+    else if (Math.abs(n.resets_at - o.resets_at) <= SAME_PERIOD_SECONDS) decision = samePeriod(n, o, sessionId)
+    else decision = n.resets_at > o.resets_at ? 'take' : 'hold'
+    if (decision === 'hold') {
       merged[kind] = o
       held.push(kind)
+    } else if (decision === 'confirm') {
+      merged[kind] = stored(o.used_percentage, o.resets_at, now, sessionId)
+    } else {
+      merged[kind] = stored(n.used_percentage, n.resets_at, now, sessionId)
     }
   }
   return { windows: merged, held }
 }
 
+// merge 的规则：闲置会话重跑时拿到的是旧数，不能覆盖已确认的新数。
+// 例外：新读数的会话 id 与已存窗口的 session_id 相同（都不是 null）时一律取新，不论周期。同一个会话的读数有先后之分，
+// 这一条一定比它自己写的上一条新；套餐升级之类让上限变高时，同一周期里百分比会掉下来，
+// 不放行的话要等到 resets_at 往后走（seven_day 最长七天）才显示新的数。别的会话写的更高的数仍然挡住更低的读数。
+// 两边的 id 只要有一个读不到（null），就不知道是不是同一个会话，不算。
+const merge = (old: Windows<Stored>, fresh: Windows<Fresh>, now: number, sessionId: string | null): MergeResult =>
+  mergeWindows(old, fresh, now, sessionId, mergeSame, true)
+
 // 把请求或确认文件的文本解析成对象。不是字符串、超过 MAX_SMALL_CHARS、带坏 JSON、或根不是对象（含数组、null）都返回 null。
 // 只去掉开头一个 BOM，做法与 readStored 相同：别的写入方或编辑器可能留下它。
 const parseObject = (text: unknown): Record<string, unknown> | null => {
-  if (typeof text !== 'string' || text.length > MAX_SMALL_CHARS) return null
-  let obj: unknown
-  try {
-    obj = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
-  } catch {
-    return null
-  }
+  const obj = parseJson(text, MAX_SMALL_CHARS)
   return isRecord(obj) ? obj : null
 }
 
@@ -348,13 +383,8 @@ const textPayload = (content: unknown): Record<string, unknown> | null => {
   if (!Array.isArray(content)) return null
   for (const block of content as unknown[]) {
     if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') continue
-    if (block.text.length > MAX_PAYLOAD_CHARS) return null
-    let obj: unknown
-    try {
-      obj = JSON.parse(block.text)
-    } catch {
-      return null
-    }
+    // 不去 BOM：这里的文本与上面几个读取不同，原样保留这个差别。
+    const obj = parseJson(block.text, MAX_PAYLOAD_CHARS, false)
     return isRecord(obj) ? obj : null
   }
   return null
@@ -406,32 +436,22 @@ export const windowsFromApp = (
     if (kind === null) continue
     // 先到先得：该 kind 已有有效窗口就整项忽略，后面这项无效也不计丢弃。
     if (fresh[kind] !== undefined) continue
-    const percentUsed = finite(w.percentUsed)
-    if (percentUsed === null || percentUsed < 0) {
-      noteDrop(drops, 'bad_percent')
+    const f = freshFrom(w.percentUsed, w.resetsAt)
+    if (typeof f === 'string') {
+      noteDrop(drops, f)
       continue
     }
-    const resetsAt = w.resetsAt
-    if (typeof resetsAt !== 'string') {
-      noteDrop(drops, 'no_resets_at')
-      continue
-    }
-    const ms = Date.parse(resetsAt)
-    if (!Number.isFinite(ms)) {
-      noteDrop(drops, 'bad_resets_at')
-      continue
-    }
-    const resets = Math.floor(ms / 1000)
-    if (!(resets > 0)) {
-      noteDrop(drops, 'bad_resets_at')
-      continue
-    }
-    fresh[kind] = { used_percentage: percentUsed, resets_at: resets }
+    fresh[kind] = f
   }
   return { status, fresh, drops, count }
 }
 
-// 把桌面应用的账号读数并进已有快照。不复用 replaces / merge：账号读数是整数、会话读数最多一位小数，
+// 同一周期内 mergeApp 的决定：账号值低于已存值、且相差不到 1 点，视为同一个读数的取整差，保留已存的用量与重置时间并确认；
+// 其余（账号值不低，或低了 1 点以上）取账号值。
+const mergeAppSame: SamePeriod = (n, o) =>
+  n.used_percentage < o.used_percentage && o.used_percentage - n.used_percentage < 1 ? 'confirm' : 'take'
+
+// 把桌面应用的账号读数并进已有快照。与 merge 共用 mergeWindows，只有同一周期内的决定不同：账号读数是整数、会话读数最多一位小数，
 // 规则不同。held 只收录"本次有新读数、但留下了旧值"的 kind，按 KINDS 顺序。
 // 同一周期里，账号值不低于已存值就取账号值。否则若两者相差小于 1，视为同一个读数的取整差并确认：
 // 朴素的"只增不减"会把刚确认过的整数读数（例如会话读数 66.4、账号读数 66）当成旧数挡掉，
@@ -445,31 +465,7 @@ export const mergeApp = (
   fresh: Windows<Fresh>,
   now: number,
   sessionId: string | null,
-): { windows: Windows<Stored>; held: Kind[] } => {
-  const merged: Windows<Stored> = {}
-  const held: Kind[] = []
-  for (const kind of KINDS) {
-    const o = old[kind]
-    const n = fresh[kind]
-    if (n === undefined) {
-      if (o !== undefined) merged[kind] = o
-    } else if (o === undefined) {
-      merged[kind] = stored(n.used_percentage, n.resets_at, now, sessionId)
-    } else if (Math.abs(n.resets_at - o.resets_at) <= SAME_PERIOD_SECONDS) {
-      if (n.used_percentage < o.used_percentage && o.used_percentage - n.used_percentage < 1) {
-        merged[kind] = stored(o.used_percentage, o.resets_at, now, sessionId)
-      } else {
-        merged[kind] = stored(n.used_percentage, n.resets_at, now, sessionId)
-      }
-    } else if (n.resets_at > o.resets_at) {
-      merged[kind] = stored(n.used_percentage, n.resets_at, now, sessionId)
-    } else {
-      merged[kind] = o
-      held.push(kind)
-    }
-  }
-  return { windows: merged, held }
-}
+): MergeResult => mergeWindows(old, fresh, now, sessionId, mergeAppSame, false)
 
 // list 不是数组则为 []；否则取前 MAX_KINDS 个条目，三种 kind 原样保留，其余记 other。
 const kindsOf = (list: unknown): string[] => {
@@ -522,13 +518,7 @@ const readSid = async ($: EngineInterface): Promise<string | null> => {
 // 返回 null，与"读出来是空列表"区分开：调用方对前者要多一道确认才重新开始（见 logEvent）。
 // 去掉开头一个 BOM，做法与 readStored 相同：别的写入方或编辑器可能留下它，不能因此把整份日志判为坏的。
 const readEvents = (text: unknown): unknown[] | null => {
-  if (typeof text !== 'string' || text.length > MAX_EVENTS_CHARS) return null
-  let obj: unknown
-  try {
-    obj = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
-  } catch {
-    return null
-  }
+  const obj = parseJson(text, MAX_EVENTS_CHARS)
   if (!isRecord(obj) || obj.schema !== 1) return null
   const events = obj.events
   if (!Array.isArray(events)) return null
@@ -556,43 +546,62 @@ const tidyEvents = (list: unknown[]): unknown[] => {
   return out
 }
 
-// 采一次：转换、取时间与会话 id、读旧快照、合并、整体写回。
-// 返回结果对象供 logEvent 记录。预期内的失败（没有窗口、窗口全被丢、时钟坏、
-// 取会话 id 失败、读旧快照失败、写快照失败）不再抛出。
-const feed = async ($: EngineInterface, target: string, list: unknown): Promise<Outcome> => {
-  const n = Array.isArray(list) ? list.length : 0
-  const kinds = kindsOf(list)
-  if (n === 0) {
-    return { n, kinds, kept: 0, drops: {}, held: [], out: 'skipped', why: 'no_rate_limits', nowMs: null, sessionId: undefined }
-  }
-  const converted = fromEngine(list)
-  const fresh = converted.windows
-  const drops = converted.drops
-  const kept = Object.keys(fresh).length
-  if (kept === 0) {
-    return { n, kinds, kept: 0, drops, held: [], out: 'skipped', why: 'all_dropped', nowMs: null, sessionId: undefined }
-  }
-  const nowMs = await readNow($)
-  if (nowMs === null) {
-    return { n, kinds, kept, drops, held: [], out: 'skipped', why: 'bad_clock', nowMs: null, sessionId: undefined }
-  }
-  const now = nowMs / 1000
-  const sessionId = await readSid($)
+// 读旧快照、按 mergeFn 合并、整体写回：feed 与 refreshFromApp 共用，引擎调用的顺序是 读、写。
+// 读不出当作没有旧快照；写失败不抛出，由返回值的 failed 告诉调用方。held 在两种情形下都返回。
+// 时钟与会话 id 由调用方先读好再传进来，顺序在调用方那边决定。
+const writeMerged = async (
+  $: EngineInterface,
+  target: string,
+  fresh: Windows<Fresh>,
+  now: number,
+  sessionId: string | null,
+  mergeFn: typeof merge,
+): Promise<{ held: Kind[]; failed: false } | { held: Kind[]; failed: true; err: unknown }> => {
   let existing: unknown = null
   try {
     existing = await $.fs.read(target)
   } catch {
     // 不存在或读不了：当作没有已有快照。
   }
-  const merged = merge(readStored(existing), fresh, now, sessionId)
-  const windows = merged.windows
-  const held = merged.held
+  const merged = mergeFn(readStored(existing), fresh, now, sessionId)
   try {
-    await $.fs.write(target, JSON.stringify({ schema: 1, written_at: now, windows }, null, 2))
+    await $.fs.write(target, JSON.stringify({ schema: 1, written_at: now, windows: merged.windows }, null, 2))
   } catch (err) {
-    return { n, kinds, kept, drops, held, out: 'failed', why: 'write_error:' + errName(err), nowMs, sessionId }
+    return { held: merged.held, failed: true, err }
   }
-  return { n, kinds, kept, drops, held, out: 'wrote', why: '', nowMs, sessionId }
+  return { held: merged.held, failed: false }
+}
+
+// 采一次：转换、取时间与会话 id、读旧快照、合并、整体写回。
+// 返回结果对象供 logEvent 记录。预期内的失败（没有窗口、窗口全被丢、时钟坏、
+// 取会话 id 失败、读旧快照失败、写快照失败）不再抛出。
+const feed = async ($: EngineInterface, target: string, list: unknown): Promise<Outcome> => {
+  const n = Array.isArray(list) ? list.length : 0
+  const kinds = kindsOf(list)
+  if (n === 0) return outcome({ n, kinds, why: 'no_rate_limits' })
+  const converted = fromEngine(list)
+  const fresh = converted.windows
+  const drops = converted.drops
+  const kept = Object.keys(fresh).length
+  if (kept === 0) return outcome({ n, kinds, drops, why: 'all_dropped' })
+  const nowMs = await readNow($)
+  if (nowMs === null) return outcome({ n, kinds, kept, drops, why: 'bad_clock' })
+  const sessionId = await readSid($)
+  const written = await writeMerged($, target, fresh, nowMs / 1000, sessionId, merge)
+  if (written.failed) {
+    return outcome({
+      n,
+      kinds,
+      kept,
+      drops,
+      held: written.held,
+      out: 'failed',
+      why: 'write_error:' + errName(written.err),
+      nowMs,
+      sessionId,
+    })
+  }
+  return outcome({ n, kinds, kept, drops, held: written.held, out: 'wrote', nowMs, sessionId })
 }
 
 // 追加一条事件日志。整个函数永不抛出：日志失败不影响用量快照，也不改变事件结果。
@@ -654,8 +663,13 @@ const logEvent = async (
       }
     }
     events.push(entry)
-    // 紧凑写出（不缩进）：每个 hook 都要把整份日志读一遍、写一遍，缩进会让文件多出约七成（200 条典型条目 40 KB 对 68 KB）。
-    await $.fs.write(file, JSON.stringify({ schema: 1, events: events.slice(-EVENT_CAP) }))
+    // 每条紧凑、占一行、不缩进：每个 hook 都要把整份日志读一遍、写一遍，缩进会让文件多出约七成；一行一条便于在普通编辑器里看。
+    // 外层不用 JSON.stringify 整体写，因为那样条目之间没有换行。U+2028、U+2029 在 JSON 字符串里可以不转义，
+    // 但编辑器和一些工具把它们当作换行，所以也转成转义写法（解析出来的值不变）。
+    const lines = events
+      .slice(-EVENT_CAP)
+      .map((e) => JSON.stringify(e).replace(/[\u2028\u2029]/g, (c) => '\\u' + c.charCodeAt(0).toString(16)))
+    await $.fs.write(file, '{"schema":1,"events":[\n' + lines.join(',\n') + '\n]}')
     ctx.badEventsMark = null
   } catch {
     // 日志失败静默。
@@ -685,19 +699,6 @@ type WatchCtx = {
   busyPeriods: number
   runId: number
 }
-
-// 早退：没有写任何文件，也没有映射出任何窗口。sessionId 留 undefined，表示这次根本没去读会话 id。
-const skipOutcome = (why: string, nowMs: number | null): Outcome => ({
-  n: 0,
-  kinds: [],
-  kept: 0,
-  drops: {},
-  held: [],
-  out: 'skipped',
-  why,
-  nowMs,
-  sessionId: undefined,
-})
 
 // 超时的标记值：用 Symbol，不会与调用的真实返回值混淆。
 const TIMED_OUT = Symbol('app_call_timed_out')
@@ -792,16 +793,16 @@ const refreshFromApp = async (
   requestId: string,
 ): Promise<Outcome> => {
   const call = await callApp($)
-  if (call.kind === 'timeout') return skipOutcome('mcp_timeout', null)
+  if (call.kind === 'timeout') return outcome({ why: 'mcp_timeout' })
   if (call.kind === 'failed') {
     ctx.appFailAt = startMs
-    return skipOutcome('mcp_error:' + errName(call.err), null)
+    return outcome({ why: 'mcp_error:' + errName(call.err) })
   }
   ctx.appFailAt = null
   const res = call.res
-  if (isRecord(res) && res.isError === true) return skipOutcome('app_is_error', null)
+  if (isRecord(res) && res.isError === true) return outcome({ why: 'app_is_error' })
   const payload = extractPayload(res)
-  if (payload === null) return skipOutcome('parse_failed', null)
+  if (payload === null) return outcome({ why: 'parse_failed' })
   const { status, fresh, drops, count } = windowsFromApp(payload)
   const kinds: string[] = []
   for (const kind of KINDS) {
@@ -809,9 +810,7 @@ const refreshFromApp = async (
   }
   const kept = kinds.length
   const nowMs = await readNow($)
-  if (nowMs === null) {
-    return { n: count, kinds, kept, drops, held: [], out: 'skipped', why: 'bad_clock', nowMs: null, sessionId: undefined }
-  }
+  if (nowMs === null) return outcome({ n: count, kinds, kept, drops, why: 'bad_clock' })
   const now = nowMs / 1000
   if (status !== 'ok' || kept === 0) {
     const why = status !== 'ok' ? 'app_unavailable:' + (status ?? 'none').slice(0, 24) : 'no_windows'
@@ -821,43 +820,25 @@ const refreshFromApp = async (
         JSON.stringify({ schema: 1, id: requestId, status: 'unavailable', at: now, windows: 0 }, null, 2),
       )
     } catch (err) {
-      return {
-        n: count,
-        kinds,
-        kept,
-        drops,
-        held: [],
-        out: 'failed',
-        why: 'ack_write_error:' + errName(err),
-        nowMs,
-        sessionId: undefined,
-      }
+      return outcome({ n: count, kinds, kept, drops, out: 'failed', why: 'ack_write_error:' + errName(err), nowMs })
     }
-    return { n: count, kinds, kept, drops, held: [], out: 'skipped', why, nowMs, sessionId: undefined }
+    return outcome({ n: count, kinds, kept, drops, why, nowMs })
   }
   const sessionId = await readSid($)
-  let existing: unknown = null
-  try {
-    existing = await $.fs.read(target)
-  } catch {
-    // 不存在或读不了：当作没有。
-  }
-  const merged = mergeApp(readStored(existing), fresh, now, sessionId)
-  try {
-    await $.fs.write(target, JSON.stringify({ schema: 1, written_at: now, windows: merged.windows }, null, 2))
-  } catch (err) {
+  const written = await writeMerged($, target, fresh, now, sessionId, mergeApp)
+  if (written.failed) {
     // usage.json 没写上就不写确认，避免小窗读到旧快照却以为已经刷新。
-    return {
+    return outcome({
       n: count,
       kinds,
       kept,
       drops,
-      held: merged.held,
+      held: written.held,
       out: 'failed',
-      why: 'write_error:' + errName(err),
+      why: 'write_error:' + errName(written.err),
       nowMs,
       sessionId,
-    }
+    })
   }
   // windows 记的是映射成功的账号窗口数（含合并时保留了旧值的），不是 usage.json 里的窗口总数。
   // 小窗只读确认里的 schema、id、status。
@@ -867,19 +848,19 @@ const refreshFromApp = async (
       JSON.stringify({ schema: 1, id: requestId, status: 'ok', at: now, windows: kept }, null, 2),
     )
   } catch (err) {
-    return {
+    return outcome({
       n: count,
       kinds,
       kept,
       drops,
-      held: merged.held,
+      held: written.held,
       out: 'failed',
       why: 'ack_write_error:' + errName(err),
       nowMs,
       sessionId,
-    }
+    })
   }
-  return { n: count, kinds, kept, drops, held: merged.held, out: 'wrote', why: '', nowMs, sessionId }
+  return outcome({ n: count, kinds, kept, drops, held: written.held, out: 'wrote', nowMs, sessionId })
 }
 
 // 记下这段请求文本已经有了定论（无效、已见过、太旧或已处理），下一期读到完全相同的文本就不再解析。
@@ -936,7 +917,7 @@ const handleRequest = async (
     }
     const ack = parseAck(ackText)
     if (ack !== null && ack.id === req.id) {
-      await logEvent($, ctx, eventsTarget, 'refresh.app', skipOutcome('duplicate_ack', nowMs), [])
+      await logEvent($, ctx, eventsTarget, 'refresh.app', outcome({ why: 'duplicate_ack', nowMs }), [])
       return
     }
     // 恰好相差 APP_CALL_GAP_MS 就处理，只有更短才跳过。差为负说明系统时间被往回调过，限频期当作已过，
@@ -944,7 +925,7 @@ const handleRequest = async (
     if (ctx.lastCallAt !== null) {
       const sinceLast = nowMs - ctx.lastCallAt
       if (sinceLast >= 0 && sinceLast < APP_CALL_GAP_MS) {
-        await logEvent($, ctx, eventsTarget, 'refresh.app', skipOutcome('throttled', nowMs), [])
+        await logEvent($, ctx, eventsTarget, 'refresh.app', outcome({ why: 'throttled', nowMs }), [])
         return
       }
     }
@@ -954,13 +935,13 @@ const handleRequest = async (
     if (ctx.appFailAt !== null) {
       const sinceFail = nowMs - ctx.appFailAt
       if (sinceFail >= 0 && sinceFail < APP_BACKOFF_MS) {
-        await logEvent($, ctx, eventsTarget, 'refresh.app', skipOutcome('mcp_backoff', nowMs), [])
+        await logEvent($, ctx, eventsTarget, 'refresh.app', outcome({ why: 'mcp_backoff', nowMs }), [])
         return
       }
     }
     ctx.lastCallAt = nowMs
-    const outcome = await refreshFromApp($, ctx, nowMs, target, ackTarget, req.id)
-    await logEvent($, ctx, eventsTarget, 'refresh.app', outcome, [])
+    const result = await refreshFromApp($, ctx, nowMs, target, ackTarget, req.id)
+    await logEvent($, ctx, eventsTarget, 'refresh.app', result, [])
   } catch {
     // 任何异常直接结束。
   }
@@ -1083,22 +1064,10 @@ export const register: Register = (on, options) => {
       } catch (err) {
         usageErr = errName(err)
       }
-      const outcome: Outcome =
-        usageErr === null
-          ? await feed($, target, list)
-          : {
-              n: 0,
-              kinds: [],
-              kept: 0,
-              drops: {},
-              held: [],
-              out: 'skipped',
-              why: 'usage_error:' + usageErr,
-              nowMs: null,
-              sessionId: undefined,
-            }
-      nowMs = outcome.nowMs
-      await logEvent($, ctx, eventsTarget, 'session.start', outcome, [])
+      const result: Outcome =
+        usageErr === null ? await feed($, target, list) : outcome({ why: 'usage_error:' + usageErr })
+      nowMs = result.nowMs
+      await logEvent($, ctx, eventsTarget, 'session.start', result, [])
     } catch {
       // 失败静默：不抛出，不改变事件结果。
     }

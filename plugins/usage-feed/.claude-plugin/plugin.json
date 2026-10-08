@@ -1,6 +1,6 @@
 {
   "name": "usage-feed",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Write Claude plan usage windows to a local usage.json for the taskbar widget",
   "author": { "name": "imrooki" },
   "userConfig": {

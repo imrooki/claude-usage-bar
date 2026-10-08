@@ -42,6 +42,56 @@ const win = (used: number, resets: number, observed: number, sid: string | null)
   session_id: sid,
 })
 
+// 两个夹具共用的底层钩子：内存文件、fs.read / fs.write、会话 id 与用量，以及 session.start / session.measure 的回显。
+// 各夹具自己的失败注入由 faults 传进来：refuse 决定一次拒绝的形式，其余判断某次调用是否被拒。路径一律先 norm。
+type Shared = {
+  files: Map<string, string>
+  writes: { path: string; text: string }[]
+  reads: string[]
+  sessionId: unknown
+  usageLimits: unknown[]
+  lastStart: unknown
+  lastMeasure: unknown
+}
+type Faults = {
+  refuse: (what: string) => { deny: string }
+  readRefused: (path: string) => boolean
+  writeRefused: (path: string) => boolean
+  sessionRefused: (what: 'id' | 'usage') => boolean
+}
+const sharedHooks = (on: On, s: Shared, f: Faults): void => {
+  on('session.id', () => (f.sessionRefused('id') ? f.refuse('id') : { value: s.sessionId as string }))
+  on('session.usage', () =>
+    f.sessionRefused('usage')
+      ? f.refuse('usage')
+      : { value: { startedAt: 0, context: { window: 200000 }, rateLimits: s.usageLimits as never } },
+  )
+  on('fs.read', (_$, e) => {
+    const p = norm(e.path)
+    s.reads.push(p)
+    if (f.readRefused(p)) return f.refuse('read')
+    const text = s.files.get(p)
+    return text === undefined ? { deny: 'ENOENT' } : { value: text }
+  })
+  on('fs.write', (_$, e) => {
+    const p = norm(e.path)
+    if (f.writeRefused(p)) return f.refuse('write')
+    s.writes.push({ path: p, text: e.text })
+    s.files.set(p, e.text)
+    return { value: undefined }
+  })
+  on('session.start', (_$, e) => {
+    const value = { cwd: START_MARK + e.cwd }
+    s.lastStart = value
+    return value
+  })
+  on('session.measure', (_$, e) => {
+    const value = { changed: e.changed }
+    s.lastMeasure = value
+    return value
+  })
+}
+
 // 底层 hook：代表引擎，应答被测模块的每个调用，并把"经过的事件"全部记下来。
 const makeWorld = (on: On) => {
   const w = {
@@ -81,34 +131,11 @@ const makeWorld = (on: On) => {
     if (step !== undefined) return { value: step }
     return w.failing.has('clock') ? refuse('clock') : { value: w.nowMs as number }
   })
-  on('session.id', () => (w.failing.has('id') ? refuse('id') : { value: w.sessionId as string }))
-  on('session.usage', () =>
-    w.failing.has('usage')
-      ? refuse('usage')
-      : { value: { startedAt: 0, context: { window: 200000 }, rateLimits: w.usageLimits as never } },
-  )
-  on('fs.read', (_$, e) => {
-    const p = norm(e.path)
-    w.reads.push(p)
-    if (w.failing.has('read') || w.failReadPaths.has(p)) return refuse('read')
-    const text = w.files.get(p)
-    return text === undefined ? { deny: 'ENOENT' } : { value: text }
-  })
-  on('fs.write', (_$, e) => {
-    if (w.failing.has('write') || w.failWritePaths.has(norm(e.path))) return refuse('write')
-    w.writes.push({ path: e.path, text: e.text })
-    w.files.set(norm(e.path), e.text)
-    return { value: undefined }
-  })
-  on('session.start', (_$, e) => {
-    const value = { cwd: START_MARK + e.cwd }
-    w.lastStart = value
-    return value
-  })
-  on('session.measure', (_$, e) => {
-    const value = { changed: e.changed }
-    w.lastMeasure = value
-    return value
+  sharedHooks(on, w, {
+    refuse,
+    readRefused: (p) => w.failing.has('read') || w.failReadPaths.has(p),
+    writeRefused: (p) => w.failing.has('write') || w.failWritePaths.has(p),
+    sessionRefused: (what) => w.failing.has(what),
   })
   // 这个夹具没有可推进的时钟：拒绝 clock.every，间隔在第一期就结束，不会空转。每次布下都被拒绝，所以 w.timers 的长度就是布下定时器的次数。
   on('clock.every', () => ({ deny: 'no timers in this fixture' }))
@@ -1112,17 +1139,26 @@ for (const mode of ['deny', 'throw'] as const) {
   })
 }
 
-// 事件日志每个 hook 都整份读、整份写，所以写紧凑 JSON（一行，无缩进）；usage.json 仍是两格缩进，小窗两种都读得了。
-scenario('log: the events file is compact JSON on one line while usage.json stays indented', undefined, async (w, $) => {
+// 事件日志每个 hook 都整份读、整份写，所以每条紧凑、占一行（不缩进），最新的在最后；usage.json 仍是两格缩进，小窗两种都读得了。
+scenario('log: the events file has one compact entry per line while usage.json stays indented', undefined, async (w, $) => {
   await measure($, [lim('five_hour', 20, R5)])
   await measure($, [lim('five_hour', 21, R5), lim('seven_day', 8, R7)])
   await start($)
   const text = w.files.get(EVENTS)!
-  expect(logOf(w)).toHaveLength(3)
-  expect(text, 'no indentation or line breaks').toBe(JSON.stringify(JSON.parse(text)))
-  expect(text.includes('\n'), 'one line').toBe(false)
-  expect(text.startsWith('{"schema":1,"events":[{"t":'), 'starts compact').toBe(true)
+  const entries = logOf(w)
+  expect(entries).toHaveLength(3)
+  expect(text, 'wrapper line, one compact entry per line, newest last').toBe(
+    '{"schema":1,"events":[\n' + entries.map((e) => JSON.stringify(e)).join(',\n') + '\n]}',
+  )
+  expect(text.split('\n'), 'the wrapper opens and closes the list').toHaveLength(entries.length + 2)
+  expect(text.startsWith('{"schema":1,"events":[\n{"t":'), 'starts with the wrapper, then a compact entry').toBe(true)
   expect(w.files.get(TARGET), 'usage.json keeps its layout').toBe(JSON.stringify(snap(w), null, 2))
+  // 条目里的行分隔符（U+2028、U+2029）不能把一条拆成两行：写成转义形式，读回来的值不变。
+  await measureChanged($, [lim('five_hour', 22, R5)], ['a\u2028b', 'c\u2029d'])
+  const grown = w.files.get(EVENTS)!
+  expect(grown.split('\n'), 'still one line per entry').toHaveLength(logOf(w).length + 2)
+  expect(/[\u2028\u2029]/.test(grown), 'no raw line separator in the file, they are escaped').toBe(false)
+  expect(logOf(w)[logOf(w).length - 1]!.changed, 'the separators read back unchanged').toEqual(['a\u2028b', 'c\u2029d'])
 })
 
 scenario('log: entries have exactly the documented keys, and nothing identifying leaks into the file', undefined, async (w, $) => {
@@ -1141,7 +1177,7 @@ scenario('log: entries have exactly the documented keys, and nothing identifying
   for (let i = 0; i < keySets.length; i++) expect(Object.keys(entries[i]!), String(i)).toEqual(keySets[i])
 
   const text = w.files.get(EVENTS)!
-  expect(text).toBe(JSON.stringify(JSON.parse(text)))
+  expect(text, 'one compact entry per line').toBe('{"schema":1,"events":[\n' + entries.map((e) => JSON.stringify(e)).join(',\n') + '\n]}')
   const parsed = JSON.parse(text) as { schema: unknown; events: unknown }
   expect(Object.keys(parsed)).toEqual(['schema', 'events'])
   expect(parsed.schema).toBe(1)
@@ -1894,6 +1930,16 @@ test('app pure: extractPayload does not fall through after the first text block'
   ).toEqual({ plan: { status: 'ok' } })
 })
 
+test('app pure: extractPayload does not strip a BOM from a text block, unlike the files, so a BOM-prefixed reply is unusable', () => {
+  // 文件读取会去掉开头的一个 BOM；桌面应用返回的文本块原样解析，这个差别保留，并由这个用例钉住。
+  const good = JSON.stringify({ plan: { status: 'ok' } })
+  expect(extractPayload({ content: [{ type: 'text', text: '\uFEFF' + good }] }), 'one BOM').toBeNull()
+  expect(
+    extractPayload({ content: [{ type: 'text', text: '\uFEFF' + good }, { type: 'text', text: good }] }),
+    'no fall through to the next block',
+  ).toBeNull()
+})
+
 // 决定：structuredContent 是对象却没有 plan、文本块里有 plan 时，以文本块为准。MCP 约定文本块是同一份结果的 JSON 序列化，
 // 两边本应一致；结构化的那份缺了我们要的 plan、文本块里却有，说明结构化的那份是别的形状。照旧让结构化的赢，
 // 就会白白报 app_unavailable:none，小窗显示 no limits，尽管数据就在文本里。
@@ -2608,6 +2654,9 @@ const makeAppWorld = (on: On) => {
     failWritePaths: new Set<string>(), // 这些路径（norm 形式）的 fs.write 被拒绝
     sessionId: 'sess-new' as unknown,
     usageLimits: [] as unknown[], // session.usage 返回的限额列表；默认空，session.start 因此读不到时间
+    reads: [] as string[], // 共用钩子记下的 fs.read 路径（norm 形式），这一组不断言它
+    lastStart: undefined as unknown, // 同上：共用钩子记下的 session.start 返回值
+    lastMeasure: undefined as unknown, // 同上：共用钩子记下的 session.measure 返回值
     clock: undefined as unknown as MockClock,
   }
   // 最先注册，才能看到之后所有事件；clock.now 的故障注入也放在这里，因为不能再注册第二个 clock.now。
@@ -2633,16 +2682,11 @@ const makeAppWorld = (on: On) => {
     if (a.failExists) return { deny: 'exists refused' }
     return { value: a.files.has(norm(e.path)) }
   })
-  on('fs.read', (_$, e) => {
-    const text = a.files.get(norm(e.path))
-    return text === undefined ? { deny: 'ENOENT' } : { value: text }
-  })
-  on('fs.write', (_$, e) => {
-    const p = norm(e.path)
-    if (a.failWritePaths.has(p)) return { deny: 'write refused' }
-    a.writes.push({ path: p, text: e.text })
-    a.files.set(p, e.text)
-    return { value: undefined }
+  sharedHooks(on, a, {
+    refuse: (what) => ({ deny: what + ' refused' }),
+    readRefused: () => false,
+    writeRefused: (p) => a.failWritePaths.has(p),
+    sessionRefused: () => false,
   })
   on('mcp.call', (_$, e) => {
     a.mcpCalls.push({ server: e.server, tool: e.tool, args: e.args })
@@ -2661,10 +2705,6 @@ const makeAppWorld = (on: On) => {
     if (item === 'throw' || item === undefined) throw new Error('no such server')
     return { value: item as never }
   })
-  on('session.id', () => ({ value: a.sessionId as string }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: a.usageLimits as never } }))
-  on('session.start', (_$, e) => ({ cwd: START_MARK + e.cwd }))
-  on('session.measure', (_$, e) => ({ changed: e.changed }))
   on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   return a
 }

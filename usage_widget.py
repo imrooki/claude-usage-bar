@@ -5,7 +5,7 @@
 <data-dir>\\usage.json（由别的程序写入）。读数超过 30 分钟视为陈旧：进度条变成
 灰色，并显示读数的年龄（单栏写在重置时间右边，双栏写在页眉里）。右键 Refresh now
 之后，页眉或附加列（没有任何数据时是第二行）会短暂（约 2.5 秒）改写成刷新结果，
-如 new 14:58、same 14:29、no data、read error。本程序自己不联网、不读任何凭证文件；
+如 new 14:58、same 14:29、no data、no file、read error。本程序自己不联网、不读任何凭证文件；
 唯一例外是用户点 Refresh now 且 Codex 已启用时，会启动用户自己的 Codex 命令行
 （原生 codex.exe，固定参数，不经 shell，隐藏窗口）发一个很小的请求，让 Codex
 把最新额度写进它的会话日志，随后小窗照常只读这份日志；--no-codex-ping 可关闭。

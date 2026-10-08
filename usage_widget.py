@@ -536,6 +536,14 @@ def _snapshot_observed_at(snapshot):
     return latest
 
 
+def _ahead_of_clock(observed_at, now):
+    """观测时间是否比 now 超前超过 CODEX_FUTURE_TOLERANCE_SECONDS（时钟曾拨快后又校正的迹象）。
+
+    恰好超前容差那么多不算。_snapshot_is_older 与 CodexReader._latest_record 用同一个判断。
+    """
+    return observed_at - now > CODEX_FUTURE_TOLERANCE_SECONDS
+
+
 def _snapshot_is_older(found, current, now=None):
     """found 的观测时间是否早于已有快照。缺一边的时间时不算更旧。
 
@@ -548,8 +556,7 @@ def _snapshot_is_older(found, current, now=None):
     found_at = _snapshot_observed_at(found)
     if current_at is None or found_at is None:
         return False
-    if (now is not None
-            and current_at - now > CODEX_FUTURE_TOLERANCE_SECONDS):
+    if now is not None and _ahead_of_clock(current_at, now):
         return False
     return found_at < current_at
 
@@ -594,8 +601,8 @@ def _read_codex_tail(path):
 class CodexReader:
     """按日期目录找最近的几个 rollout，取其中观测时间最晚的限额记录。
 
-    只在最新文件的签名变化时重新评估；各文件尾部的解析结果按 (mtime_ns, size) 缓存，
-    没变的文件不重读。
+    只在候选文件的签名（每个候选的路径、mtime_ns、size）有变化时重新评估；各文件尾部的
+    解析结果按 (mtime_ns, size) 缓存，没变的文件不重读。
     """
 
     def __init__(self, home=None, clock=time.time):
@@ -650,30 +657,26 @@ class CodexReader:
             self._tail_cache = {}
             return False
 
-        newest = self._candidates[0]
-        signature = None
-        try:
-            newest_stat = os.stat(newest)
-            signature = (newest, newest_stat.st_mtime_ns, newest_stat.st_size)
-        except OSError:
-            signature = None
+        signature = self._candidates_signature()
         if not force and signature is not None and signature == self._signature:
             return False
 
-        found, found_path, read_error = self._latest_record(force)
+        found, found_path, read_error = self._latest_record(force, now)
         if read_error:
             # 有候选读失败：不记签名，下次轮询再试（SnapshotReader 也只在读成功后更新签名）。
             self._signature = None
-        elif signature is not None:
+        else:
+            # signature 为 None（有候选 stat 失败）时同样不记，下次轮询照常重新评估。
             self._signature = signature
         if found is None:
             # 一条记录都没有：读不了（read error）与还没有记录（no data）要分开。
             self.last_reason = read_error or "no_rate_limits"
             return False
         # 观测时间只增不减，强制刷新也一样：找到的记录比已有快照更旧就不采用。
-        # 从前 force 会放行更旧的记录，为的是时钟曾拨快后又校正的情形；那种情形由
-        # _snapshot_is_older 自己处理：当前快照的观测时间比 now 超前超过
-        # CODEX_FUTURE_TOLERANCE_SECONDS 时它不再拒绝较新的记录，所以不必再靠 force 放行。
+        # 从前 force 会放行更旧的记录，为的是时钟曾拨快后又校正的情形；那种情形现在由两处
+        # 自己处理：当前快照的观测时间比 now 超前超过 CODEX_FUTURE_TOLERANCE_SECONDS 时，
+        # _snapshot_is_older 不再拒绝较新的记录；_latest_record 又把这样超前的记录排在正常
+        # 记录之后，别的日志里的正常记录不会被它压住。所以不必再靠 force 放行。
         if _snapshot_is_older(found, self.snapshot, now):
             self.last_reason = ""
             return False
@@ -683,13 +686,36 @@ class CodexReader:
         self.last_reason = ""
         return changed
 
-    def _latest_record(self, force):
+    def _candidates_signature(self):
+        """所有候选文件的 (路径, mtime_ns, size)，按候选顺序排成元组；有一个 stat 失败就返回 None。
+
+        只看 mtime 最新的那个文件会漏掉别的日志里的新记录：它在上一次扫描时不是最新的，
+        追加之后候选顺序要等下一次扫描（最多 60 秒）才会变，期间每次轮询都看不见。
+        候选最多 CODEX_MAX_CANDIDATES 个，每次轮询多几次 stat；没变的文件的解析结果仍
+        按 (mtime_ns, size) 缓存，所以多的只是 stat，不会多读文件。
+        返回 None 表示这一轮无法确认“没变”：调用方照常重新评估，也不记签名。
+        """
+        parts = []
+        for path in self._candidates:
+            try:
+                file_stat = os.stat(path)
+            except OSError:
+                return None
+            parts.append((path, file_stat.st_mtime_ns, file_stat.st_size))
+        return tuple(parts)
+
+    def _latest_record(self, force, now):
         """解析每个候选文件的尾部，返回 (快照或 None, 路径或 None, 读取失败的原因或 "")。
 
         快照取观测时间最晚的那条。文件的 mtime 只说明谁最后被写过：在某个会话里敲提示词
         也会抬高它日志的 mtime，却不带新的限额记录；应用加命令行同时开着两个会话很常见，
         所以 mtime 最新的文件未必有最新的记录。候选都看，按记录自己的观测时间取最大；
         观测时间相同取排在前面的，即 mtime 较新的文件。
+
+        例外：观测时间比 now 超前超过 CODEX_FUTURE_TOLERANCE_SECONDS 的记录（写它的时候
+        时钟拨快了）排在所有没超前的记录之后。否则它的观测时间比之后写下的正常记录大，
+        要等时钟追上才会让位；排在后面，另一个日志里的正常记录就能马上顶替它。所有记录
+        都超前时没有可比的正常记录，照旧取观测时间最晚的。
 
         没变的文件不重读：按 (mtime_ns, size) 缓存各路径的解析结果，缓存只留当前候选。
         签名在读取之前取，读到的内容至少和签名一样新；读的当中文件又被追加，下次签名
@@ -700,7 +726,7 @@ class CodexReader:
         fresh = {}
         best = None
         best_path = None
-        best_at = None
+        best_rank = None
         read_error = ""
         for path in self._candidates:
             try:
@@ -721,10 +747,12 @@ class CodexReader:
             if parsed is None:
                 continue
             observed_at = _snapshot_observed_at(parsed)
-            if best is None or observed_at > best_at:
+            # 没超前的排在超前的前面；同一类里观测时间大的在前，相同则先遇到的（mtime 较新的文件）保住。
+            rank = (not _ahead_of_clock(observed_at, now), observed_at)
+            if best is None or rank > best_rank:
                 best = parsed
                 best_path = path
-                best_at = observed_at
+                best_rank = rank
         self._tail_cache = fresh
         return best, best_path, read_error
 
@@ -3331,18 +3359,14 @@ class WidgetApp:
             else:
                 self._caption = None
         # asking 在 ping 或等待桌面会话期间持续显示，不受 2.5 秒反馈到期影响。
-        # Codex 那一项只因 pinger.running 变成 asking，Claude 那一项只因
-        # app_refresher.waiting 变成 asking，两项互不影响，可以同时成立。
-        if self.pinger is not None and self.pinger.running:
-            base = list(captions) if captions else []
-            base = (base + ["", ""])[:2]
-            base[1] = CAPTION_ASKING
-            captions = tuple(base)
-        if self.app_refresher is not None and self.app_refresher.waiting:
-            base = list(captions) if captions else []
-            base = (base + ["", ""])[:2]
-            base[0] = CAPTION_ASKING
-            captions = tuple(base)
+        # 每一路只因自己有已发出、尚未收口的请求（_slot_busy）而把自己那一项（slot.index）
+        # 变成 asking，各路互不影响，可以同时成立。
+        for slot in REFRESH_SLOTS:
+            if self._slot_busy(slot):
+                base = list(captions) if captions else []
+                base = (base + ["", ""])[:2]
+                base[slot.index] = CAPTION_ASKING
+                captions = tuple(base)
         display = build_display(
             self._current_snapshot(), now, theme, scale, height,
             codex=codex_snapshot, codex_available=codex_available, captions=captions)
@@ -3373,9 +3397,10 @@ class WidgetApp:
     def _frame_image(self, display):
         """显示元组对应的未变暗画面，与上一次相同的元组直接复用。
 
-        元组相等画面就相同（见 build_display），所以点 Refresh now 时变暗、恢复和前面那次
-        带反馈文字的重绘用的是同一个元组，只渲染第一次，之后只重新预乘并提交。缓存里是
-        未变暗的原图：变暗由调用方用 dim_image 另取新图，绝不改它。渲染抛错时缓存保持原样。
+        元组相等画面就相同（见 build_display），所以点 Refresh now 时变暗和恢复用的是同一个
+        元组，只渲染第一次，之后只重新预乘并提交；没有请求改变画面时，前面那次带反馈文字的
+        重绘也是这个元组。缓存里是未变暗的原图：变暗由调用方用 dim_image 另取新图，绝不
+        改它。渲染抛错时缓存保持原样。
         """
         frame = self._frame
         if frame is not None and frame[0] == display:
@@ -3526,12 +3551,16 @@ class WidgetApp:
         driver = getattr(self, slot.driver)
         return driver is not None and bool(getattr(driver, slot.busy))
 
-    def _start_slot(self, slot, before):
+    def _start_slot(self, slot, before, redraw=True):
         """发出这一路的请求并起轮询计时器。只在 Refresh now 里调用，TIMER_POLL 绝不会走到。
 
         before 是点击那一刻这个提供方最新的 observed_at。冷却里只改这一路已有的文字
         （改不改成 cooldown 由 slot.caption 定）；请求没能发出（原因以 slot.error_prefix
         开头）就记日志并标成失败；正在等、没有可用目录这类原因什么也不改。内部绝不抛异常。
+
+        屏幕上的内容有变（asking、cooldown、失败文字）时默认马上重绘一次。redraw 为假时不
+        重绘：_refresh_now 之后紧跟着 _begin_flash 的强制重绘，那一帧已经带着这些文字，
+        不必每一路各画一帧。
         """
         try:
             driver = getattr(self, slot.driver)
@@ -3544,18 +3573,21 @@ class WidgetApp:
                     self._drop_slot(slot)
                     self._rewrite_slot_caption(
                         slot.index, lambda _text: slot.caption("", slot.drop_state))
-                self.refresh_view()
+                if redraw:
+                    self.refresh_view()
             elif reason == "cooldown":
                 self._rewrite_slot_caption(
                     slot.index, lambda text: slot.caption(text, "cooldown"))
-                self.refresh_view()
+                if redraw:
+                    self.refresh_view()
             elif reason in slot.skip_notes:
                 self.log.log(slot.log_kind, slot.skip_notes[reason])
             elif reason.startswith(slot.error_prefix):
                 self.log.log(slot.log_kind, reason)
                 self._rewrite_slot_caption(
                     slot.index, lambda _text: slot.caption("", slot.error_state))
-                self.refresh_view()
+                if redraw:
+                    self.refresh_view()
         except Exception as exc:
             self._log_exception(exc)
 
@@ -3597,14 +3629,15 @@ class WidgetApp:
 
     # Codex ping --------------------------------------------------------------
 
-    def _start_codex_ping(self, before_codex):
+    def _start_codex_ping(self, before_codex, redraw=True):
         """只在 Refresh now 里调用，TIMER_POLL 不会走到。
 
         Codex 没装或还没用过（没有 sessions 目录）时，不替用户去启动它。
+        redraw 原样交给 _start_slot。
         """
         if self.codex is None or not self.codex.available:
             return
-        self._start_slot(CODEX_SLOT, before_codex)
+        self._start_slot(CODEX_SLOT, before_codex, redraw)
 
     def _on_ping_timer(self):
         """ping 的结果只在这里统一收口。只换 Codex 那一项（下标 1），
@@ -3620,26 +3653,23 @@ class WidgetApp:
         return caption_text(
             before, _snapshot_observed_at(self.codex.snapshot), self.codex.last_reason)
 
-    def _stop_ping(self):
-        """停掉正在跑的 ping。可重复调用，绝不抛异常。"""
-        self._stop_slot(CODEX_SLOT)
-
-    def _drop_ping(self):
-        """轮询计时器建不起来，ping 会一直停在 asking，所以放弃它。"""
-        self._drop_slot(CODEX_SLOT)
-
     # 桌面会话请求 ------------------------------------------------------------
 
-    def _start_app_refresh(self, before_claude):
-        """只在 Refresh now 里调用，TIMER_POLL 绝不会走到。内部绝不抛异常。"""
-        self._start_slot(APP_SLOT, before_claude)
+    def _start_app_refresh(self, before_claude, redraw=True):
+        """只在 Refresh now 里调用，TIMER_POLL 绝不会走到。内部绝不抛异常。
+        redraw 原样交给 _start_slot。"""
+        self._start_slot(APP_SLOT, before_claude, redraw)
 
     def _on_app_timer(self):
         """TIMER_APP：读确认文件，收口后只换 Claude 那一项。"""
         self._poll_slot(APP_SLOT, self._finish_app_refresh)
 
     def _finish_app_refresh(self, outcome, _detail, before):
-        """请求收口：返回 Claude 那一项的反馈文字。只有 ok 才重读 usage.json。"""
+        """请求收口：返回 Claude 那一项的反馈文字。只有 ok 才重读 usage.json。
+
+        超时而 usage.json 又不在（上一次读取报 missing）时写 no file，不写 no session：
+        usage.json 不在，多半是小窗与插件指着不同的文件夹，no session 会把这个原因盖住。
+        """
         if outcome == "ok":
             self.reader.refresh(force=True)
             reason = self.reader.last_reason
@@ -3650,15 +3680,9 @@ class WidgetApp:
         if outcome == "unavailable":
             return app_refresh_caption("", "no_limits")
         self.log.log("AppRefresh", "no answer within %d s" % APP_REFRESH_WAIT_SECONDS)
+        if self.reader.last_reason == "missing":
+            return CAPTION_NO_FILE
         return app_refresh_caption("", "no_session")
-
-    def _stop_app_refresh(self):
-        """停掉正在等的请求。可重复调用，绝不抛异常。"""
-        self._stop_slot(APP_SLOT)
-
-    def _drop_app_refresh(self):
-        """轮询计时器建不起来，Claude 项会一直停在 asking，所以放弃这次请求。"""
-        self._drop_slot(APP_SLOT)
 
     def poll_theme(self):
         light = read_light_theme()
@@ -3748,6 +3772,9 @@ class WidgetApp:
         poll_snapshot 读完就清掉；这里的 finally 保住异常路径也清掉。
         之后（读完数据源、反馈文字已经挂上）才请求 Codex 与桌面会话，这样
         asking / cooldown 是在已有反馈文字上改。
+        两路发出请求后各自不重绘（redraw 为假）：紧接着 _begin_flash 的强制重绘那一帧已经
+        带着 asking / cooldown，每路各画一帧只是白画。例外是已经在闪的时候：_begin_flash
+        那时不再重绘，两路就仍然各自重绘，文字才不会晚到闪烁结束。
         """
         if before is None:
             before = self._latest_observed()
@@ -3756,15 +3783,17 @@ class WidgetApp:
             self.poll_snapshot(force=True)
         finally:
             self._caption_before = None
-        self._safe(self._start_codex_ping, before[1])
-        self._safe(self._start_app_refresh, before[0])
+        redraw = self._flashing  # 已经在闪时 _begin_flash 不画，两路自己画
+        self._safe(self._start_codex_ping, before[1], redraw)
+        self._safe(self._start_app_refresh, before[0], redraw)
         self._begin_flash()
 
     def _begin_flash(self):
         """刷新后把画面短暂变暗再恢复，数据没变时点击也有可见反馈。
 
-        闪烁不进显示元组，所以开始和结束都用 force=True 重绘；显示元组通常与前面那次带
-        反馈文字的重绘相同，此时命中渲染缓存，只重新预乘并提交，不再渲染。已经在闪时
+        闪烁不进显示元组，所以开始和结束都用 force=True 重绘。开始变暗的这一帧带着刚发出的
+        请求的 asking / cooldown（两路请求不再各自重绘），是这次点击的最后一个新画面，渲染
+        一次；结束时显示元组不变，命中渲染缓存，只重新预乘并提交，不再渲染。已经在闪时
         再点刷新只重设定时器，不再多画一次。重绘抛错也要建上定时器；定时器建不起来就
         立刻取消变暗，避免小窗一直停在暗的画面上。
         """
@@ -3837,8 +3866,8 @@ class WidgetApp:
         if self.exiting:
             return
         self.exiting = True
-        self._stop_ping()
-        self._stop_app_refresh()
+        for slot in REFRESH_SLOTS:
+            self._stop_slot(slot)
         self._flashing = False
         self._caption = None
         self.w32.unwatch_window_events()
@@ -3921,8 +3950,8 @@ class WidgetApp:
                 self.w32.unwatch_window_events()
                 self.w32.unregister_class()
         finally:
-            self._stop_ping()
-            self._stop_app_refresh()
+            for slot in REFRESH_SLOTS:
+                self._stop_slot(slot)
             _APP = None
         return 0
 

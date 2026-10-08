@@ -4032,29 +4032,36 @@ def run_app(opts, log):
         say("ClaudeUsageWidget is already running; exiting")
         return 0
     if not handle:
+        # 没能确认是唯一实例：不建数据目录；日志只在目录已经存在时才写进去。
         log.log("MutexError", "CreateMutexW failed, error %d" % error)
         return 1
     try:
+        prepare_data_folder(opts, log)
         w32.set_dpi_awareness()
         return WidgetApp(opts, w32, log).run()
     finally:
         w32.close_handle(handle)
 
 
-def main(argv=None):
-    opts = parse_args(sys.argv[1:] if argv is None else argv)
-    if opts.selftest_render:
-        return selftest_render(opts.selftest_render)
+def prepare_data_folder(opts, log):
+    """只在确认是唯一实例之后调用。第二次启动在互斥量处已经退出，不建目录，也不写日志。"""
     # 数据目录不存在就建（小窗的文件都写在这里）。建不成也照常启动，只说一声：日志也写不进去。
     try:
         os.makedirs(opts.data_dir, exist_ok=True)
     except (OSError, ValueError) as exc:
         say("data folder %s could not be created: %s: %s"
             % (opts.data_dir, type(exc).__name__, exc))
-    log = ErrorLog(opts.data_dir)
     for text in opts.warnings:
         log.log("Argument", text)
         say(text)
+
+
+def main(argv=None):
+    opts = parse_args(sys.argv[1:] if argv is None else argv)
+    if opts.selftest_render:
+        return selftest_render(opts.selftest_render)
+    # ErrorLog 的构造不碰磁盘；目录和参数警告都等 run_app 确认唯一实例之后再处理。
+    log = ErrorLog(opts.data_dir)
     try:
         return run_app(opts, log)
     except Exception as exc:

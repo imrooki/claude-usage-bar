@@ -5,8 +5,8 @@
 // 模块自己传出的原始字符串（正斜杠、去末尾斜杠）不在这里断言。
 import { test, expect, mock } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On } from 'claude-code'
-import { parseRequest, parseAck, extractPayload, windowsFromApp, mergeApp } from '../hooks/register.ts'
+import type { EngineInterface, On } from 'claude-code'
+import { parseRequest, parseAck, extractPayload, windowsFromApp, mergeApp, callApp } from '../hooks/register.ts'
 
 // 假路径，只是内存假文件系统里的键，不对应任何真实目录。
 const DATA_DIR = 'D:/usage-feed-test/mem'
@@ -262,6 +262,70 @@ scenario('merge 5: older period keeps old even when the percentage is larger', u
   }
 })
 
+// 同一个会话的读数有先后之分，一定比它自己写的上一条新。套餐升级之类让上限变高时，同一周期里百分比会掉下来；
+// 不放行的话要等 resets_at 往后走（seven_day 最长七天）才显示新的数。世界里的会话 id 是 'sess-new'。
+scenario('merge 6: a reading from the session that wrote the stored value replaces it, also when lower', undefined, async (w, $) => {
+  const cases: [string, number, number][] = [
+    ['lower, same reset (the limit was raised mid-period)', 12, R5],
+    ['lower, +120 s is still the same period', 12, R5 + 120],
+    ['lower, -120 s is still the same period', 12, R5 - 120],
+    ['lower and from an earlier period: the session reports its own latest', 12, R5 - 5 * 3600],
+  ]
+  for (const [label, pct, resets] of cases) {
+    reset(w)
+    stage(w, { five_hour: ow(40, R5, T0 - 300, 'sess-new'), seven_day: ow(55, R7, T0 - 300, 'old-b') })
+    await measure($, [lim('five_hour', pct, resets)])
+    expect(snap(w).windows.five_hour, label).toEqual(win(pct, resets, T0, 'sess-new'))
+    expect(lastLog(w).held, label).toEqual([])
+    expect(snap(w).windows.seven_day, label + ': a kind not in the reading is untouched').toEqual(win(55, R7, T0 - 300, 'old-b'))
+  }
+})
+
+scenario('merge 6: the rule is per window, so another session\'s window in the same reading is still held', undefined, async (w, $) => {
+  stage(w, { five_hour: ow(40, R5, T0 - 300, 'sess-new'), seven_day: ow(55, R7, T0 - 300, 'old-b') })
+  await measure($, [lim('five_hour', 12, R5), lim('seven_day', 10, R7)])
+  expect(snap(w).windows.five_hour).toEqual(win(12, R5, T0, 'sess-new'))
+  expect(snap(w).windows.seven_day).toEqual(win(55, R7, T0 - 300, 'old-b'))
+  expect(lastLog(w).held).toEqual(['seven_day'])
+})
+
+scenario('merge 6: a lower reading from another session, or from a session whose id is unknown, is still held', undefined, async (w, $) => {
+  // 别的会话写的：照旧挡住。
+  stage(w, { five_hour: ow(40, R5, T0 - 300, 'old-a') })
+  await measure($, [lim('five_hour', 12, R5)])
+  expect(snap(w).windows.five_hour, 'another session').toEqual(win(40, R5, T0 - 300, 'old-a'))
+  expect(lastLog(w).held, 'another session').toEqual(['five_hour'])
+
+  // 本次读不到会话 id（null）：不知道是不是同一个会话，不算；已存的 session_id 是 null 时也一样。
+  reset(w)
+  w.failing.add('id')
+  stage(w, { five_hour: ow(40, R5, T0 - 300, 'sess-new') })
+  await measure($, [lim('five_hour', 12, R5)])
+  expect(snap(w).windows.five_hour, 'this id unknown').toEqual(win(40, R5, T0 - 300, 'sess-new'))
+  expect(lastLog(w).held, 'this id unknown').toEqual(['five_hour'])
+
+  reset(w)
+  stage(w, { five_hour: ow(40, R5, T0 - 300, null) })
+  await measure($, [lim('five_hour', 12, R5)])
+  expect(snap(w).windows.five_hour, 'both ids unknown').toEqual(win(40, R5, T0 - 300, null))
+  expect(lastLog(w).held, 'both ids unknown').toEqual(['five_hour'])
+
+  w.failing.delete('id')
+  reset(w)
+  stage(w, { five_hour: ow(40, R5, T0 - 300, null) })
+  await measure($, [lim('five_hour', 12, R5)])
+  expect(snap(w).windows.five_hour, 'stored id unknown').toEqual(win(40, R5, T0 - 300, null))
+  expect(lastLog(w).held, 'stored id unknown').toEqual(['five_hour'])
+})
+
+scenario('merge 6: session.start follows the same rule', undefined, async (w, $) => {
+  stage(w, { five_hour: ow(40, R5, T0 - 300, 'sess-new') })
+  w.usageLimits = [lim('five_hour', 12, R5)]
+  await start($)
+  expect(snap(w).windows.five_hour).toEqual(win(12, R5, T0, 'sess-new'))
+  expect(lastLog(w).held).toEqual([])
+})
+
 // ---------------------------------------------------------------- 窗口转换
 
 scenario('convert: unknown kind, bad percentUsed or bad resetsAt are dropped', undefined, async (w, $) => {
@@ -412,6 +476,31 @@ scenario('existing: a leading BOM is tolerated and unknown window names are drop
   w.files.set(TARGET, String.fromCharCode(0xfeff) + text)
   await measure($, [lim('five_hour', 20, R5)])
   expect(snap(w).windows).toEqual({ five_hour: win(20, R5, T0, 'sess-new'), seven_day: win(55, R7, T0 - 600, 'old-b') })
+})
+
+// 用量快照超过 64 KB（按字符数）当作没有，与解析失败走同一条路：不解析，这次写出的小文件把它换掉。
+scenario('existing: a snapshot over 64 KB is treated as absent, one of exactly 64 KB is merged', undefined, async (w, $) => {
+  const CAP = 64 * 1024
+  const text = JSON.stringify({ schema: 1, written_at: T0 - 100, windows: { seven_day: ow(55, R7, T0 - 600, 'old-b') } })
+  const padded = (size: number) => text + ' '.repeat(size - text.length)
+  w.files.set(TARGET, padded(CAP))
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(snap(w).windows, 'exactly 64 KB: the other kind is kept').toEqual({
+    five_hour: win(20, R5, T0, 'sess-new'),
+    seven_day: win(55, R7, T0 - 600, 'old-b'),
+  })
+
+  reset(w)
+  w.files.set(TARGET, padded(CAP + 1))
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(snap(w).windows, 'one over: absent, replaced by the small file').toEqual({ five_hour: win(20, R5, T0, 'sess-new') })
+
+  // 别的写入方留下的几 MB 文件：照样当作没有，被这次写出的小文件换掉。
+  reset(w)
+  w.files.set(TARGET, 'x'.repeat(3 * 1024 * 1024))
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(snap(w).windows, 'a multi-MB foreign file').toEqual({ five_hour: win(20, R5, T0, 'sess-new') })
+  expect(w.files.get(TARGET)!.length).toBeLessThan(1000)
 })
 
 // ---------------------------------------------------------------- dataDir 安全闸
@@ -1023,6 +1112,19 @@ for (const mode of ['deny', 'throw'] as const) {
   })
 }
 
+// 事件日志每个 hook 都整份读、整份写，所以写紧凑 JSON（一行，无缩进）；usage.json 仍是两格缩进，小窗两种都读得了。
+scenario('log: the events file is compact JSON on one line while usage.json stays indented', undefined, async (w, $) => {
+  await measure($, [lim('five_hour', 20, R5)])
+  await measure($, [lim('five_hour', 21, R5), lim('seven_day', 8, R7)])
+  await start($)
+  const text = w.files.get(EVENTS)!
+  expect(logOf(w)).toHaveLength(3)
+  expect(text, 'no indentation or line breaks').toBe(JSON.stringify(JSON.parse(text)))
+  expect(text.includes('\n'), 'one line').toBe(false)
+  expect(text.startsWith('{"schema":1,"events":[{"t":'), 'starts compact').toBe(true)
+  expect(w.files.get(TARGET), 'usage.json keeps its layout').toBe(JSON.stringify(snap(w), null, 2))
+})
+
 scenario('log: entries have exactly the documented keys, and nothing identifying leaks into the file', undefined, async (w, $) => {
   await measure($, [lim('five_hour', 20, R5)])
   await measure($, [lim('five_hour', 10, R5), { kind: 'monthly', percentUsed: 1, resetsAt: iso(R5) }])
@@ -1039,7 +1141,7 @@ scenario('log: entries have exactly the documented keys, and nothing identifying
   for (let i = 0; i < keySets.length; i++) expect(Object.keys(entries[i]!), String(i)).toEqual(keySets[i])
 
   const text = w.files.get(EVENTS)!
-  expect(text).toBe(JSON.stringify(JSON.parse(text), null, 2))
+  expect(text).toBe(JSON.stringify(JSON.parse(text)))
   const parsed = JSON.parse(text) as { schema: unknown; events: unknown }
   expect(Object.keys(parsed)).toEqual(['schema', 'events'])
   expect(parsed.schema).toBe(1)
@@ -1205,11 +1307,13 @@ scenario('log: only the most recent 200 entries are kept', undefined, async (w, 
   for (let i = 1; i < kept.length; i++) expect(kept[i]!.t - kept[i - 1]!.t).toBe(1000)
 })
 
-scenario('log: an unusable existing log is replaced by a fresh one that holds only the new entry', undefined, async (w, $) => {
+// 非空却读不出的日志（多半是另一个会话正写到一半）先不动：第一次只记下、这一次不写（丢这一条），
+// 下一次 hook 读到的仍是同一段才认定真坏了，从空日志重新开始。文件不存在、读失败或是空文件则直接重新开始。
+const UNUSABLE_LOGS: [string, string][] = (() => {
   const sd = [{ seq: 1 }]
-  const bad: [string, string][] = [
+  return [
     ['broken JSON', 'not json{'],
-    ['empty text', ''],
+    ['whitespace only', '   '],
     ['JSON null', 'null'],
     ['top level array', '[]'],
     ['top level number', '42'],
@@ -1221,25 +1325,219 @@ scenario('log: an unusable existing log is replaced by a fresh one that holds on
     ['events null', JSON.stringify({ schema: 1, events: null })],
     ['events string', JSON.stringify({ schema: 1, events: 'x' })],
     ['events missing', JSON.stringify({ schema: 1 })],
+    ['two leading BOMs (only one is stripped)', '﻿﻿' + JSON.stringify({ schema: 1, events: sd })],
   ]
-  for (const [label, text] of bad) {
+})()
+
+scenario('log: an unusable existing log is left alone once and replaced when the same text is still there at the next entry', undefined, async (w, $) => {
+  for (const [label, text] of UNUSABLE_LOGS) {
     reset(w)
     w.files.set(EVENTS, text)
     await measure($, [lim('five_hour', 20, R5)])
-    expect(logOf(w), label).toHaveLength(1)
+    // 第一次：日志原样留着，这一条没记，usage.json 照常写。
+    expect(w.files.get(EVENTS), label + ': first entry leaves the log alone').toBe(text)
+    expect(writesTo(w, EVENTS), label + ': no log write').toHaveLength(0)
+    expect(snap(w).windows.five_hour, label).toEqual(win(20, R5, T0, 'sess-new'))
+    // 第二次：仍是同一段，从空日志重新开始，里面只有这一条。
+    await measure($, [lim('five_hour', 21, R5)])
+    expect(logOf(w), label + ': second entry starts a fresh log').toHaveLength(1)
     expect(lastLog(w).ev, label).toBe('session.measure')
     expect(lastLog(w).out, label).toBe('wrote')
     expect(w.files.get(EVENTS), label).not.toContain('seq')
-    expect(snap(w).windows.five_hour, label).toEqual(win(20, R5, T0, 'sess-new'))
+    expect(snap(w).windows.five_hour, label).toEqual(win(21, R5, T0, 'sess-new'))
   }
 
   reset(w)
-  w.files.set(EVENTS, JSON.stringify({ schema: 1, events: sd }))
+  w.files.set(EVENTS, JSON.stringify({ schema: 1, events: [{ seq: 1 }] }))
   await measure($, [lim('five_hour', 20, R5)])
   expect(logOf(w)).toHaveLength(2)
   expect(logOf(w)[0] as unknown as { seq: number }).toEqual({ seq: 1 })
   expect(lastLog(w).ev).toBe('session.measure')
   expect(lastLog(w).out).toBe('wrote')
+})
+
+// 事件日志超过 256 KB（按字符数）与坏文件同一条路：不解析，当作读不出，走两次确认。本插件自己的日志最大约 130 KB。
+scenario('log: an events log over 256 KB is unusable, one of exactly 256 KB is read', undefined, async (w, $) => {
+  const CAP = 256 * 1024
+  const log = JSON.stringify({ schema: 1, events: [{ seq: 1 }] })
+  const padded = (size: number) => log + ' '.repeat(size - log.length)
+  w.files.set(EVENTS, padded(CAP))
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(logOf(w), 'exactly 256 KB: read, the old entry is kept').toHaveLength(2)
+  expect(logOf(w)[0] as unknown as { seq: number }).toEqual({ seq: 1 })
+
+  // 大字符串用 === 比，不用 toBe：断言失败时 toBe 会去渲染几 MB 的差异，把测试进程拖死。
+  reset(w)
+  const over = padded(CAP + 1)
+  w.files.set(EVENTS, over)
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.files.get(EVENTS) === over, 'one over: left alone the first time').toBe(true)
+  await measure($, [lim('five_hour', 21, R5)])
+  expect(logOf(w), 'and replaced the second time').toHaveLength(1)
+
+  // 别的写入方留下的几 MB 文件：同样的路，不会被每个 hook 解析一遍，第二次就被小日志换掉。
+  reset(w)
+  const huge = JSON.stringify({ schema: 1, events: [{ blob: 'x'.repeat(3 * 1024 * 1024) }] })
+  w.files.set(EVENTS, huge)
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.files.get(EVENTS) === huge, 'left alone the first time').toBe(true)
+  await measure($, [lim('five_hour', 21, R5)])
+  expect(logOf(w)).toHaveLength(1)
+  expect(w.files.get(EVENTS)!.length).toBeLessThan(1000)
+})
+
+scenario('log: a missing, empty or unreadable log starts fresh at once, without a second look', undefined, async (w, $) => {
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(logOf(w), 'missing').toHaveLength(1)
+
+  reset(w)
+  w.files.set(EVENTS, '')
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(logOf(w), 'empty file').toHaveLength(1)
+  expect(lastLog(w).out).toBe('wrote')
+
+  reset(w)
+  w.files.set(EVENTS, JSON.stringify({ schema: 1, events: [{ seq: 1 }, { seq: 2 }] }))
+  w.failReadPaths.add(EVENTS)
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(logOf(w), 'unreadable').toHaveLength(1)
+  expect(w.files.get(EVENTS)).not.toContain('seq')
+})
+
+scenario('log: a half-written log costs one entry, not the whole log', undefined, async (w, $) => {
+  // 另一个会话写到一半：这一次读到的是被截断的文本。
+  for (let i = 0; i < 3; i++) {
+    w.nowMs = NOW_MS + i * 1000
+    await measure($, [lim('five_hour', 20 + i, R5)])
+  }
+  const whole = w.files.get(EVENTS)!
+  expect(logOf(w)).toHaveLength(3)
+  const cut = whole.slice(0, Math.floor(whole.length / 2))
+  w.files.set(EVENTS, cut)
+  w.nowMs = NOW_MS + 3000
+  await measure($, [lim('five_hour', 23, R5)])
+  expect(w.files.get(EVENTS), 'the half-written text is not overwritten').toBe(cut)
+  expect(snap(w).windows.five_hour.used_percentage, 'usage.json is unaffected').toBe(23)
+  // 对方写完了：它自己的那份完整日志（再加它的一条）还在，我们接着追加，之前的记录一条没丢。
+  const finished = JSON.stringify({
+    schema: 1,
+    events: [...(JSON.parse(whole) as { events: unknown[] }).events, { seq: 'theirs' }],
+  })
+  w.files.set(EVENTS, finished)
+  w.nowMs = NOW_MS + 4000
+  await measure($, [lim('five_hour', 24, R5)])
+  const entries = logOf(w)
+  expect(entries, 'three old + theirs + this one; only the cut-off entry is lost').toHaveLength(5)
+  expect(entries.map((e) => e.t).filter((t) => t !== undefined), 'old entries kept in order').toEqual([
+    NOW_MS,
+    NOW_MS + 1000,
+    NOW_MS + 2000,
+    NOW_MS + 4000,
+  ])
+  expect(entries[3] as unknown as { seq: string }).toEqual({ seq: 'theirs' })
+})
+
+scenario('log: a different unusable text at the next entry starts the count again', undefined, async (w, $) => {
+  w.files.set(EVENTS, 'first bad text{')
+  await measure($, [lim('five_hour', 20, R5)])
+  w.files.set(EVENTS, 'second bad text{')
+  await measure($, [lim('five_hour', 21, R5)])
+  expect(w.files.get(EVENTS), 'a different text is a first sighting again').toBe('second bad text{')
+  await measure($, [lim('five_hour', 22, R5)])
+  expect(logOf(w), 'the second sighting of it resets').toHaveLength(1)
+})
+
+scenario('log: two unusable texts that differ only in the middle are told apart', undefined, async (w, $) => {
+  // 同样的长度、同样的开头和结尾，只差中间一个字符：记号要看全文，不能只取首尾各一截。
+  const bad = (middle: string) => '{' + 'a'.repeat(300) + middle + 'a'.repeat(300) + '{'
+  w.files.set(EVENTS, bad('1'))
+  await measure($, [lim('five_hour', 20, R5)])
+  w.files.set(EVENTS, bad('2'))
+  await measure($, [lim('five_hour', 21, R5)])
+  expect(w.files.get(EVENTS) === bad('2'), 'the changed text is a first sighting, not a second').toBe(true)
+  await measure($, [lim('five_hour', 22, R5)])
+  expect(logOf(w), 'and only its own second sighting resets').toHaveLength(1)
+})
+
+scenario('log: a log that was repaired in between is appended to, and a later damage counts from the start', undefined, async (w, $) => {
+  const bad = 'not json{'
+  w.files.set(EVENTS, bad)
+  await measure($, [lim('five_hour', 20, R5)])
+  expect(w.files.get(EVENTS)).toBe(bad)
+  w.files.set(EVENTS, JSON.stringify({ schema: 1, events: [{ seq: 1 }] }))
+  await measure($, [lim('five_hour', 21, R5)])
+  expect(logOf(w), 'appended, not reset').toHaveLength(2)
+  // 同一段坏文本再出现：之前的记号已随成功的写入清掉，这是第一次，不是第二次。
+  w.files.set(EVENTS, bad)
+  await measure($, [lim('five_hour', 22, R5)])
+  expect(w.files.get(EVENTS), 'a first sighting again').toBe(bad)
+  await measure($, [lim('five_hour', 23, R5)])
+  expect(logOf(w), 'now it resets').toHaveLength(1)
+})
+
+scenario('log: a log that cannot be written leaves the count standing so the next entry tries again', undefined, async (w, $) => {
+  w.files.set(EVENTS, 'not json{')
+  await measure($, [lim('five_hour', 20, R5)])
+  w.failWritePaths.add(EVENTS)
+  await measure($, [lim('five_hour', 21, R5)])
+  expect(w.files.get(EVENTS), 'the reset write was refused').toBe('not json{')
+  w.failWritePaths.delete(EVENTS)
+  await measure($, [lim('five_hour', 22, R5)])
+  expect(logOf(w), 'still the same text, so the next try resets at once').toHaveLength(1)
+})
+
+// 带 BOM 的日志（别的写入方或编辑器存过一次）与快照、请求、确认一样能读，不能因此被当成坏的而重置。
+scenario('log: an existing log with one leading BOM is read and its entries are kept', undefined, async (w, $) => {
+  w.files.set(EVENTS, '﻿' + JSON.stringify({ schema: 1, events: [{ seq: 1 }, { seq: 2 }] }))
+  await measure($, [lim('five_hour', 20, R5)])
+  const entries = logOf(w)
+  expect(entries).toHaveLength(3)
+  expect(entries[0] as unknown as { seq: number }).toEqual({ seq: 1 })
+  expect(entries[1] as unknown as { seq: number }).toEqual({ seq: 2 })
+  expect(lastLog(w).ev).toBe('session.measure')
+  expect(w.files.get(EVENTS)!.charCodeAt(0), 'the BOM is not written back').not.toBe(0xfeff)
+})
+
+// 重写时只留普通对象、且紧凑后不超过 2 KB 的旧条目，别的写入方留下的臃肿日志不会被永久保留。
+scenario('log: foreign entries that are not plain objects or are over 2 KB are dropped when the log is rewritten', undefined, async (w, $) => {
+  // JSON.stringify({ blob: 'x'.repeat(n) }) 长 n + 11：2037 个字符正好 2048，2038 个字符是 2049。
+  const blob = (n: number) => ({ blob: 'x'.repeat(n) })
+  expect(JSON.stringify(blob(2037)).length).toBe(2048)
+  const entries = [
+    'a string',
+    42,
+    null,
+    true,
+    [1, 2],
+    { seq: 1 },
+    blob(2037),
+    blob(2038),
+    blob(100_000),
+    { seq: 2 },
+  ]
+  w.files.set(EVENTS, JSON.stringify({ schema: 1, events: entries }))
+  await measure($, [lim('five_hour', 20, R5)])
+  const kept = logOf(w) as unknown as Record<string, unknown>[]
+  expect(kept, 'only plain objects up to 2048 characters survive, in order').toHaveLength(4)
+  expect(kept[0]).toEqual({ seq: 1 })
+  expect(kept[1]).toEqual(blob(2037))
+  expect(kept[2]).toEqual({ seq: 2 })
+  expect(kept[3]!.ev).toBe('session.measure')
+  expect(w.files.get(EVENTS)!.length, 'the bloated entries are really gone from the file').toBeLessThan(3000)
+})
+
+scenario('log: junk is dropped before the newest 200 are kept', undefined, async (w, $) => {
+  // 205 条正常的，后面跟 10 条杂物（排在最新的位置）。先过滤再截断：留下最新的 199 条正常的加这一条；
+  // 若先截断再过滤，杂物会挤掉正常的条目。
+  const valid = Array.from({ length: 205 }, (_, i) => ({ seq: i }))
+  const junk = Array.from({ length: 10 }, () => 'junk')
+  w.files.set(EVENTS, JSON.stringify({ schema: 1, events: [...valid, ...junk] }))
+  await measure($, [lim('five_hour', 20, R5)])
+  const kept = logOf(w) as unknown as { seq?: number; ev?: string }[]
+  expect(kept).toHaveLength(200)
+  expect(kept[0]).toEqual({ seq: 6 })
+  expect(kept[198]).toEqual({ seq: 204 })
+  expect(kept[199]!.ev).toBe('session.measure')
 })
 
 for (const mode of ['deny', 'throw'] as const) {
@@ -1596,6 +1894,73 @@ test('app pure: extractPayload does not fall through after the first text block'
   ).toEqual({ plan: { status: 'ok' } })
 })
 
+// 决定：structuredContent 是对象却没有 plan、文本块里有 plan 时，以文本块为准。MCP 约定文本块是同一份结果的 JSON 序列化，
+// 两边本应一致；结构化的那份缺了我们要的 plan、文本块里却有，说明结构化的那份是别的形状。照旧让结构化的赢，
+// 就会白白报 app_unavailable:none，小窗显示 no limits，尽管数据就在文本里。
+test('app pure: extractPayload takes the text block when structuredContent is an object without a plan', () => {
+  const text = [{ type: 'text', text: JSON.stringify(REAL_PLAN) }]
+  const rows: { label: string; structuredContent: unknown }[] = [
+    { label: 'empty object', structuredContent: {} },
+    { label: 'another shape', structuredContent: { ok: true, context: { session: 'self' } } },
+    { label: 'plan is a number', structuredContent: { plan: 5 } },
+    { label: 'plan is an array', structuredContent: { plan: [] } },
+    { label: 'plan is null', structuredContent: { plan: null } },
+    { label: 'plan is a string', structuredContent: { plan: 'ok' } },
+  ]
+  for (const row of rows) {
+    expect(extractPayload({ structuredContent: row.structuredContent, content: text }), row.label).toEqual(REAL_PLAN)
+  }
+})
+
+test('app pure: extractPayload still prefers structuredContent when it has a plan, even if the text differs', () => {
+  const structured = { plan: { status: 'ok', from: 'structured' } }
+  const rows: { label: string; content: unknown }[] = [
+    { label: 'text with another plan', content: [{ type: 'text', text: JSON.stringify({ plan: { status: 'ok', from: 'text' } }) }] },
+    { label: 'text is not json', content: [{ type: 'text', text: 'not json' }] },
+    { label: 'no content', content: undefined },
+    { label: 'content is not a list', content: 'nope' },
+  ]
+  for (const row of rows) {
+    const got = extractPayload({ structuredContent: structured, content: row.content })
+    expect(got, row.label).toEqual(structured)
+    expect((got as { plan: { from: string } }).plan.from, row.label + ' is the structured one').toBe('structured')
+  }
+})
+
+test('app pure: extractPayload keeps the structured object when the text block has no plan either or is unusable', () => {
+  const structured = { ok: true }
+  const rows: { label: string; content: unknown }[] = [
+    { label: 'text without a plan', content: [{ type: 'text', text: JSON.stringify({ other: 1 }) }] },
+    { label: 'text with a plan that is not an object', content: [{ type: 'text', text: JSON.stringify({ plan: 7 }) }] },
+    { label: 'broken json', content: [{ type: 'text', text: '{no' }] },
+    { label: 'json array', content: [{ type: 'text', text: '[1]' }] },
+    { label: 'no text block', content: [{ type: 'image' }] },
+    { label: 'second text block has the plan', content: [{ type: 'text', text: '{bad' }, { type: 'text', text: JSON.stringify(REAL_PLAN) }] },
+    { label: 'text block over the size cap', content: [{ type: 'text', text: JSON.stringify(REAL_PLAN) + ' '.repeat(64 * 1024) }] },
+  ]
+  for (const row of rows) {
+    expect(extractPayload({ structuredContent: structured, content: row.content }), row.label).toEqual(structured)
+  }
+  // 结构化的是空对象，文本块也读不出：结果仍是那个空对象（下游据此报 app_unavailable），不是 null。
+  expect(extractPayload({ structuredContent: {}, content: [] }), 'empty structured, empty content').toEqual({})
+})
+
+test('app pure: extractPayload caps the text block at 64 KB but not a structured object', () => {
+  const body = JSON.stringify(REAL_PLAN)
+  const padded = (size: number) => body + ' '.repeat(size - body.length)
+  const CAP = 64 * 1024
+  expect(extractPayload({ content: [{ type: 'text', text: padded(CAP) }] }), 'exactly 64 KB is read').toEqual(REAL_PLAN)
+  expect(extractPayload({ content: [{ type: 'text', text: padded(CAP + 1) }] }), 'one over is unusable').toBeNull()
+  // 超限算作解析失败：不拿后面的块补位。
+  expect(
+    extractPayload({ content: [{ type: 'text', text: padded(CAP + 1) }, { type: 'text', text: body }] }),
+    'a later block does not stand in',
+  ).toBeNull()
+  // 结构化内容已经是解析好的对象，没有解析可省，不设上限。
+  const big = { plan: { status: 'ok', windows: [] }, blob: 'x'.repeat(200_000) }
+  expect(extractPayload({ structuredContent: big }), 'structured is not capped').toBe(big)
+})
+
 test('app pure: extractPayload ignores isError and returns the parsed plan', () => {
   const got = extractPayload({
     isError: true,
@@ -1892,7 +2257,7 @@ test('app pure: mergeApp takes the app value in the same period when it is not l
   }
 })
 
-test('app pure: mergeApp confirms a rounding gap under 1 and holds a gap of 1', () => {
+test('app pure: mergeApp confirms a rounding gap under 1 and takes the app value from a gap of 1 up', () => {
   const confirm: { label: string; used: number }[] = [
     { label: 'gap 0.4', used: 66.4 },
     { label: 'gap 0.5', used: 66.5 },
@@ -1904,15 +2269,43 @@ test('app pure: mergeApp confirms a rounding gap under 1 and holds a gap of 1', 
     expect(got.windows, row.label).toEqual({ five_hour: win(row.used, R5, NOW, SID) })
     expect(got.held, row.label).toEqual([])
   }
-  const hold: { label: string; used: number }[] = [
+  // 账号值是点击那一刻现取的：比已存值低 1 个点以上，说明已存的是过时的数，取账号值（原来是保留旧值并计入 held）。
+  const take: { label: string; used: number }[] = [
     { label: 'gap 1', used: 67 },
+    { label: 'gap 1.01', used: 67.01 },
     { label: 'gap 4', used: 70 },
   ]
-  for (const row of hold) {
+  for (const row of take) {
     const old = { five_hour: win(row.used, R5, OLD_AT, 'old-a') }
     const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW, SID)
-    expect(got.windows, row.label).toEqual(old)
-    expect(got.held, row.label).toEqual(['five_hour'])
+    expect(got.windows, row.label).toEqual({ five_hour: win(66, R5 + 60, NOW, SID) })
+    expect(got.held, row.label).toEqual([])
+  }
+})
+
+test('app pure: mergeApp takes a live value far below the stored one in the same period (a raised limit)', () => {
+  // 套餐升级、上限变高：同一周期里账号百分比从 80 掉到 20，不能等到 resets_at 往后走才显示。
+  const rows: { label: string; kind: 'five_hour' | 'seven_day'; reset: number; stored: number; live: number; sid: string | null }[] = [
+    { label: '5h from another session', kind: 'five_hour', reset: R5, stored: 80, live: 20, sid: 'old-a' },
+    { label: '5h from the same session', kind: 'five_hour', reset: R5, stored: 80, live: 20, sid: SID },
+    { label: '5h stored without a session id', kind: 'five_hour', reset: R5, stored: 80, live: 20, sid: null },
+    { label: '7d, which would otherwise stay stale for days', kind: 'seven_day', reset: R7, stored: 90, live: 30, sid: 'old-b' },
+  ]
+  const one = <V>(kind: 'five_hour' | 'seven_day', value: V) => (kind === 'five_hour' ? { five_hour: value } : { seven_day: value })
+  for (const row of rows) {
+    const old = one(row.kind, win(row.stored, row.reset, OLD_AT, row.sid))
+    const got = mergeApp(old, one(row.kind, fr(row.live, row.reset + 90)), NOW, SID)
+    expect(got.windows, row.label).toEqual(one(row.kind, win(row.live, row.reset + 90, NOW, SID)))
+    expect(got.held, row.label).toEqual([])
+  }
+})
+
+test('app pure: mergeApp still holds a reading from an earlier period, however high', () => {
+  const old = { five_hour: win(10, R5, OLD_AT, 'old-a') }
+  for (const used of [5, 10, 99]) {
+    const got = mergeApp(old, { five_hour: fr(used, R5 - 121) }, NOW, SID)
+    expect(got.windows, String(used)).toEqual(old)
+    expect(got.held, String(used)).toEqual(['five_hour'])
   }
 })
 
@@ -1926,19 +2319,29 @@ test('app pure: mergeApp follows the later reset across periods', () => {
 })
 
 test('app pure: mergeApp treats 120 seconds as the same period and 121 as a new one', () => {
-  const old = { five_hour: win(90, R5, OLD_AT, 'old-a') }
-  const plus120 = mergeApp(old, { five_hour: fr(3, R5 + 120) }, NOW, SID)
-  expect(plus120.windows, '+120 keeps old').toEqual(old)
-  expect(plus120.held, '+120 held').toEqual(['five_hour'])
-  const plus121 = mergeApp(old, { five_hour: fr(3, R5 + 121) }, NOW, SID)
-  expect(plus121.windows, '+121 takes app').toEqual({ five_hour: win(3, R5 + 121, NOW, SID) })
+  // 同一周期里相差不到 1 的是取整差，保留已存的值和重置时间；换了周期则整个取账号的。靠这一点区分边界
+  // （同一周期里低得多的账号值现在也会被取走，分不出边界）。
+  const old = { five_hour: win(66.4, R5, OLD_AT, 'old-a') }
+  const plus120 = mergeApp(old, { five_hour: fr(66, R5 + 120) }, NOW, SID)
+  expect(plus120.windows, '+120 is the same period: confirmed').toEqual({ five_hour: win(66.4, R5, NOW, SID) })
+  expect(plus120.held, '+120 held').toEqual([])
+  const plus121 = mergeApp(old, { five_hour: fr(66, R5 + 121) }, NOW, SID)
+  expect(plus121.windows, '+121 is a new period: takes app').toEqual({ five_hour: win(66, R5 + 121, NOW, SID) })
   expect(plus121.held, '+121 held').toEqual([])
-  const minus120 = mergeApp(old, { five_hour: fr(91, R5 - 120) }, NOW, SID)
-  expect(minus120.windows, '-120 takes app').toEqual({ five_hour: win(91, R5 - 120, NOW, SID) })
+  const minus120 = mergeApp(old, { five_hour: fr(66, R5 - 120) }, NOW, SID)
+  expect(minus120.windows, '-120 is the same period: confirmed').toEqual({ five_hour: win(66.4, R5, NOW, SID) })
   expect(minus120.held, '-120 held').toEqual([])
   const minus121 = mergeApp(old, { five_hour: fr(99, R5 - 121) }, NOW, SID)
-  expect(minus121.windows, '-121 keeps old').toEqual(old)
+  expect(minus121.windows, '-121 is an earlier period: keeps old').toEqual(old)
   expect(minus121.held, '-121 held').toEqual(['five_hour'])
+  // 同一周期的另一侧：差得多的账号值取走，resets_at 用账号的（+120、-120 都在同一周期内）。
+  const wide = { five_hour: win(90, R5, OLD_AT, 'old-a') }
+  expect(mergeApp(wide, { five_hour: fr(3, R5 + 120) }, NOW, SID).windows, '+120 far below').toEqual({
+    five_hour: win(3, R5 + 120, NOW, SID),
+  })
+  expect(mergeApp(wide, { five_hour: fr(3, R5 - 120) }, NOW, SID).windows, '-120 far below').toEqual({
+    five_hour: win(3, R5 - 120, NOW, SID),
+  })
 })
 
 test('app pure: mergeApp keeps kind order and lists held kinds in kind order', () => {
@@ -1947,9 +2350,10 @@ test('app pure: mergeApp keeps kind order and lists held kinds in kind order', (
     seven_day: win(10, R7, OLD_AT, 'old-b'),
     spend_limit: win(1, R7, OLD_AT, 'old-c'),
   }
+  // held 现在只剩"账号读数属于更早的周期"一种，所以用更早的 resets_at 造出被挡住的 kind。
   const fresh = {
     spend_limit: fr(2, R7),
-    seven_day: fr(9, R7),
+    seven_day: fr(9, R7 - 121),
     five_hour: fr(39.5, R5 + 60),
   }
   const got = mergeApp(old, fresh, NOW, SID)
@@ -1960,11 +2364,12 @@ test('app pure: mergeApp keeps kind order and lists held kinds in kind order', (
   expect(got.held, 'only seven_day').toEqual(['seven_day'])
   const two = mergeApp(
     old,
-    { spend_limit: fr(0, R7 - 121), five_hour: fr(30, R5), seven_day: fr(11, R7) },
+    { spend_limit: fr(0, R7 - 121), five_hour: fr(30, R5 - 5 * 3600), seven_day: fr(11, R7) },
     NOW,
     SID,
   )
   expect(two.held, 'two kinds in kind order').toEqual(['five_hour', 'spend_limit'])
+  expect(two.windows.seven_day, 'the third is taken').toEqual(win(11, R7, NOW, SID))
 })
 
 test('app pure: mergeApp writes a null session id and a fixed field order', () => {
@@ -1995,6 +2400,185 @@ test('app pure: mergeApp does not mutate its inputs', () => {
   expect(JSON.stringify(fresh), 'fresh unchanged').toBe(freshText)
 })
 
+// ---------------------------------------------------------------- 刷新请求：一次尝试（两个服务器名共用一个期限）
+// 引擎把 hook 里抛出的任何错误都包成 HooksError，经引擎的用例分不出"第一个名字的错误名"和"第二个的"，
+// 所以这一组直接给 callApp 一个手工搭的引擎替身（只有它用到的 clock.after 与 mcp.call）：错误对象原样递到模块手里，
+// 期限的到点由测试亲手触发，不依赖 mock 时钟。引擎层面的流程用例见后面（mcp_timeout、mcp_error 等）。
+
+type StubTimer = { ms: number; fn: () => void; cancelled: boolean }
+// behave 决定每个服务器名的调用怎么应答：返回 promise（挂着、拒绝、成功都行），或直接抛。
+const makeAppStub = (behave: (server: string, nth: number) => Promise<unknown>, afterThrows?: unknown) => {
+  const timers: StubTimer[] = []
+  const calls: { server: string; tool: string; args: unknown }[] = []
+  const $ = {
+    clock: {
+      after: (ms: number, fn: () => void) => {
+        if (afterThrows !== undefined) throw afterThrows
+        const timer: StubTimer = { ms, fn, cancelled: false }
+        timers.push(timer)
+        return { cancel: () => void (timer.cancelled = true) }
+      },
+    },
+    mcp: {
+      call: (server: string, tool: string, args: unknown) => {
+        calls.push({ server, tool, args })
+        return behave(server, calls.length)
+      },
+    },
+  } as unknown as EngineInterface
+  return { $, timers, calls }
+}
+const named = (name: string): Error => Object.assign(new Error('stub ' + name), { name })
+// 让出若干个微任务，让挂着的 callApp 走到下一个等待点。
+const settle = async (): Promise<void> => {
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+}
+
+test('app call: both server names share one 5 s timer', async () => {
+  const stub = makeAppStub((server) => (server === 'ccd_session_mgmt' ? Promise.reject(named('Gone')) : Promise.resolve(APP_OK)))
+  const got = await callApp(stub.$)
+  expect(got, 'the second name answered').toEqual({ kind: 'answered', res: APP_OK })
+  expect(stub.calls, 'both names, in order, empty arguments').toEqual([
+    { server: 'ccd_session_mgmt', tool: 'get_usage', args: {} },
+    { server: 'ccd-session-mgmt', tool: 'get_usage', args: {} },
+  ])
+  expect(stub.timers.map((t) => t.ms), 'one timer for the whole attempt').toEqual([5000])
+  expect(stub.timers[0]!.cancelled, 'cancelled at the end').toBe(true)
+})
+
+test('app call: an answer from the first name ends the attempt', async () => {
+  const stub = makeAppStub(() => Promise.resolve(APP_OK))
+  expect(await callApp(stub.$)).toEqual({ kind: 'answered', res: APP_OK })
+  expect(stub.calls.map((c) => c.server)).toEqual(['ccd_session_mgmt'])
+  expect(stub.timers).toHaveLength(1)
+  expect(stub.timers[0]!.cancelled).toBe(true)
+  // 空结果、isError 的结果都是"回应了"，怎么处理归调用方。
+  for (const res of [null, undefined, { isError: true }]) {
+    const one = makeAppStub(() => Promise.resolve(res))
+    expect(await callApp(one.$), String(res)).toEqual({ kind: 'answered', res })
+    expect(one.calls, String(res)).toHaveLength(1)
+  }
+})
+
+test('app call: when both names throw it reports the first name\'s error, not the fallback\'s', async () => {
+  const first = named('FirstServerGone')
+  const second = named('SecondServerGone')
+  const stub = makeAppStub((server) => Promise.reject(server === 'ccd_session_mgmt' ? first : second))
+  const got = await callApp(stub.$)
+  expect(got.kind).toBe('failed')
+  if (got.kind !== 'failed') return
+  expect(got.err, 'the first error, by identity').toBe(first)
+  expect((got.err as Error).name).toBe('FirstServerGone')
+  expect(stub.calls, 'both names were really called').toHaveLength(2)
+  expect(stub.timers[0]!.cancelled).toBe(true)
+})
+
+test('app call: a synchronous throw from mcp.call counts as that name failing', async () => {
+  const first = named('SyncFirst')
+  const stub = makeAppStub((server) => {
+    if (server === 'ccd_session_mgmt') throw first
+    return Promise.resolve(APP_OK)
+  })
+  expect(await callApp(stub.$), 'falls through to the second name').toEqual({ kind: 'answered', res: APP_OK })
+  const both = makeAppStub((server) => {
+    throw named(server === 'ccd_session_mgmt' ? 'SyncOne' : 'SyncTwo')
+  })
+  const got = await callApp(both.$)
+  expect(got.kind === 'failed' && (got.err as Error).name).toBe('SyncOne')
+})
+
+test('app call: the deadline passing while the first name hangs ends the attempt and the second name is never called', async () => {
+  const stub = makeAppStub(() => new Promise(() => {}))
+  const pending = callApp(stub.$)
+  await settle()
+  expect(stub.calls, 'waiting on the first name').toHaveLength(1)
+  stub.timers[0]!.fn()
+  expect(await pending).toEqual({ kind: 'timeout' })
+  expect(stub.calls, 'the second name was not tried').toHaveLength(1)
+  expect(stub.timers[0]!.cancelled).toBe(true)
+})
+
+test('app call: the second name only gets what is left of the one deadline', async () => {
+  // 第一个名字失败得慢（期限里的 4 秒），第二个挂住：一次尝试到期限就结束，不是再等一个 5 秒。
+  let failFirst: () => void = () => {}
+  const stub = makeAppStub((server) =>
+    server === 'ccd_session_mgmt'
+      ? new Promise((_resolve, reject) => {
+          failFirst = () => reject(named('SlowFail'))
+        })
+      : new Promise(() => {}),
+  )
+  const pending = callApp(stub.$)
+  await settle()
+  failFirst()
+  await settle()
+  expect(stub.calls.map((c) => c.server), 'the second name is now waiting').toEqual(['ccd_session_mgmt', 'ccd-session-mgmt'])
+  expect(stub.timers, 'no second timer for the second name').toHaveLength(1)
+  stub.timers[0]!.fn()
+  expect(await pending).toEqual({ kind: 'timeout' })
+})
+
+test('app call: no call is made once the deadline has already passed', async () => {
+  // 期限在发第一个调用之前就到了（计时器同步触发）：一个调用都不发，同样是 timeout。
+  const stub = makeAppStub(() => Promise.resolve(APP_OK))
+  const eager = stub.$ as unknown as { clock: { after: (ms: number, fn: () => void) => unknown } }
+  const original = eager.clock.after
+  eager.clock.after = (ms, fn) => {
+    const timer = original(ms, fn)
+    fn()
+    return timer
+  }
+  expect(await callApp(stub.$)).toEqual({ kind: 'timeout' })
+  expect(stub.calls, 'nothing was called').toEqual([])
+  expect(stub.timers[0]!.cancelled).toBe(true)
+})
+
+test('app call: a result that arrives after the deadline is ignored, rejected or not', async () => {
+  for (const mode of ['resolve', 'reject'] as const) {
+    let settleLate: () => void = () => {}
+    const stub = makeAppStub(
+      () =>
+        new Promise((resolve, reject) => {
+          settleLate = () => (mode === 'resolve' ? resolve(APP_OK) : reject(named('TooLate')))
+        }),
+    )
+    const pending = callApp(stub.$)
+    await settle()
+    stub.timers[0]!.fn()
+    expect(await pending, mode).toEqual({ kind: 'timeout' })
+    // 期限之后才返回或才失败：结果没人用，也不能变成未处理的 promise 拒绝（那会让这个用例或后面的用例出错）。
+    settleLate()
+    await settle()
+    expect(stub.calls, mode).toHaveLength(1)
+  }
+})
+
+test('app call: a timer that cannot be set fails the attempt without sending get_usage', async () => {
+  // $.clock.after 同步抛异常几乎不会发生（被 hook 拒绝时不抛、只是回调永不执行）；发生时按失败处理，一个调用都不发。
+  const cannot = named('NoTimer')
+  const stub = makeAppStub(() => Promise.resolve(APP_OK), cannot)
+  const got = await callApp(stub.$)
+  expect(got).toEqual({ kind: 'failed', err: cannot })
+  expect(stub.calls, 'get_usage was never sent').toEqual([])
+})
+
+test('app call: the timer is cancelled on every outcome', async () => {
+  const outcomes: { label: string; behave: (server: string) => Promise<unknown>; fire: boolean }[] = [
+    { label: 'answered', behave: () => Promise.resolve(APP_OK), fire: false },
+    { label: 'failed', behave: () => Promise.reject(named('Gone')), fire: false },
+    { label: 'timeout', behave: () => new Promise(() => {}), fire: true },
+  ]
+  for (const row of outcomes) {
+    const stub = makeAppStub(row.behave)
+    const pending = callApp(stub.$)
+    await settle()
+    if (row.fire) stub.timers[0]!.fn()
+    await pending
+    expect(stub.timers, row.label).toHaveLength(1)
+    expect(stub.timers[0]!.cancelled, row.label).toBe(true)
+  }
+})
+
 // ---------------------------------------------------------------- 刷新请求：流程
 // 每个用例一个世界：同一个测试里不能再注册同名 hook（clock.now 注册两次会直接拒绝装载）。
 // 不给 dataDir 的话安全闸不注册任何 hook，定时检查不会发生。
@@ -2013,12 +2597,13 @@ const makeAppWorld = (on: On) => {
     exists: [] as string[], // 每次 fs.exists 的 norm 路径
     mcpCalls: [] as { server: string; tool: string; args: unknown }[],
     afterMs: [] as number[], // 每次 clock.after 的等待毫秒
-    mcp: {} as Record<string, unknown>, // 服务器名 -> 返回值，或 'throw'、'hang'、'late'。'late' 的调用各自挂起，由测试用 a.release 按调用顺序放出，放出后调用的返回值是 APP_OK；没配置的服务器等同 'throw'
+    mcp: {} as Record<string, unknown>, // 服务器名 -> 返回值，或 'throw'、'hang'、'late'、'slowfail'。'late' 的调用各自挂起，由测试用 a.release 按调用顺序放出，放出后调用的返回值是 APP_OK；'slowfail' 的调用各自挂起，由测试用 a.failCall 按调用顺序让它们以异常结束；没配置的服务器等同 'throw'
     failClock: false, // 为真时 clock.now 被拒绝
     clockScript: [] as ('ok' | 'fail' | number)[], // 前几次 clock.now：'fail' 拒绝，'ok' 放行；数字直接作为这次 clock.now 的返回值，用来模拟系统时间被调过（mock 时钟本身只能往前走）；用完后回到 failClock 的取值
     denyEvery: 0, // 接下来这么多次 clock.every 被拒绝（每次拒绝减一）；被拒绝的那一期之后整个间隔静默结束，不抛异常
     denyAfter: false, // 为真时每次 clock.after 都被拒绝：不抛异常，回调永不执行
     release: [] as (() => void)[], // 'late' 模式下各个挂起的调用，按调用顺序；调用 release[i]() 放出第 i 个
+    failCall: [] as (() => void)[], // 'slowfail' 模式下各个挂起的调用，按调用顺序；调用 failCall[i]() 让第 i 个以异常结束（失败得慢）
     failExists: false,
     failWritePaths: new Set<string>(), // 这些路径（norm 形式）的 fs.write 被拒绝
     sessionId: 'sess-new' as unknown,
@@ -2068,6 +2653,11 @@ const makeAppWorld = (on: On) => {
         a.release.push(() => resolve({ value: APP_OK as never }))
       })
     }
+    if (item === 'slowfail') {
+      return new Promise<never>((_resolve, reject) => {
+        a.failCall.push(() => reject(new Error('slow failure')))
+      })
+    }
     if (item === 'throw' || item === undefined) throw new Error('no such server')
     return { value: item as never }
   })
@@ -2075,6 +2665,7 @@ const makeAppWorld = (on: On) => {
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000 }, rateLimits: a.usageLimits as never } }))
   on('session.start', (_$, e) => ({ cwd: START_MARK + e.cwd }))
   on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   return a
 }
 type AppWorld = ReturnType<typeof makeAppWorld>
@@ -2363,6 +2954,83 @@ for (const row of badRequestRows) {
   })
 }
 
+// 请求与确认文件只有一百来字节，超过 4 KB（按字符数）的当作不可用：不解析，请求当作没有，确认当作没有。
+const padTo = (text: string, size: number): string => text + ' '.repeat(size - text.length)
+
+appScenario('caps: a request file over 4 KB is not a request, one of exactly 4 KB is', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  const CAP = 4 * 1024
+  const body = (id: string) => JSON.stringify({ schema: 1, id, requested_at: (a.clock.now() + POLL) / 1000 - 1 })
+  a.files.set(REQUEST, padTo(body('big1'), CAP + 1))
+  await tick(a)
+  expect(a.mcpCalls, 'over the cap: no call').toEqual([])
+  expect(a.events, 'read and dropped before any clock read').toEqual(['fs.exists', 'fs.read', 'clock.every'])
+  expect(a.files.has(EVENTS), 'silent, like any invalid request').toBe(false)
+  a.files.set(REQUEST, padTo(body('big2'), CAP))
+  await tick(a)
+  expect(a.mcpCalls, 'exactly at the cap: handled').toHaveLength(1)
+  expect(whys(a)).toEqual([''])
+})
+
+const ackCapRows = [
+  { label: 'an ack of exactly 4 KB is read, so the request is a duplicate', size: 4096, duplicate: true },
+  { label: 'an ack over 4 KB is no ack, so the request is handled', size: 4097, duplicate: false },
+]
+for (const row of ackCapRows) {
+  appScenario('caps: ' + row.label, async (a, $) => {
+    a.mcp.ccd_session_mgmt = APP_OK
+    await boot(a, $)
+    const ack = JSON.stringify({ schema: 1, id: 'ak1', status: 'ok', at: T0, windows: 2 })
+    a.files.set(ACK, padTo(ack, row.size))
+    stageRequest(a, 'ak1')
+    await tick(a)
+    if (row.duplicate) {
+      expect(a.mcpCalls, row.label).toEqual([])
+      expect(whys(a), row.label).toEqual(['duplicate_ack'])
+    } else {
+      expect(a.mcpCalls, row.label).toHaveLength(1)
+      expect(whys(a), row.label).toEqual([''])
+    }
+  })
+}
+
+// 读到的请求文本与上一次处理完的完全相同时不再解析。这在行为上看不出来（同一段文本解析多少次结论都一样），
+// 测试环境里模块的状态也不与测试共享、JSON.parse 又是冻结的，没法数解析次数，所以这里只钉住行为不变：
+// 引擎调用的序列、无效文本不会粘住、读时钟失败的请求不会被当成处理过（见后面"时钟一直坏"的用例）。
+appScenario('app flow: an unparseable request text costs only the reread, and a valid request written later is handled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.files.set(REQUEST, '{no')
+  await tick(a, 4)
+  expect(a.events, 'four periods, each one exists and one read').toEqual(
+    Array.from({ length: 4 }, () => ['fs.exists', 'fs.read', 'clock.every']).flat(),
+  )
+  expect(a.mcpCalls).toEqual([])
+  a.files.set(REQUEST, '{still no')
+  await tick(a, 2)
+  expect(a.mcpCalls, 'another bad text is also ignored').toEqual([])
+  stageRequest(a, 'ok1')
+  await tick(a)
+  expect(a.mcpCalls, 'the valid request is handled').toHaveLength(1)
+  expect(whys(a)).toEqual([''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id).toBe('ok1')
+})
+
+appScenario('app flow: a request text that is only rewritten with the same id is not handled again', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'same1')
+  await tick(a)
+  expect(a.mcpCalls).toHaveLength(1)
+  // 同一个 id、别的 requested_at：文本不同所以要解析，id 已见过，仍不处理。
+  await tick(a, 5)
+  stageRequest(a, 'same1')
+  await tick(a, 2)
+  expect(a.mcpCalls, 'the same id, whatever the text').toHaveLength(1)
+  expect(whys(a)).toEqual([''])
+})
+
 appScenario('app flow: a 32 character id is handled', async (a, $) => {
   const id = 'a'.repeat(32)
   a.mcp.ccd_session_mgmt = APP_OK
@@ -2385,6 +3053,41 @@ appScenario('app flow: a structuredContent payload writes the same snapshot and 
   expect(a.files.get(TARGET), 'snapshot layout').toBe(JSON.stringify(snap, null, 2))
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(ack)
   expect(a.files.get(ACK), 'ack layout').toBe(JSON.stringify(ack, null, 2))
+})
+
+appScenario('app flow: a structuredContent without a plan does not hide the plan in the text block', async (a, $) => {
+  a.mcp.ccd_session_mgmt = {
+    isError: false,
+    content: [{ type: 'text', text: JSON.stringify(appPayload()) }],
+    structuredContent: { ok: true },
+  }
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot from the text block').toEqual(okSnap())
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'a normal ack, not unavailable').toEqual(okAck('req1'))
+  expect(appLog(a)).toEqual([wroteLog()])
+})
+
+appScenario('app flow: a structuredContent with a plan wins over a text block that says something else', async (a, $) => {
+  a.mcp.ccd_session_mgmt = {
+    isError: false,
+    content: [{ type: 'text', text: JSON.stringify(appPayload(1, 2)) }],
+    structuredContent: appPayload(),
+  }
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'the structured numbers').toEqual(okSnap())
+})
+
+appScenario('app flow: when neither the structured object nor the text block has a plan the account counts as unavailable', async (a, $) => {
+  a.mcp.ccd_session_mgmt = { isError: false, content: [{ type: 'text', text: '{"other":1}' }], structuredContent: { ok: true } }
+  await boot(a, $)
+  stageRequest(a, 'req1')
+  await tick(a)
+  expectUnavail(a, 'req1')
+  expect(appLog(a)).toEqual([skipLog(TICK1, 'app_unavailable:none')])
 })
 
 appScenario('app flow: a stored spend_limit window is kept beside the app windows', async (a, $) => {
@@ -2443,7 +3146,7 @@ appScenario('app flow: the dashed server name is used when the first name throws
     { server: 'ccd_session_mgmt', tool: 'get_usage', args: {} },
     { server: 'ccd-session-mgmt', tool: 'get_usage', args: {} },
   ])
-  expect(a.afterMs, 'one timeout each').toEqual([5000, 5000])
+  expect(a.afterMs, 'one timeout shared by both names').toEqual([5000])
   expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(okSnap())
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
   expect(appLog(a), 'wrote').toEqual([wroteLog()])
@@ -2476,6 +3179,170 @@ appScenario('app flow: both server names throwing writes only the event log', as
   expect(logged, 'mcp error').toEqual([skipLog(TICK1, 'mcp_error:HooksError')])
   expect(Object.keys(logged[0] ?? {}), 'log keys').toEqual(LOG_KEYS)
 })
+
+// ---------------------------------------------------------------- 刷新请求：两个名字都失败之后的退避
+// 两个服务器名都抛异常（终端会话没有这个服务）之后，APP_BACKOFF_MS（10 分钟，这里写字面量）内本会话不再调用，
+// 点击只记一条 mcp_backoff。要碰 10 分钟的边界时，用 clockScript 直接给那一期的 clock.now 一个读数，不去真推 10 分钟的时钟。
+const BACKOFF_MS = 10 * 60 * 1000
+const TRY_MS = TICK1 * 1000 // 第一次尝试发生在 t=3 秒
+const bothThrow = (a: AppWorld): void => {
+  a.mcp.ccd_session_mgmt = 'throw'
+  a.mcp['ccd-session-mgmt'] = 'throw'
+}
+// 写一个新请求，并让下一期的 clock.now 读到 readMs。
+const clickAt = async (a: AppWorld, id: string, readMs: number): Promise<void> => {
+  a.files.set(REQUEST, JSON.stringify({ schema: 1, id, requested_at: readMs / 1000 - 1 }))
+  a.clockScript = [readMs]
+  await tick(a)
+}
+
+appScenario('app flow: after both server names fail, later clicks make no mcp.call and log mcp_backoff', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a) // t=3：两个名字都试了，都失败
+  expect(a.mcpCalls.map((c) => c.server), 'first click: both names tried').toEqual(['ccd_session_mgmt', 'ccd-session-mgmt'])
+  expect(whys(a)).toEqual(['mcp_error:HooksError'])
+  // 之后的点击（都已过了 10 秒的限频）：不再调用，只记一条 mcp_backoff，不写确认、不动 usage.json。
+  await tick(a, 3)
+  stageRequest(a, 'f2')
+  await tick(a) // t=15
+  await clickAt(a, 'f3', TRY_MS + 60_000) // 一分钟后
+  await clickAt(a, 'f4', TRY_MS + BACKOFF_MS - 1000) // 差一秒满 10 分钟
+  expect(a.mcpCalls, 'no further call').toHaveLength(2)
+  expect(whys(a)).toEqual(['mcp_error:HooksError', 'mcp_backoff', 'mcp_backoff', 'mcp_backoff'])
+  const logged = appLog(a)
+  expect(logged[1], 'the click is still seen in the log').toEqual(skipLog(T0 + 15, 'mcp_backoff'))
+  expect(logged[2]).toEqual(skipLog(TICK1 + 60, 'mcp_backoff'))
+  expect(Object.keys(logged[1] ?? {}), 'log keys').toEqual(LOG_KEYS)
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.writes.map((w) => w.path), 'only log writes').toEqual([EVENTS, EVENTS, EVENTS, EVENTS])
+})
+
+appScenario('app flow: a click within 10 s of the failed attempt is throttled, the first one after that is backed off', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a) // t=3
+  stageRequest(a, 'f2')
+  await tick(a) // t=6：离失败的那次尝试 3 秒
+  await tick(a, 2)
+  stageRequest(a, 'f3')
+  await tick(a) // t=15：12 秒
+  expect(whys(a)).toEqual(['mcp_error:HooksError', 'throttled', 'mcp_backoff'])
+  expect(a.mcpCalls, 'only the first click called').toHaveLength(2)
+})
+
+appScenario('app flow: the backoff ends exactly 10 minutes after the failed attempt and holds 1 ms earlier', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a)
+  expect(a.mcpCalls).toHaveLength(2)
+  await clickAt(a, 'e1', TRY_MS + BACKOFF_MS - 1)
+  expect(a.mcpCalls, '1 ms short: no call').toHaveLength(2)
+  expect(whys(a).at(-1), '1 ms short').toBe('mcp_backoff')
+  a.mcp.ccd_session_mgmt = APP_OK
+  await clickAt(a, 'e2', TRY_MS + BACKOFF_MS)
+  expect(a.mcpCalls, 'exactly 10 minutes: called again').toHaveLength(3)
+  expect(a.mcpCalls[2]).toEqual({ server: 'ccd_session_mgmt', tool: 'get_usage', args: {} })
+  expect(whys(a).at(-1), 'exactly 10 minutes').toBe('')
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'answered').toBe('e2')
+})
+
+appScenario('app flow: a failure after the backoff starts a new backoff from that attempt', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a)
+  await clickAt(a, 'g1', TRY_MS + BACKOFF_MS) // 到期后再试一次，仍然失败
+  expect(a.mcpCalls, 'tried again after 10 minutes').toHaveLength(4)
+  expect(whys(a).at(-1)).toBe('mcp_error:HooksError')
+  await clickAt(a, 'g2', TRY_MS + 2 * BACKOFF_MS - 1) // 离第二次失败不到 10 分钟：退避
+  expect(a.mcpCalls, 'still backed off, counted from the second failure').toHaveLength(4)
+  expect(whys(a).at(-1)).toBe('mcp_backoff')
+  await clickAt(a, 'g3', TRY_MS + 2 * BACKOFF_MS)
+  expect(a.mcpCalls, '10 minutes after the second failure').toHaveLength(6)
+})
+
+appScenario('app flow: a successful call clears the backoff, so a clock set back into the old window is not held back', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a)
+  a.mcp.ccd_session_mgmt = APP_OK
+  await clickAt(a, 's1', TRY_MS + BACKOFF_MS)
+  expect(whys(a).at(-1), 'recovered').toBe('')
+  // 时钟被往回调到失败之后 5 分钟：若退避记录没清，会被当成还在退避期。
+  await clickAt(a, 's2', TRY_MS + 5 * 60 * 1000)
+  expect(a.mcpCalls, 'handled, not backed off').toHaveLength(4)
+  expect(whys(a).at(-1)).toBe('')
+})
+
+appScenario('app flow: a clock set back to before the failed attempt does not extend the backoff', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a)
+  a.mcp.ccd_session_mgmt = APP_OK
+  await clickAt(a, 'b1', TRY_MS - 3_600_000)
+  expect(a.mcpCalls, 'the negative difference counts as expired').toHaveLength(3)
+  expect(whys(a).at(-1)).toBe('')
+})
+
+appScenario('app flow: a click another session already answered is a duplicate_ack, not mcp_backoff', async (a, $) => {
+  bothThrow(a)
+  await boot(a, $)
+  stageRequest(a, 'f1')
+  await tick(a)
+  await tick(a, 3)
+  a.files.set(ACK, JSON.stringify({ schema: 1, id: 'd1', status: 'ok', at: T0, windows: 2 }))
+  stageRequest(a, 'd1')
+  await tick(a)
+  expect(whys(a).at(-1)).toBe('duplicate_ack')
+  expect(a.mcpCalls).toHaveLength(2)
+})
+
+// 只有"两个名字都抛异常"起退避。超时（挂住不等于没有这个服务）、服务回应了的各种结果都不起，下一次点击照常调用。
+const noBackoffRows: { label: string; setup: (a: AppWorld) => void; why: string; settle: number }[] = [
+  { label: 'a timeout', setup: (a) => (a.mcp.ccd_session_mgmt = 'hang'), why: 'mcp_timeout', settle: 5000 },
+  {
+    label: 'the first name throwing and the second hanging',
+    setup: (a) => {
+      a.mcp.ccd_session_mgmt = 'throw'
+      a.mcp['ccd-session-mgmt'] = 'hang'
+    },
+    why: 'mcp_timeout',
+    settle: 5000,
+  },
+  { label: 'an isError reply', setup: (a) => (a.mcp.ccd_session_mgmt = { isError: true, content: [] }), why: 'app_is_error', settle: 0 },
+  { label: 'an unreadable reply', setup: (a) => (a.mcp.ccd_session_mgmt = null), why: 'parse_failed', settle: 0 },
+  {
+    label: 'an unavailable account',
+    setup: (a) => (a.mcp.ccd_session_mgmt = textResult({ plan: { status: 'not_applicable' } })),
+    why: 'app_unavailable:not_applicable',
+    settle: 0,
+  },
+]
+for (const row of noBackoffRows) {
+  appScenario('app flow: ' + row.label + ' does not start a backoff', async (a, $) => {
+    row.setup(a)
+    await boot(a, $)
+    stageRequest(a, 'n1')
+    await tick(a)
+    if (row.settle > 0) await a.clock.advance(row.settle)
+    expect(whys(a), row.label).toEqual([row.why])
+    const callsBefore = a.mcpCalls.length
+    a.mcp.ccd_session_mgmt = APP_OK
+    a.mcp['ccd-session-mgmt'] = APP_OK
+    await a.clock.advance(12000) // 过了 10 秒的限频，下一次点击才到得了退避那一关
+    stageRequest(a, 'n2')
+    await tick(a)
+    expect(a.mcpCalls.length, row.label + ': the next click calls again').toBeGreaterThan(callsBefore)
+    expect(whys(a).at(-1), row.label).toBe('')
+  })
+}
 
 appScenario('app flow: isError skips a usable text body and does not try the second name', async (a, $) => {
   a.mcp.ccd_session_mgmt = { isError: true, content: [{ type: 'text', text: JSON.stringify(appPayload()) }] }
@@ -2511,6 +3378,30 @@ for (const row of parseFailRows) {
   })
 }
 
+const payloadCapRows = [
+  { label: 'a text block of exactly 64 KB is read', size: 64 * 1024, ok: true },
+  { label: 'a text block over 64 KB is parse_failed', size: 64 * 1024 + 1, ok: false },
+]
+for (const row of payloadCapRows) {
+  appScenario('caps: ' + row.label, async (a, $) => {
+    a.mcp.ccd_session_mgmt = {
+      isError: false,
+      content: [{ type: 'text', text: padTo(JSON.stringify(appPayload()), row.size) }],
+    }
+    await boot(a, $)
+    stageRequest(a, 'cap1')
+    await tick(a)
+    if (row.ok) {
+      expect(appLog(a), row.label).toEqual([wroteLog()])
+      expect(JSON.parse(a.files.get(TARGET) ?? 'null'), row.label).toEqual(okSnap())
+    } else {
+      expect(appLog(a), row.label).toEqual([skipLog(TICK1, 'parse_failed')])
+      expect(a.files.has(ACK), row.label).toBe(false)
+      expect(a.files.has(TARGET), row.label).toBe(false)
+    }
+  })
+}
+
 appScenario('app flow: a hanging call times out once and later periods do not overlap', async (a, $) => {
   a.mcp.ccd_session_mgmt = 'hang'
   a.mcp['ccd-session-mgmt'] = APP_OK
@@ -2535,6 +3426,68 @@ appScenario('app flow: a hanging call times out once and later periods do not ov
   await tick(a, 2)
   expect(a.mcpCalls, 'same id not retried').toHaveLength(1)
   expect(appLog(a), 'still one log').toHaveLength(1)
+})
+
+// 两个服务器名共用一个 5 秒期限。第一个名字失败得慢（4 秒后才失败），第二个挂住：整次尝试在第 5 秒结束
+// （t=3 发出，t=8 放弃），不是第二个再等满 5 秒（t=12）。小窗只等 8 秒，晚于它写出的确认没有意义。
+appScenario('app flow: a slow failure of the first name leaves the second name only the rest of the same 5 s', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'slowfail'
+  a.mcp['ccd-session-mgmt'] = 'hang'
+  await boot(a, $)
+  stageRequest(a, 'dl1')
+  await tick(a) // t=3：第一个名字发出
+  expect(a.mcpCalls.map((c) => c.server)).toEqual(['ccd_session_mgmt'])
+  expect(a.afterMs, 'one timer armed').toEqual([5000])
+  await a.clock.advance(4000) // t=7：第一个名字这时才失败
+  a.failCall[0]?.()
+  await a.clock.settle()
+  expect(a.mcpCalls.map((c) => c.server), 'now the second name').toEqual(['ccd_session_mgmt', 'ccd-session-mgmt'])
+  expect(a.afterMs, 'no second timer for the second name').toEqual([5000])
+  await a.clock.advance(999) // t=7.999：离期限还差 1 毫秒
+  expect(a.files.has(EVENTS), '1 ms short of the shared deadline').toBe(false)
+  await a.clock.advance(1) // t=8
+  expect(appLog(a), 'given up at 3 + 5 s, not 7 + 5 s').toEqual([skipLog(T0 + 8, 'mcp_timeout')])
+  expect(a.writes.map((w) => w.path)).toEqual([EVENTS])
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+})
+
+appScenario('app flow: an answer that arrives after the shared deadline writes nothing', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'slowfail'
+  a.mcp['ccd-session-mgmt'] = 'late'
+  await boot(a, $)
+  stageRequest(a, 'dl2')
+  await tick(a) // t=3
+  await a.clock.advance(4000) // t=7：第一个名字失败，第二个发出
+  a.failCall[0]?.()
+  await a.clock.settle()
+  expect(a.release, 'the second name is waiting').toHaveLength(1)
+  await a.clock.advance(1000) // t=8：共用的期限到了
+  expect(whys(a)).toEqual(['mcp_timeout'])
+  await a.clock.advance(500) // t=8.5：若第二个名字有自己的 5 秒（到 t=12），这时放出的答案会被收下
+  a.release[0]?.()
+  await a.clock.settle()
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.writes.map((w) => w.path), 'only the timeout log').toEqual([EVENTS])
+  expect(appLog(a)).toEqual([skipLog(T0 + 8, 'mcp_timeout')])
+})
+
+appScenario('app flow: an answer that arrives after the deadline of a single call writes nothing either', async (a, $) => {
+  a.mcp.ccd_session_mgmt = 'late'
+  await boot(a, $)
+  stageRequest(a, 'dl3')
+  await tick(a)
+  await a.clock.advance(5000)
+  expect(whys(a), 'timed out').toEqual(['mcp_timeout'])
+  expect(a.release).toHaveLength(1)
+  a.release[0]?.()
+  await a.clock.settle()
+  expect(a.files.has(ACK), 'no ack').toBe(false)
+  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
+  expect(a.writes.map((w) => w.path)).toEqual([EVENTS])
+  await tick(a, 2)
+  expect(a.mcpCalls, 'the same id is not retried').toHaveLength(1)
+  expect(appLog(a)).toHaveLength(1)
 })
 
 const unavailableRows: { label: string; payload: unknown; log: Record<string, unknown>; keys: string[] }[] = [
@@ -2639,7 +3592,8 @@ appScenario('app flow: a higher app percent in the same period replaces the stor
   expect(readSnap(a).windows.five_hour, 'replaced').toEqual(win(67, R5, TICK1, 'sess-new'))
 })
 
-appScenario('app flow: a gap of 3 keeps the stored window and records it as held', async (a, $) => {
+// 账号读数是点击那一刻现取的：同一周期里比已存值低 1 个点以上，说明已存的是过时的数（套餐升级、上限变高），取账号值。
+appScenario('app flow: a live value 3 points below the stored one replaces it and is not held', async (a, $) => {
   a.mcp.ccd_session_mgmt = textResult(appPayload(67, 57))
   await boot(a, $)
   stageStored(a, { five_hour: ow(70, R5, T0 - 100, 'old-a') })
@@ -2647,20 +3601,34 @@ appScenario('app flow: a gap of 3 keeps the stored window and records it as held
   await tick(a)
   const snap = readSnap(a)
   expect(snap.written_at, 'rewritten').toBe(TICK1)
-  expect(snap.windows.five_hour, 'kept').toEqual(win(70, R5, T0 - 100, 'old-a'))
+  expect(snap.windows.five_hour, 'taken from the app').toEqual(win(67, R5, TICK1, 'sess-new'))
   expect(snap.windows.seven_day, 'new').toEqual(win(57, R7, TICK1, 'sess-new'))
-  expect(appLog(a)[0]?.held, 'held').toEqual(['five_hour'])
-  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack still ok').toEqual(okAck('req1'))
+  expect(appLog(a)[0]?.held, 'not held').toEqual([])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack ok').toEqual(okAck('req1'))
 })
 
-appScenario('app flow: a gap of exactly 1 is held and a gap of 0.01 is confirmed', async (a, $) => {
+appScenario('app flow: after a plan upgrade the live percentages replace the stored ones at once', async (a, $) => {
+  // 上限变高：账号百分比同一周期里从 80/90 掉到 20/30。5 小时的和 7 天的（原来要等 resets_at 往后走，最长七天）都立刻跟上。
+  a.mcp.ccd_session_mgmt = textResult(appPayload(20, 30))
+  await boot(a, $)
+  stageStored(a, { five_hour: ow(80, R5, T0 - 100, 'old-a'), seven_day: ow(90, R7, T0 - 100, 'old-b') })
+  stageRequest(a, 'upg1')
+  await tick(a)
+  const snap = readSnap(a)
+  expect(snap.windows.five_hour).toEqual(win(20, R5, TICK1, 'sess-new'))
+  expect(snap.windows.seven_day).toEqual(win(30, R7, TICK1, 'sess-new'))
+  expect(appLog(a)[0]).toEqual(wroteLog())
+  expect(JSON.parse(a.files.get(ACK) ?? 'null')).toEqual(okAck('upg1'))
+})
+
+appScenario('app flow: a gap of exactly 1 is taken and a gap of 0.01 is confirmed', async (a, $) => {
   a.mcp.ccd_session_mgmt = textResult(appPayload(66, 57))
   await boot(a, $)
   stageStored(a, { five_hour: ow(67, R5, T0 - 100, 'old-a') })
   stageRequest(a, 'gap1')
   await tick(a)
-  expect(readSnap(a).windows.five_hour, 'gap 1 kept').toEqual(win(67, R5, T0 - 100, 'old-a'))
-  expect(appLog(a)[0]?.held, 'gap 1 held').toEqual(['five_hour'])
+  expect(readSnap(a).windows.five_hour, 'gap 1 taken').toEqual(win(66, R5, TICK1, 'sess-new'))
+  expect(appLog(a)[0]?.held, 'gap 1 not held').toEqual([])
   // 同一个 id 不会再处理，换一个 id 才能测差 0.01。限频要等满 10 秒：第一次调用在 t=3，新请求在 t=15 被读到，已隔 12 秒。
   await tick(a, 3)
   stageStored(a, { five_hour: ow(66.01, R5, T0 - 100, 'old-a') })
@@ -3029,6 +3997,39 @@ appScenario('app flow: start and two measures share one interval', async (a, $) 
   await tick(a)
   expect(a.exists, 'one exists').toEqual([REQUEST])
   expect(a.events, 'one period').toEqual(['fs.exists', 'clock.every'])
+})
+
+// 定时器不挂 session.end，也不主动取消（理由见 register.ts 文件头）：热重载时引擎丢掉旧环境的计时器，进程退出时计时器随进程消失；
+// session.end 在 /clear 和 resume 时也会触发，但那时进程和模块继续活着（/clear 之后不再触发 session.start），取消只会让点击没人处理。
+// 这个用例钉住这个决定：session.end 不引起模块的任何引擎调用，之后间隔照常处理点击。
+appScenario('app flow: session.end of any reason causes no engine call and the interval keeps serving clicks', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  const reasons = ['clear', 'resume', 'prompt_input_exit', 'logout', 'other'] as const
+  for (const reason of reasons) {
+    const res = await $.session.end({ reason, sessionId: 'sess-new', resume: { id: 'sess-new' } })
+    expect(res, reason).toEqual({ sessionId: 'sess-new' })
+  }
+  expect(a.events, 'only the five session.end events, nothing from the module').toEqual(reasons.map(() => 'session.end'))
+  stageRequest(a, 'end1')
+  await tick(a)
+  expect(a.mcpCalls, 'the interval is still alive and serves the click').toHaveLength(1)
+  expect(whys(a)).toEqual([''])
+})
+
+// 事件日志的"读不出"记号在整个会话里共用：hook 和刷新检查写的是同一份日志。
+appScenario('log: the pending count for an unreadable log is shared by the hooks and the click handler', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.files.set(EVENTS, 'not json{')
+  await measure($, LIMS) // hook 第一次见到：不写
+  expect(a.files.get(EVENTS), 'left alone by the hook').toBe('not json{')
+  stageRequest(a, 'sh1')
+  await tick(a) // 刷新检查第二次见到同一段：重新开始
+  expect(a.files.get(EVENTS), 'replaced by the click handler').not.toBe('not json{')
+  const entries = (JSON.parse(a.files.get(EVENTS) ?? 'null') as { events: LogEntry[] }).events
+  expect(entries.map((e) => e.ev), 'a fresh log holding only the refresh.app entry').toEqual(['refresh.app'])
+  expect(a.mcpCalls, 'the click itself was served').toHaveLength(1)
 })
 
 scenario('app timer: start and two measures arm one 3000ms interval', undefined, async (w, $) => {

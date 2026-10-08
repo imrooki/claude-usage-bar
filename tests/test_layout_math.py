@@ -63,6 +63,16 @@ class WindowHeightTests(unittest.TestCase):
         self.assertEqual(widget.window_height((0, 0, 1920, 96), 2.0), 80)
         self.assertEqual(widget.window_height((0, 0, 1920, 60), 2.0), 56)
 
+    def test_metrics_shrink_with_a_short_window_and_never_grow_past_nominal(self):
+        for scale in (1.0, 1.5):
+            nominal = widget.scaled(widget.LOGICAL_H, scale)
+            with self.subTest(scale=scale):
+                self.assertEqual(widget.render_metrics(scale, nominal)["vscale"], 1.0)
+                self.assertEqual(widget.render_metrics(scale, nominal * 3)["vscale"], 1.0)
+                self.assertEqual(widget.dual_render_metrics(scale, nominal * 3)["vscale"], 1.0)
+                self.assertLess(widget.render_metrics(scale, nominal // 2)["vscale"], 1.0)
+                self.assertLess(widget.dual_render_metrics(scale, nominal // 2)["vscale"], 1.0)
+
 
 class ComputeLayoutTests(unittest.TestCase):
     def test_bottom_taskbar_places_the_window_centred_vertically(self):

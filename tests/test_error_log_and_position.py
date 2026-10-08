@@ -115,6 +115,19 @@ class ErrorLogTests(TempDirTestCase):
                 with self.at(1000.0):
                     self.assertFalse(log.log("Kind", "msg"))
 
+    def test_refused_write_does_not_use_up_the_dedupe_window(self):
+        data_dir = os.path.join(self.dir, "not-yet")
+        log = widget.ErrorLog(data_dir)
+        # Both calls happen inside one dedupe window: only the write that actually lands may claim it.
+        with self.at(1000.0):
+            self.assertFalse(log.log("Kind", "again"))
+            os.mkdir(data_dir)
+            self.assertTrue(log.log("Kind", "again"))
+        with open(os.path.join(data_dir, widget.ERROR_LOG_NAME), "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(LINE.match(lines[0]).groups(), ("Kind", "again"))
+
     def test_log_exception_records_the_exception_class_name(self):
         log = widget.ErrorLog(self.dir)
         with self.at(1000.0):

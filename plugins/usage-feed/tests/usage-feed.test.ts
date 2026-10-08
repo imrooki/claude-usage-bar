@@ -21,7 +21,11 @@ const CHANGED = ['rateLimits', 'cost']
 const BOOT_NOISE = new Set(['engine.create', 'plugin.register', 'ui.resolve'])
 const FEED_CALLS = ['clock.now', 'session.id', 'fs.read', 'fs.write']
 
-const norm = (p: string): string => p.replace(/\\/g, '/')
+// 引擎宿主会把"在本机上不是绝对路径"的路径放到插件目录之下：Linux 上 D:/... 不是绝对路径，fs 事件里的路径就成了
+// <插件目录>/D:/usage-feed-test/mem/...；Windows 上 D:/ 本身是绝对路径，原样传入。所以 norm 还要去掉第一个盘符之前的
+// 部分，让两种宿主上的假文件系统用同一个键（否则同一个文件写入和读出的键不同，一半以上的用例读不到自己刚写的文件）。
+// 插件自己的路径安全闸（resolveTarget，要求 X:/ 开头）不受影响，也不为迁就测试而放宽。
+const norm = (p: string): string => p.replace(/\\/g, '/').replace(/^.*?(?=[A-Za-z]:\/)/, '')
 const iso = (sec: number): string => new Date(sec * 1000).toISOString()
 const lim = (kind: string, pct: number, resetsSec: number) => ({ kind, percentUsed: pct, resetsAt: iso(resetsSec) })
 const ow = (used: unknown, resets: unknown, observed?: unknown, sid?: unknown) => ({
@@ -2178,7 +2182,7 @@ appScenario('app flow: a new request writes usage.json, then the ack, then one l
   stageRequest(a, 'req1')
   await tick(a)
   expect(a.mcpCalls, 'one get_usage').toEqual([{ server: 'ccd_session_mgmt', tool: 'get_usage', args: {} }])
-  expect(a.afterMs, 'timeout armed').toEqual([15000])
+  expect(a.afterMs, 'timeout armed').toEqual([5000])
   expect(a.writes.map((w) => w.path), 'usage then ack then log').toEqual([TARGET, ACK, EVENTS])
   const snap = okSnap()
   expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(snap)
@@ -2293,15 +2297,16 @@ for (const row of ackRows) {
   })
 }
 
-appScenario('app flow: a second call inside 30s is throttled and exactly 30s is handled', async (a, $) => {
+appScenario('app flow: a second call inside 10s is throttled and the period 12s later is handled', async (a, $) => {
   a.mcp.ccd_session_mgmt = APP_OK
   await boot(a, $)
-  // t=3：第一次调用。t=6 与 t=30 距它不到 30 秒，限频；t=33 恰好 30 秒，再处理。
+  // t=3：第一次调用。t=6（3 秒后）与 t=12（9 秒后）距它不到 10 秒，限频；t=15（12 秒后）再处理。
+  // 周期是 3 秒，格点上碰不到恰好 10 秒；恰好 10 秒与差 1 毫秒的边界由下面用 clockScript 的两个用例钉住。
   stageRequest(a, 'idA')
   await tick(a)
   stageRequest(a, 'idB')
   await tick(a)
-  await tick(a, 7)
+  await tick(a)
   stageRequest(a, 'idC')
   await tick(a)
   stageRequest(a, 'idD')
@@ -2310,7 +2315,7 @@ appScenario('app flow: a second call inside 30s is throttled and exactly 30s is 
   expect(whys(a), 'why sequence').toEqual(['', 'throttled', 'throttled', ''])
   const logged = appLog(a)
   expect(logged[1], 'throttled at t=6').toEqual(skipLog(T0 + 6, 'throttled'))
-  expect(logged[2], 'throttled at t=30').toEqual(skipLog(T0 + 30, 'throttled'))
+  expect(logged[2], 'throttled at t=12').toEqual(skipLog(T0 + 12, 'throttled'))
   expect(a.writes.map((w) => w.path), 'throttled periods only write the log').toEqual([
     TARGET,
     ACK,
@@ -2438,7 +2443,7 @@ appScenario('app flow: the dashed server name is used when the first name throws
     { server: 'ccd_session_mgmt', tool: 'get_usage', args: {} },
     { server: 'ccd-session-mgmt', tool: 'get_usage', args: {} },
   ])
-  expect(a.afterMs, 'one timeout each').toEqual([15000, 15000])
+  expect(a.afterMs, 'one timeout each').toEqual([5000, 5000])
   expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(okSnap())
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
   expect(appLog(a), 'wrote').toEqual([wroteLog()])
@@ -2451,7 +2456,7 @@ appScenario('app flow: a successful first server name is not followed by the sec
   stageRequest(a, 'req1')
   await tick(a)
   expect(a.mcpCalls, 'first name only').toEqual([{ server: 'ccd_session_mgmt', tool: 'get_usage', args: {} }])
-  expect(a.afterMs, 'one timeout').toEqual([15000])
+  expect(a.afterMs, 'one timeout').toEqual([5000])
 })
 
 appScenario('app flow: both server names throwing writes only the event log', async (a, $) => {
@@ -2513,16 +2518,17 @@ appScenario('app flow: a hanging call times out once and later periods do not ov
   stageRequest(a, 'req1')
   await tick(a)
   expect(a.mcpCalls, 'one call at t=3').toHaveLength(1)
-  expect(a.afterMs, 'timeout armed').toEqual([15000])
+  expect(a.afterMs, 'timeout armed').toEqual([5000])
   expect(a.writes, 'still waiting').toEqual([])
   expect(a.files.has(EVENTS), 'no log yet').toBe(false)
-  await a.clock.advance(14000)
-  expect(a.files.has(EVENTS), 'still no log at t=17').toBe(false)
+  // 超时在 t=3 + 5 = 8 秒到期：差 1 毫秒还在等，到点放弃。
+  await a.clock.advance(4999)
+  expect(a.files.has(EVENTS), '1 ms short of the timeout, still no log').toBe(false)
   expect(a.mcpCalls, 'still one call').toHaveLength(1)
   expect(a.exists, 'no extra exists while busy').toEqual([REQUEST])
-  await a.clock.advance(1000)
+  await a.clock.advance(1)
   expect(whys(a), 'timed out').toEqual(['mcp_timeout'])
-  expect(appLog(a), 'timeout log').toEqual([skipLog(T0 + 18, 'mcp_timeout')])
+  expect(appLog(a), 'timeout log').toEqual([skipLog(T0 + 8, 'mcp_timeout')])
   expect(a.mcpCalls, 'second name not tried').toHaveLength(1)
   expect(a.files.has(ACK), 'no ack').toBe(false)
   expect(a.files.has(TARGET), 'no snapshot').toBe(false)
@@ -2655,13 +2661,13 @@ appScenario('app flow: a gap of exactly 1 is held and a gap of 0.01 is confirmed
   await tick(a)
   expect(readSnap(a).windows.five_hour, 'gap 1 kept').toEqual(win(67, R5, T0 - 100, 'old-a'))
   expect(appLog(a)[0]?.held, 'gap 1 held').toEqual(['five_hour'])
-  // 同一个 id 不会再处理，换一个 id 才能测差 0.01。限频要等满 30 秒。
-  await tick(a, 10)
+  // 同一个 id 不会再处理，换一个 id 才能测差 0.01。限频要等满 10 秒：第一次调用在 t=3，新请求在 t=15 被读到，已隔 12 秒。
+  await tick(a, 3)
   stageStored(a, { five_hour: ow(66.01, R5, T0 - 100, 'old-a') })
   stageRequest(a, 'gap001')
   await tick(a)
   const second = readSnap(a)
-  expect(second.windows.five_hour, 'gap 0.01 confirmed').toEqual(win(66.01, R5, T0 + 36, 'sess-new'))
+  expect(second.windows.five_hour, 'gap 0.01 confirmed').toEqual(win(66.01, R5, T0 + 15, 'sess-new'))
   expect(appLog(a)[1]?.held, 'gap 0.01 not held').toEqual([])
 })
 
@@ -2761,7 +2767,8 @@ appScenario('app flow: a refused event log does not block the snapshot or the ne
   expect(a.writes.map((w) => w.path), 'snapshot and ack').toEqual([TARGET, ACK])
   expect(a.files.has(EVENTS), 'no log').toBe(false)
   a.failWritePaths.delete(EVENTS)
-  await tick(a, 10)
+  // 等过 10 秒的限频：idA 在 t=3，idB 在 t=15 被读到。
+  await tick(a, 3)
   stageRequest(a, 'idB')
   await tick(a)
   expect(a.mcpCalls, 'both calls').toHaveLength(2)
@@ -2783,7 +2790,7 @@ appScenario('app flow: a non-string session id is stored and logged as null', as
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
 })
 
-appScenario('app flow: a failed clock read marks the request seen and a new id still works', async (a, $) => {
+appScenario('app flow: a clock that stays down costs one clock.now per period, then the request is handled', async (a, $) => {
   a.mcp.ccd_session_mgmt = APP_OK
   await boot(a, $)
   a.failClock = true
@@ -2793,15 +2800,76 @@ appScenario('app flow: a failed clock read marks the request seen and a new id s
   expect(a.writes, 'nothing written').toEqual([])
   expect(a.files.has(EVENTS), 'no log').toBe(false)
   expect(a.events, 'stopped after the clock').toEqual(['fs.exists', 'fs.read', 'clock.now', 'clock.every'])
+  // 时钟一直坏：请求没有被处理过，不记已见，每期只多试一次 clock.now，除此之外什么都不做。
+  const seen = a.events.length
+  await tick(a, 2)
+  expect(a.events.slice(seen), 'two more periods, one clock.now each').toEqual([
+    'fs.exists',
+    'fs.read',
+    'clock.now',
+    'clock.every',
+    'fs.exists',
+    'fs.read',
+    'clock.now',
+    'clock.every',
+  ])
+  expect(a.mcpCalls, 'still not called').toEqual([])
+  expect(a.writes, 'still nothing written').toEqual([])
+  expect(a.files.has(EVENTS), 'still no log').toBe(false)
+  // 时钟恢复：同一个请求仍年轻（t=12 时 10 秒），这一期就处理。
   a.failClock = false
   await tick(a)
-  expect(a.mcpCalls, 'seen id skipped').toEqual([])
-  expect(a.files.has(EVENTS), 'still no log').toBe(false)
-  stageRequest(a, 'clk2')
-  await tick(a)
-  expect(a.mcpCalls, 'new id').toHaveLength(1)
+  expect(a.mcpCalls, 'handled once the clock is back').toHaveLength(1)
   expect(whys(a), 'wrote').toEqual([''])
-  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('clk2')
+  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('clk1')
+  await tick(a, 2)
+  expect(a.mcpCalls, 'now seen, not handled again').toHaveLength(1)
+})
+
+appScenario('app flow: one failed clock read does not swallow the request and the next period handles it', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.clockScript = ['fail']
+  stageRequest(a, 'clk1')
+  await tick(a)
+  expect(a.events, 'first period stops after the clock').toEqual(['fs.exists', 'fs.read', 'clock.now', 'clock.every'])
+  expect(a.mcpCalls, 'nothing attempted yet').toEqual([])
+  expect(a.writes, 'nothing written').toEqual([])
+  expect(a.files.has(EVENTS), 'no log').toBe(false)
+  await tick(a)
+  expect(a.mcpCalls, 'exactly one call on the second period').toEqual([
+    { server: 'ccd_session_mgmt', tool: 'get_usage', args: {} },
+  ])
+  expect(a.writes.map((w) => w.path), 'usage then ack then log').toEqual([TARGET, ACK, EVENTS])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual({ ...okAck('clk1'), at: T0 + 6 })
+  expect(appLog(a), 'one refresh.app').toEqual([{ ...wroteLog(), t: (T0 + 6) * 1000 }])
+  await tick(a, 2)
+  expect(a.mcpCalls, 'handled once, later periods only reread the request').toHaveLength(1)
+})
+
+appScenario('app flow: a request that outlives a long clock outage is ignored once the clock is back', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  a.failClock = true
+  stageRequest(a, 'clk1')
+  // 重试受 REQUEST_MAX_AGE_S 约束：请求写于 t=2，时钟坏到 t=33，期间每期只试一次 clock.now，除此之外什么都不做。
+  await tick(a, 11)
+  const period = ['fs.exists', 'fs.read', 'clock.now', 'clock.every']
+  expect(a.events, 'every period of the outage costs one clock.now and nothing else').toEqual(
+    Array.from({ length: 11 }, () => period).flat(),
+  )
+  expect(a.mcpCalls, 'no call during the outage').toEqual([])
+  expect(a.writes, 'nothing written during the outage').toEqual([])
+  expect(a.files.has(EVENTS), 'no log during the outage').toBe(false)
+  a.failClock = false
+  await tick(a)
+  expect(a.mcpCalls, 't=36 the request is 34s old, not handled').toEqual([])
+  expect(a.writes, 'ignored silently').toEqual([])
+  expect(a.files.has(EVENTS), 'no log for a stale request').toBe(false)
+  // 读到时钟之后它就记为已见，不会再有 clock.now。
+  const seen = a.events.length
+  await tick(a)
+  expect(a.events.slice(seen), 'seen now, only the reread').toEqual(['fs.exists', 'fs.read', 'clock.every'])
 })
 
 appScenario('app flow: a clock failure after the app call skips the write and logs bad_clock', async (a, $) => {
@@ -2840,19 +2908,59 @@ appScenario('app flow: after a hang times out a later request is handled', async
   await boot(a, $)
   stageRequest(a, 'h1')
   await tick(a)
-  await a.clock.advance(15000)
+  await a.clock.advance(5000)
   expect(whys(a), 'timed out').toEqual(['mcp_timeout'])
   a.mcp.ccd_session_mgmt = APP_OK
-  await a.clock.advance(15000)
+  // 超时的调用也算一次调用，h2 要隔满 10 秒：h1 在 t=3 被读到，h2 在 t=15 被读到，隔 12 秒。
+  await a.clock.advance(4000)
   stageRequest(a, 'h2')
   await tick(a)
   expect(a.mcpCalls, 'hang plus the later call').toHaveLength(2)
   expect(whys(a), 'timeout then wrote').toEqual(['mcp_timeout', ''])
   expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('h2')
   const snap = readSnap(a)
-  expect(snap.written_at, 'written at t=36').toBe(T0 + 36)
-  expect(snap.windows.five_hour, 'five_hour').toEqual(win(67, R5, T0 + 36, 'sess-new'))
-  expect(snap.windows.seven_day, 'seven_day').toEqual(win(57, R7, T0 + 36, 'sess-new'))
+  expect(snap.written_at, 'written at t=15').toBe(T0 + 15)
+  expect(snap.windows.five_hour, 'five_hour').toEqual(win(67, R5, T0 + 15, 'sess-new'))
+  expect(snap.windows.seven_day, 'seven_day').toEqual(win(57, R7, T0 + 15, 'sess-new'))
+})
+
+// 下面两个用例钉住 usage_widget.py 的刷新协议（常量在 Python 里，这里不能导入，所以写字面量）：
+// 小窗写出请求后等 APP_REFRESH_WAIT_SECONDS = 8 秒的确认；等不到就放弃，再过 APP_REFRESH_RETRY_SECONDS = 10 秒才接受下一次点击。
+appScenario("app flow: a retry at the widget's earliest retry time is not throttled by the call that timed out", async (a, $) => {
+  // 第一次点击写于 t=2，t=3 的检查读到并调用；插件 5 秒后放弃，小窗 8 秒后放弃（t=10），再过 10 秒（t=20）才接受重试。
+  // 重试请求写于 t=20，t=21 被读到，离第一次调用 18 秒：不能被限频，否则有桌面会话时小窗还是显示 no session。
+  a.mcp.ccd_session_mgmt = 'hang'
+  await boot(a, $)
+  stageRequest(a, 'try1')
+  await tick(a)
+  await a.clock.advance(5000)
+  expect(whys(a), 'first call given up').toEqual(['mcp_timeout'])
+  a.mcp.ccd_session_mgmt = APP_OK
+  await a.clock.advance(10000)
+  stageRequest(a, 'try2')
+  await tick(a)
+  expect(a.mcpCalls, 'the retry is handled').toHaveLength(2)
+  expect(whys(a), 'timeout then wrote').toEqual(['mcp_timeout', ''])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual({ ...okAck('try2'), at: T0 + 21 })
+})
+
+appScenario("app flow: the slowest answer the plugin waits for still lands within the widget's 8s wait", async (a, $) => {
+  // 最坏情形：点击恰好发生在一次定时检查之后，要等满 3 秒才被发现；调用在 5 秒上限前 1 毫秒才返回。
+  // 3 + 5 = 8：确认离请求时间不能超过小窗等待的 8 秒。
+  a.mcp.ccd_session_mgmt = 'late'
+  await boot(a, $)
+  stageRequest(a, 'slow1', 3)
+  await tick(a)
+  expect(a.release, 'the call is waiting').toHaveLength(1)
+  await a.clock.advance(4999)
+  a.release[0]?.()
+  await a.clock.settle()
+  const ack = JSON.parse(a.files.get(ACK) ?? 'null') as { id: string; status: string; at: number }
+  expect(ack.id, 'ack id').toBe('slow1')
+  expect(ack.status, 'ack status').toBe('ok')
+  expect(ack.at - T0, 'ack lands within the widget wait').toBeLessThanOrEqual(8)
+  expect(ack.at - T0, 'ack is written when the call returns').toBeGreaterThan(7.9)
+  expect(whys(a), 'wrote').toEqual([''])
 })
 
 appScenario('app flow: written files omit the raw payload, paths, and the server name', async (a, $) => {
@@ -3041,6 +3149,8 @@ appScenario('app watchdog: a clock set back only moves the baseline and the chec
 
 appScenario('app watchdog: periods skipped as busy still count as ticks', async (a, $) => {
   a.mcp.ccd_session_mgmt = 'hang'
+  // 计时器被拒绝：调用一直挂着、一直忙。否则真实的 5 秒超时在 t=8 到期，之后的几期就不是被挡掉的了。
+  a.denyAfter = true
   await start($)
   await measure($, LIMS)
   stageRequest(a, 'req1')
@@ -3050,32 +3160,34 @@ appScenario('app watchdog: periods skipped as busy still count as ticks', async 
   quiet(a)
   await measure($, LIMS)
   expect(a.events, 'ticked since the baseline, so only the baseline moves').toEqual(MEASURE_EVENTS)
-  await a.clock.advance(9000)
+  // 新基线之后的两期（t=9、t=12）全是被挡掉的忙期；挡到第 5 期才强制复位，所以还留着一期余量。
+  await a.clock.advance(6001)
   quiet(a)
   await measure($, LIMS)
   expect(a.events, 'only busy periods since the new baseline, still alive, no arm').toEqual(MEASURE_EVENTS)
 })
 
-appScenario('app watchdog: a call stuck without a timeout frees the watcher after more than seven skipped periods', async (a, $) => {
+appScenario('app watchdog: a call stuck without a timeout frees the watcher after more than four skipped periods', async (a, $) => {
   a.denyAfter = true
   a.mcp.ccd_session_mgmt = 'hang'
   await boot(a, $)
   stageRequest(a, 'req1')
   await tick(a)
   expect(a.mcpCalls, 'one call').toHaveLength(1)
-  expect(a.afterMs, 'the timeout was asked for but refused').toEqual([15000])
+  expect(a.afterMs, 'the timeout was asked for but refused').toEqual([5000])
   expect(a.exists, 'one exists so far').toEqual([REQUEST])
-  await tick(a, 7)
-  expect(a.exists, 'seven skipped periods do not touch the file').toEqual([REQUEST])
+  // 上限是调用超时折成的期数（5 秒向上取整为 2 期）再加两期余量，共 4 期。
+  await tick(a, 4)
+  expect(a.exists, 'four skipped periods do not touch the file').toEqual([REQUEST])
   expect(whys(a), 'nothing is logged for the stuck call').toEqual([])
   a.mcp.ccd_session_mgmt = APP_OK
   await tick(a)
-  expect(a.exists, 'the eighth period resets busy and runs').toEqual([REQUEST, REQUEST])
+  expect(a.exists, 'the fifth period resets busy and runs').toEqual([REQUEST, REQUEST])
   expect(a.mcpCalls, 'req1 is already seen').toHaveLength(1)
   await tick(a)
   stageRequest(a, 'req2')
   await tick(a)
-  expect(a.mcpCalls, 'req2 is handled exactly 30s after the first call').toHaveLength(2)
+  expect(a.mcpCalls, 'req2 is handled 21s after the first call, past the 10s gap').toHaveLength(2)
   expect(whys(a), 'wrote').toEqual([''])
   expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('req2')
 })
@@ -3087,7 +3199,8 @@ appScenario('app watchdog: a stuck call that returns late does not clear the bus
   stageRequest(a, 'reqA')
   await tick(a)
   expect(a.release, 'call A is waiting').toHaveLength(1)
-  await tick(a, 8)
+  // 4 期被挡掉，第 5 期复位并运行（上限的取值见上一个用例）。
+  await tick(a, 5)
   await tick(a)
   stageRequest(a, 'reqB')
   await tick(a)
@@ -3103,7 +3216,7 @@ appScenario('app watchdog: a stuck call that returns late does not clear the bus
   expect(a.exists.length, 'the watcher runs again once the newer run is done').toBe(before + 1)
 })
 
-appScenario('app flow: a clock set back does not extend the 30s throttle', async (a, $) => {
+appScenario('app flow: a clock set back does not extend the 10s throttle', async (a, $) => {
   a.mcp.ccd_session_mgmt = APP_OK
   await boot(a, $)
   stageRequest(a, 'idA')
@@ -3131,13 +3244,28 @@ appScenario('app flow: a request read at exactly the time of the last call is st
   expect(whys(a), 'second request was throttled').toEqual(['', 'throttled'])
 })
 
-appScenario('app flow: a request read 1 ms short of 30s after the last call is still throttled', async (a, $) => {
+appScenario('app flow: a request read exactly 10s after the last call is handled', async (a, $) => {
   a.mcp.ccd_session_mgmt = APP_OK
   await boot(a, $)
   stageRequest(a, 'idA')
   await tick(a)
   expect(a.mcpCalls, 'first call').toHaveLength(1)
-  const almost = a.clock.now() + 29999
+  // 周期是 3 秒，格点上碰不到恰好 10 秒，所以直接给这一期的 clock.now 一个读数。
+  const exact = a.clock.now() + 10000
+  a.files.set(REQUEST, JSON.stringify({ schema: 1, id: 'idB', requested_at: exact / 1000 - 1 }))
+  a.clockScript = [exact]
+  await tick(a)
+  expect(a.mcpCalls, 'handled, not throttled').toHaveLength(2)
+  expect(whys(a), 'both wrote').toEqual(['', ''])
+})
+
+appScenario('app flow: a request read 1 ms short of 10s after the last call is still throttled', async (a, $) => {
+  a.mcp.ccd_session_mgmt = APP_OK
+  await boot(a, $)
+  stageRequest(a, 'idA')
+  await tick(a)
+  expect(a.mcpCalls, 'first call').toHaveLength(1)
+  const almost = a.clock.now() + 9999
   a.files.set(REQUEST, JSON.stringify({ schema: 1, id: 'idB', requested_at: almost / 1000 - 1 }))
   a.clockScript = [almost]
   await tick(a)

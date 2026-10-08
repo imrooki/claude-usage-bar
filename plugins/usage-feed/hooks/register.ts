@@ -13,7 +13,8 @@
 //    ccd_session_mgmt（或同一服务的另一种写法 ccd-session-mgmt）的 get_usage，参数为空对象，
 //    不发模型请求。定时检查（每 REFRESH_POLL_MS 一次）请求文件不存在时每期只做一次 $.fs.exists；
 //    小窗点过一次之后请求文件一直在（小窗不删它，本插件也没有删文件的接口），此后每期再多一次
-//    $.fs.read 与一次 JSON 解析，id 已处理过就返回。$.clock.after 只用来给那一次调用设超时。
+//    $.fs.read 与一次 JSON 解析，id 已处理过就返回（读时钟失败的 id 不算处理过，每期再多一次 $.clock.now，
+//    直到读到时钟为止）。$.clock.after 只用来给那一次调用设超时。
 //    fs 现在碰四个文件，本插件写三个（用量快照、事件日志、确认），读一个（小窗写的刷新请求）：
 //    <dataDir>/<SNAPSHOT_FILE>（用量快照）、<dataDir>/<EVENTS_FILE>（事件日志）、
 //    <dataDir>/<REQUEST_FILE>（小窗写的刷新请求，只读）、<dataDir>/<ACK_FILE>（确认，本插件写）。
@@ -86,10 +87,18 @@ const REFRESH_POLL_MS = 3000
 const REQUEST_MAX_AGE_S = 30
 // 容忍请求时间略超本机时钟，吸收小窗与本进程之间的时钟偏差。
 const REQUEST_FUTURE_SLOP_S = 5
-// 本会话两次调用桌面应用的最小间隔，防止刷新按钮被连点时刷屏。
-const APP_CALL_GAP_MS = 30000
-// 单次调用桌面应用的等待上限，超时就放弃这一次，不拖住定时检查。
-const APP_CALL_TIMEOUT_MS = 15000
+// 下面这两个常量要与小窗（usage_widget.py）的刷新协议对齐，改其中一边时把另一边一起看。
+// 本会话两次调用桌面应用的最小间隔，防止刷新按钮被连点时刷屏。它不能比小窗的重试节奏更长：
+// 小窗等不到确认（APP_REFRESH_WAIT_SECONDS，8 秒）之后，再过 APP_REFRESH_RETRY_SECONDS（10 秒）就允许用户重试，
+// 那次重试到达时离上一次调用至少已过 10 秒。间隔若更长（例如 30 秒），这次重试会被限频、得不到回应，
+// 小窗又显示 no session，尽管桌面会话在、数据也是新的。失败或超时的调用同样算一次调用（见 handleRequest）。
+const APP_CALL_GAP_MS = 10000
+// 单次调用桌面应用的等待上限，超时就放弃这一次，不拖住定时检查。小窗写出请求后只等 APP_REFRESH_WAIT_SECONDS
+// （8 秒）的确认，而定时检查每 REFRESH_POLL_MS（3 秒）才看一次请求文件，最坏要等 3 秒才发现请求，所以调用最多再等
+// 5 秒：3 + 5 = 8，成功的调用最迟约在小窗放弃时写出确认（两个服务器名只有前一个抛异常才试后一个，抛异常通常立刻
+// 发生，最坏情形仍只有一次上限）。上限若更长（例如 15 秒），一次耗时 8 到 15 秒的调用会在插件这边成功
+// （写了 usage.json 和确认），而小窗早已显示 no session。
+const APP_CALL_TIMEOUT_MS = 5000
 // 同一服务的两种写法，依次尝试；第一个调用没抛异常的就用，不是失败后重试。
 const APP_SERVERS = ['ccd_session_mgmt', 'ccd-session-mgmt'] as const
 const APP_TOOL = 'get_usage'
@@ -750,7 +759,10 @@ const refreshFromApp = async (
 
 // 看一眼请求文件。请求文件不存在时只做一次 exists；小窗点过一次之后文件一直在，每期还会读一次并解析，
 // id 已处理过就返回。永不抛出：任何异常直接结束，不能冒进定时回调。
-// 先记已见再判断年龄、确认和限频：同一个请求不会被本会话重复处理，哪怕这次读时钟失败、被跳过或调用失败。
+// 读到时钟之后、判断年龄、确认和限频之前记已见：同一个请求不会被本会话重复处理，哪怕之后被跳过或调用失败。
+// 读时钟失败时这个请求连年龄都还没判断过，不算处理过，所以不记已见，下一期再来一遍；否则一次时钟故障就会让
+// 这次点击被永久吞掉，小窗对着一个从未尝试过的请求显示 no session。重试受 REQUEST_MAX_AGE_S 约束：时钟恢复得
+// 太晚，请求按太旧静默忽略（同时记已见）。时钟一直坏的代价只是每期多一次 $.clock.now，不调用、不写文件、不记日志。
 // 太旧或来自未来的请求静默忽略，不记日志：多半是重启后残留的旧文件，记了只是噪声。
 // lastCallAt 记在调用之前：这次调用失败也算一次，连点不会把桌面应用打爆。
 // 限频用本会话两次 nowMs 之差，与请求年龄同一个引擎时钟，不另取别的时间。
@@ -768,9 +780,10 @@ const handleRequest = async (
     const req = parseRequest(text)
     if (req === null) return
     if (req.id === ctx.lastSeenId) return
-    ctx.lastSeenId = req.id
     const nowMs = await readNow($)
+    // 读不到时钟：什么都不做、不记已见，下一期再试（理由见上面的说明）。
     if (nowMs === null) return
+    ctx.lastSeenId = req.id
     // 恰为 REQUEST_MAX_AGE_S 仍处理，只有更旧才忽略；恰为 -REQUEST_FUTURE_SLOP_S 仍处理。
     const age = nowMs / 1000 - req.requestedAt
     if (age > REQUEST_MAX_AGE_S || age < -REQUEST_FUTURE_SLOP_S) return

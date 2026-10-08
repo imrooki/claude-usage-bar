@@ -580,7 +580,7 @@ class CaptionTextTests(unittest.TestCase):
             widget.CAPTION_BENIGN_REASONS,
             frozenset({"missing", "no_codex", "no_rate_limits"}))
         self.assertEqual(widget.caption_text(None, at(9, 5), ""), "new 09:05")
-        self.assertEqual(widget.caption_text(None, at(9, 5), "missing"), "new 09:05")
+        self.assertEqual(widget.caption_text(None, at(9, 5), "missing"), "no file")
         self.assertEqual(widget.caption_text(None, None, "no_codex"), "no data")
         self.assertEqual(widget.caption_text(None, None, "no_rate_limits"), "no data")
         self.assertEqual(widget.caption_text(at(9, 5), at(9, 5), "no_rate_limits"), "same 09:05")
@@ -798,8 +798,8 @@ class SampleTests(unittest.TestCase):
             "caption_same": ("same 14:29",),
             "caption_error": ("read error",),
             "dual_caption_new_same": ("new 14:59", "same 14:29"),
-            "dual_caption_nodata_error": ("no data", "read error"),
-            "caption_nodata": ("no data",),
+            "dual_caption_nodata_error": ("no file", "read error"),
+            "caption_nodata": ("no file",),
             "caption_nodata_error": ("read error",),
             "dual_caption_all_nodata": ("read error",),
         }
@@ -942,7 +942,7 @@ class RefreshCaptionFlowTests(unittest.TestCase):
         cases = (
             ("same", None, "same 14:00", None),
             ("bad_json", (data_at(OBS_OLD), "bad_json"), "read error", None),
-            ("missing", (None, "missing"), "no data", "nodata"),
+            ("missing", (None, "missing"), "no file", "nodata"),
         )
         for name, queued, text, kind in cases:
             with self.subTest(name=name):
@@ -955,7 +955,7 @@ class RefreshCaptionFlowTests(unittest.TestCase):
                 if kind == "nodata":
                     display = first_display(app)
                     self.assertEqual(display.kind, "nodata")
-                    self.assertEqual(display.captions, ("no data",))
+                    self.assertEqual(display.captions, ("no file",))
 
     def test_data_read_while_the_menu_is_open_still_counts_as_new(self):
         app = make_app()
@@ -1181,10 +1181,10 @@ class CaptionLifecycleTests(unittest.TestCase):
         live_apply(app)
         click_refresh(app)
         self.assertEqual(app.shown_display.kind, "nodata")
-        self.assertEqual(app.shown_display.captions, ("no data",))
+        self.assertEqual(app.shown_display.captions, ("no file",))
         with patch.object(widget.time, "time", return_value=APP_NOW + 0.1):
             app.on_timer(widget.TIMER_FLASH)
-        self.assertEqual(app.shown_display.captions, ("no data",))
+        self.assertEqual(app.shown_display.captions, ("no file",))
         app.w32.update_layered.reset_mock()
         with patch.object(widget.time, "time", return_value=APP_NOW + 3.0):
             app.on_timer(widget.TIMER_CAPTION)
@@ -1200,11 +1200,13 @@ class CaptionLifecycleTests(unittest.TestCase):
         self.assertEqual(app.shown_display.kind, "nodata")
         self.assertEqual(app.shown_display.captions, ("read error",))
 
-    def test_dual_without_any_window_reports_no_data_for_an_empty_codex_log(self):
+    def test_dual_without_any_window_shows_the_claude_caption_first(self):
+        # Both sides are empty, so one caption fits: the Claude one wins ("no file"),
+        # the Codex one ("no data" for an empty log) is not shown.
         app = make_app()
         app.reader = FakeReader(None, "missing")
         app.codex = FakeReader(None, "no_rate_limits")
         live_apply(app)
         click_refresh(app)
         self.assertEqual(app.shown_display.kind, "nodata")
-        self.assertEqual(app.shown_display.captions, ("no data",))
+        self.assertEqual(app.shown_display.captions, ("no file",))

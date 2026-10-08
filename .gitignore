@@ -15,3 +15,5 @@ __pycache__/
 *.pyc
 node_modules/
 *.log
+# Rotated error log (widget_error.log.1)
+*.log.1

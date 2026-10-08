@@ -71,7 +71,8 @@ it, so ask me to open a new Claude Code session afterwards, and restart the widg
 (Quit from its right-click menu, then start it again).
 
 1. Clone the repository into a local folder that is not inside OneDrive and not on a
-   network share (the plugin refuses such paths). Create the "data" folder inside it.
+   network share (the plugin refuses such paths). Create the "data" folder inside it
+   (the widget also creates it on its first start).
 2. Make sure Python 3 with Pillow is available (pip install pillow). Tell me which
    python.exe and pythonw.exe you will use.
 3. Validate the plugin: claude plugin validate <repo>\plugins\usage-feed must pass.
@@ -117,12 +118,11 @@ or push anything. At the end, list every file and setting you changed.
 
 ### Install by hand
 
-Clone the repository and create the folder that will hold the snapshot. It is git-ignored, so it does not exist after cloning.
+Clone the repository. The folder that will hold the snapshot, `data/`, is git-ignored, so it does not exist after cloning; the widget creates it when it first starts.
 
 ```powershell
 git clone https://github.com/imrooki/claude-usage-bar.git
 cd claude-usage-bar
-mkdir data
 pip install pillow
 ```
 
@@ -152,7 +152,7 @@ claude plugin install usage-feed@usage-bar-local --config dataDir=C:/full/path/t
 
 Either way, `dataDir` must be the full path of the `data` folder, written with forward slashes. The plugin accepts only a local absolute path. It refuses relative paths, network (UNC) paths and any path containing `onedrive`, and then writes nothing at all.
 
-Open a new Claude Code session, send one message, then start the widget:
+Start the widget first (it creates `data/`), then open a new Claude Code session and send one message:
 
 ```powershell
 pythonw usage_widget.py
@@ -225,6 +225,7 @@ To see which one it is, click `Refresh now` in the right-click menu. For about 2
 | `new 14:59` | A reading newer than the one on screen was found; 14:59 is when it was taken (local time). |
 | `same 14:29` | Nothing newer exists in the data; the newest reading was taken at 14:29. The widget works, the source has not written anything since. |
 | `no data` | There is no reading at all yet for this block. |
+| `no file` | Claude block only: `usage.json` is not in the data folder. Any numbers already shown stay until a new file arrives. |
 | `read error` | The data (the Claude data file, or the Codex session log for the Codex block) exists but could not be read or parsed. |
 | `asking` | The request of that block is pending: Codex block, your Codex CLI is running the small request (4 to 7 s); Claude block, the widget waits for a desktop-app session to answer (up to 8 s). The text stays until it ends, then the result shows as `new` or `same`. |
 | `cooldown` | No new request was sent because the last one was too recent: Codex block, less than 5 minutes ago; Claude block, less than 60 s ago (10 s after an unanswered one). |
@@ -285,7 +286,7 @@ Known limitations:
 - After an Explorer restart (tested once with `taskkill` and `start explorer.exe` on build 26200) the widget recreated its window under the new taskbar within the same second, and it again stayed visible over the Start menu.
 - To follow the notification area the widget reads the window rectangle of `TrayNotifyWnd` (read-only queries, every 2 s), so it moves when tray icons come and go.
 - Foreground and window-order notifications use out-of-context WinEvent hooks. When the taskbar covers the widget, for example after the Start menu closes, it restores its own window order without taking focus; repeated notifications are coalesced and the 2 s check remains as a fallback. Only overlapping shell panel rectangles prevent that restoration. Full-screen, auto-hide and menu rules still apply. Some machines report a busy notification state all the time, so a busy state alone does not hide the widget: the foreground must also be an ordinary application window covering the whole monitor of the taskbar. The taskbar, the desktop and the widget's own windows never count.
-- The widget makes no network connections. Its only subprocess is the optional Codex request after a click on `Refresh now`: one `Popen` call with a fixed argument list (no shell, standard streams closed, no window), a non-blocking check every 0.5 s on the main thread, `terminate` then `kill` after 60 s, and a stop on quit; there is no extra thread. It reads one registry value (the light/dark setting), `data/usage.json`, the plugin's answer `data/refresh-ack.json` (at most 4 KB, only while it waits for one) and, read-only, the tail of the newest Codex session logs, and it writes only `widget_pos.json`, the request file `refresh-request.json` (replaced atomically, only after a click) and a small error log (capped at 64 KB) into the data folder. Looking for the newest Codex session log stats the files of the last 14 date folders at most once a minute (about 2 ms with 1,200 session logs); reading takes at most 1 MB from the end of a log.
+- The widget makes no network connections. Its only subprocess is the optional Codex request after a click on `Refresh now`: one `Popen` call with a fixed argument list (no shell, standard streams closed, no window), a non-blocking check every 0.5 s on the main thread, `terminate` then `kill` after 60 s, and a stop on quit; there is no extra thread. It reads one registry value (the light/dark setting), `data/usage.json`, the plugin's answer `data/refresh-ack.json` (at most 4 KB, only while it waits for one) and, read-only, the tail of the newest Codex session logs, and it writes only `widget_pos.json`, the request file `refresh-request.json` (replaced atomically, only after a click) and a small error log (rotated once at 64 KB, so at most about 128 KB on disk) into the data folder. Looking for the newest Codex session log stats the files of the last 14 date folders at most once a minute (about 2 ms with 1,200 session logs); reading takes at most 1 MB from the end of a log.
 - The plugin calls nine Claude Code APIs (`session.usage`, `session.id`, `clock.now`, `clock.every`, `clock.after`, `fs.read`, `fs.write`, `fs.exists`, `mcp.call`), hooks only `session.start` and `session.measure`, and writes only `usage.json`, the troubleshooting log `usage-feed-events.json` and the answer file `refresh-ack.json` in the folder you configured. Every hook runs the engine's own handling first, and a failure inside the plugin is swallowed, so it cannot change how a session behaves. The only timer is one 3 s interval per session that checks the request file (`fs.exists`, then a read of the tiny file once it exists); `mcp.call` is made only for a new request, only to `ccd_session_mgmt`'s `get_usage`, with an empty argument and a 15 s limit.
 - The request and the answer are matched by a random id, not by file existence (a plugin cannot delete files). The plugin writes `usage.json` before the answer, so a widget that sees the answer always reads the new numbers; a failed call writes no answer, so a terminal session cannot make a desktop session's click look failed; several sessions may answer the same click, which is harmless (the first answer wins, later sessions see it and skip).
 

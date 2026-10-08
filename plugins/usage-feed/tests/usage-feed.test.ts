@@ -3220,132 +3220,8 @@ appScenario('app flow: both server names throwing writes only the event log', as
   expect(Object.keys(logged[0] ?? {}), 'log keys').toEqual(LOG_KEYS)
 })
 
-// ---------------------------------------------------------------- 刷新请求：两个名字都失败之后的退避
-// 两个服务器名都抛异常（终端会话没有这个服务）之后，APP_BACKOFF_MS（10 分钟，这里写字面量）内本会话不再调用，
-// 点击只记一条 mcp_backoff。要碰 10 分钟的边界时，用 clockScript 直接给那一期的 clock.now 一个读数，不去真推 10 分钟的时钟。
-const BACKOFF_MS = 10 * 60 * 1000
-const TRY_MS = TICK1 * 1000 // 第一次尝试发生在 t=3 秒
-const bothThrow = (a: AppWorld): void => {
-  a.mcp.ccd_session_mgmt = 'throw'
-  a.mcp['ccd-session-mgmt'] = 'throw'
-}
-// 写一个新请求，并让下一期的 clock.now 读到 readMs。
-const clickAt = async (a: AppWorld, id: string, readMs: number): Promise<void> => {
-  a.files.set(REQUEST, JSON.stringify({ schema: 1, id, requested_at: readMs / 1000 - 1 }))
-  a.clockScript = [readMs]
-  await tick(a)
-}
-
-appScenario('app flow: after both server names fail, later clicks make no mcp.call and log mcp_backoff', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a) // t=3：两个名字都试了，都失败
-  expect(a.mcpCalls.map((c) => c.server), 'first click: both names tried').toEqual(['ccd_session_mgmt', 'ccd-session-mgmt'])
-  expect(whys(a)).toEqual(['mcp_error:HooksError'])
-  // 之后的点击（都已过了 10 秒的限频）：不再调用，只记一条 mcp_backoff，不写确认、不动 usage.json。
-  await tick(a, 3)
-  stageRequest(a, 'f2')
-  await tick(a) // t=15
-  await clickAt(a, 'f3', TRY_MS + 60_000) // 一分钟后
-  await clickAt(a, 'f4', TRY_MS + BACKOFF_MS - 1000) // 差一秒满 10 分钟
-  expect(a.mcpCalls, 'no further call').toHaveLength(2)
-  expect(whys(a)).toEqual(['mcp_error:HooksError', 'mcp_backoff', 'mcp_backoff', 'mcp_backoff'])
-  const logged = appLog(a)
-  expect(logged[1], 'the click is still seen in the log').toEqual(skipLog(T0 + 15, 'mcp_backoff'))
-  expect(logged[2]).toEqual(skipLog(TICK1 + 60, 'mcp_backoff'))
-  expect(Object.keys(logged[1] ?? {}), 'log keys').toEqual(LOG_KEYS)
-  expect(a.files.has(ACK), 'no ack').toBe(false)
-  expect(a.files.has(TARGET), 'no snapshot').toBe(false)
-  expect(a.writes.map((w) => w.path), 'only log writes').toEqual([EVENTS, EVENTS, EVENTS, EVENTS])
-})
-
-appScenario('app flow: a click within 10 s of the failed attempt is throttled, the first one after that is backed off', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a) // t=3
-  stageRequest(a, 'f2')
-  await tick(a) // t=6：离失败的那次尝试 3 秒
-  await tick(a, 2)
-  stageRequest(a, 'f3')
-  await tick(a) // t=15：12 秒
-  expect(whys(a)).toEqual(['mcp_error:HooksError', 'throttled', 'mcp_backoff'])
-  expect(a.mcpCalls, 'only the first click called').toHaveLength(2)
-})
-
-appScenario('app flow: the backoff ends exactly 10 minutes after the failed attempt and holds 1 ms earlier', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a)
-  expect(a.mcpCalls).toHaveLength(2)
-  await clickAt(a, 'e1', TRY_MS + BACKOFF_MS - 1)
-  expect(a.mcpCalls, '1 ms short: no call').toHaveLength(2)
-  expect(whys(a).at(-1), '1 ms short').toBe('mcp_backoff')
-  a.mcp.ccd_session_mgmt = APP_OK
-  await clickAt(a, 'e2', TRY_MS + BACKOFF_MS)
-  expect(a.mcpCalls, 'exactly 10 minutes: called again').toHaveLength(3)
-  expect(a.mcpCalls[2]).toEqual({ server: 'ccd_session_mgmt', tool: 'get_usage', args: {} })
-  expect(whys(a).at(-1), 'exactly 10 minutes').toBe('')
-  expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'answered').toBe('e2')
-})
-
-appScenario('app flow: a failure after the backoff starts a new backoff from that attempt', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a)
-  await clickAt(a, 'g1', TRY_MS + BACKOFF_MS) // 到期后再试一次，仍然失败
-  expect(a.mcpCalls, 'tried again after 10 minutes').toHaveLength(4)
-  expect(whys(a).at(-1)).toBe('mcp_error:HooksError')
-  await clickAt(a, 'g2', TRY_MS + 2 * BACKOFF_MS - 1) // 离第二次失败不到 10 分钟：退避
-  expect(a.mcpCalls, 'still backed off, counted from the second failure').toHaveLength(4)
-  expect(whys(a).at(-1)).toBe('mcp_backoff')
-  await clickAt(a, 'g3', TRY_MS + 2 * BACKOFF_MS)
-  expect(a.mcpCalls, '10 minutes after the second failure').toHaveLength(6)
-})
-
-appScenario('app flow: a successful call clears the backoff, so a clock set back into the old window is not held back', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a)
-  a.mcp.ccd_session_mgmt = APP_OK
-  await clickAt(a, 's1', TRY_MS + BACKOFF_MS)
-  expect(whys(a).at(-1), 'recovered').toBe('')
-  // 时钟被往回调到失败之后 5 分钟：若退避记录没清，会被当成还在退避期。
-  await clickAt(a, 's2', TRY_MS + 5 * 60 * 1000)
-  expect(a.mcpCalls, 'handled, not backed off').toHaveLength(4)
-  expect(whys(a).at(-1)).toBe('')
-})
-
-appScenario('app flow: a clock set back to before the failed attempt does not extend the backoff', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a)
-  a.mcp.ccd_session_mgmt = APP_OK
-  await clickAt(a, 'b1', TRY_MS - 3_600_000)
-  expect(a.mcpCalls, 'the negative difference counts as expired').toHaveLength(3)
-  expect(whys(a).at(-1)).toBe('')
-})
-
-appScenario('app flow: a click another session already answered is a duplicate_ack, not mcp_backoff', async (a, $) => {
-  bothThrow(a)
-  await boot(a, $)
-  stageRequest(a, 'f1')
-  await tick(a)
-  await tick(a, 3)
-  a.files.set(ACK, JSON.stringify({ schema: 1, id: 'd1', status: 'ok', at: T0, windows: 2 }))
-  stageRequest(a, 'd1')
-  await tick(a)
-  expect(whys(a).at(-1)).toBe('duplicate_ack')
-  expect(a.mcpCalls).toHaveLength(2)
-})
-
-// 只有"两个名字都抛异常"起退避。超时（挂住不等于没有这个服务）、服务回应了的各种结果都不起，下一次点击照常调用。
-const noBackoffRows: { label: string; setup: (a: AppWorld) => void; why: string; settle: number }[] = [
+// 每种结果之后，下一次点击都照常调用：超时（挂住不等于没有这个服务）、两个名字都抛异常、服务回应了的各种结果都是如此。
+const outcomeRows: { label: string; setup: (a: AppWorld) => void; why: string; settle: number }[] = [
   { label: 'a timeout', setup: (a) => (a.mcp.ccd_session_mgmt = 'hang'), why: 'mcp_timeout', settle: 5000 },
   {
     label: 'the first name throwing and the second hanging',
@@ -3364,9 +3240,18 @@ const noBackoffRows: { label: string; setup: (a: AppWorld) => void; why: string;
     why: 'app_unavailable:not_applicable',
     settle: 0,
   },
+  {
+    label: 'both server names throwing',
+    setup: (a) => {
+      a.mcp.ccd_session_mgmt = 'throw'
+      a.mcp['ccd-session-mgmt'] = 'throw'
+    },
+    why: 'mcp_error:HooksError',
+    settle: 0,
+  },
 ]
-for (const row of noBackoffRows) {
-  appScenario('app flow: ' + row.label + ' does not start a backoff', async (a, $) => {
+for (const row of outcomeRows) {
+  appScenario('app flow: every outcome leaves the next click callable: ' + row.label, async (a, $) => {
     row.setup(a)
     await boot(a, $)
     stageRequest(a, 'n1')
@@ -3376,7 +3261,7 @@ for (const row of noBackoffRows) {
     const callsBefore = a.mcpCalls.length
     a.mcp.ccd_session_mgmt = APP_OK
     a.mcp['ccd-session-mgmt'] = APP_OK
-    await a.clock.advance(12000) // 过了 10 秒的限频，下一次点击才到得了退避那一关
+    await a.clock.advance(12000) // 过了 10 秒的限频，下一次点击才会真的调用
     stageRequest(a, 'n2')
     await tick(a)
     expect(a.mcpCalls.length, row.label + ': the next click calls again').toBeGreaterThan(callsBefore)

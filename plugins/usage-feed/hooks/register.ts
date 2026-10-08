@@ -4,15 +4,14 @@
 //
 // 任务栏小窗点 Refresh now 时会写请求文件。本插件按 REFRESH_POLL_MS 定时看一眼该文件，
 // 发现新请求就向桌面应用要一次账号级用量（不发模型请求），再按合并规则更新快照、写确认。
-// 终端会话没有这个服务，调用失败时只记事件日志、不写确认，并在 APP_BACKOFF_MS 内不再试。
+// 终端会话没有这个服务，调用失败时只记事件日志、不写确认。
 //
 // 设计约束（只做没风险的事，不能拖垮电脑）。改动前先确认不破坏：
 //  - 引擎调用面共九个：$.session.usage()（不带参数）、$.session.id()、$.clock.now()、
 //    $.clock.every()、$.clock.after()、$.fs.read(path)、$.fs.write(path, text)、
 //    $.fs.exists(path)、$.mcp.call()。$.mcp.call 只在发现新的刷新请求时才调，且只调
 //    ccd_session_mgmt（或同一服务的另一种写法 ccd-session-mgmt）的 get_usage，参数为空对象，
-//    不发模型请求。两个名字共用一个 APP_CALL_TIMEOUT_MS 的期限（见 callApp），不是各等各的；
-//    两个名字都抛异常（终端会话没有这个服务）之后，APP_BACKOFF_MS 内本会话不再调用，点击只记一条 mcp_backoff。
+//    不发模型请求。两个名字共用一个 APP_CALL_TIMEOUT_MS 的期限（见 callApp），不是各等各的。
 //    定时检查（每 REFRESH_POLL_MS 一次）请求文件不存在时每期只做一次 $.fs.exists；
 //    小窗点过一次之后请求文件一直在（小窗不删它，本插件也没有删文件的接口），此后每期再多一次
 //    $.fs.read（API 没有 stat 或监听，读本身省不掉）；读到的文本与上一次处理完的完全相同就直接返回，
@@ -27,7 +26,7 @@
 //    请求与确认超过 MAX_SMALL_CHARS、桌面应用返回的 JSON 文本超过 MAX_PAYLOAD_CHARS，一律当作不可用，
 //    与解析失败走同一条路，别的写入方留下的大文件不会被每个 hook、每三秒解析一遍（小窗对它读的两个文件也设了上限）。
 //  - 事件日志只用于排障。每次 hook 被调用记一条；处理一个新的刷新请求也记一条
-//    （含因确认已存在、限频或 mcp 退避而跳过的情形，各记一条；请求太旧、来自未来、格式不对、
+//    （含因确认已存在或限频而跳过的情形，各记一条；请求太旧、来自未来、格式不对、
 //    本会话已见过的静默忽略，不记）。最多保留最近 EVENT_CAP（200）条。每条只含：
 //    t（时间，引擎时钟的毫秒数）、ev（事件名 session.start、session.measure、refresh.app）、
 //    sid（会话 id）、n 与 kinds（引擎给的限额条数与种类）、kept（保留下来的窗口数）、
@@ -122,9 +121,6 @@ const APP_CALL_GAP_MS = 10000
 // 前一个慢慢失败、后一个再各等 5 秒的话，一次尝试可以拖到 10 秒，超过小窗的 8 秒。上限若更长（例如 15 秒），
 // 一次耗时 8 到 15 秒的调用会在插件这边成功（写了 usage.json 和确认），而小窗早已显示 no session。
 const APP_CALL_TIMEOUT_MS = 5000
-// 两个服务器名都抛异常之后，本会话这么久内不再调用桌面应用：抛异常说明这个会话里没有这个服务（终端会话），
-// 再试只会每次点击都白调两次、记两次失败。用引擎时钟；时钟被往回调时按已过期处理，与限频同一做法。
-const APP_BACKOFF_MS = 10 * 60 * 1000
 // 同一服务的两种写法，依次尝试；第一个调用没抛异常的就用，不是失败后重试。
 const APP_SERVERS = ['ccd_session_mgmt', 'ccd-session-mgmt'] as const
 const APP_TOOL = 'get_usage'
@@ -679,8 +675,7 @@ const logEvent = async (
 // 同一次模块加载里定时检查的会话内状态，放在 register 闭包里，热重载重新调用 register 时自然重置。
 // started 保证同一时刻只有一个定时器，busy 保证检查不重叠，lastSeenId 保证同一个请求不被本会话重复处理，
 // lastSeenText 是最近一次处理完的请求文件文本（不超过 MAX_SMALL_CHARS 的才记），下一期读到完全相同的文本就不再解析，
-// lastCallAt 用来限频，appFailAt 是最近一次两个服务器名都抛异常的引擎时间（毫秒），用来在 APP_BACKOFF_MS 内不再调用，
-// 有名字回应过就清回 null。badEventsMark 是 logEvent 第一次遇到读不出的事件日志时记下的文本特征（两次确认，见 logEvent）。
+// lastCallAt 用来限频。badEventsMark 是 logEvent 第一次遇到读不出的事件日志时记下的文本特征（两次确认，见 logEvent）。
 // 其余字段服务于两道兜底（见文件头）：timer 是当前间隔的句柄；ticks 是间隔回调
 // 触发的总次数，只在回调里加一，用来判断间隔是否还活着；lastCheckAt 与 ticksAtCheck 是上一次判断时
 // 记下的引擎时间与那一刻的 ticks；busyPeriods 是当前这次处理已经挡掉了几期；runId 标识当前这一次处理。
@@ -690,7 +685,6 @@ type WatchCtx = {
   lastSeenId: string | null
   lastSeenText: string | null
   lastCallAt: number | null
-  appFailAt: number | null
   badEventsMark: string | null
   timer: unknown
   ticks: number
@@ -744,7 +738,7 @@ export type AppCall = { kind: 'answered'; res: unknown } | { kind: 'timeout' } |
 // 什么都不写。结束时一定取消计时器。
 // 两个名字都抛异常时 err 是第一个名字的：第一个才是正主，后一个多半只是"没有这个服务"，
 // 让它覆盖掉前一个，日志里的 mcp_error:<错误名> 就把真正的原因藏起来了。
-// $.clock.after 同步抛异常几乎不会发生；发生时一个调用都没发出，按失败处理（记成 mcp_error:<错误名>，也起退避），
+// $.clock.after 同步抛异常几乎不会发生；发生时一个调用都没发出，按失败处理（记成 mcp_error:<错误名>），
 // 尽管 get_usage 一次都没发出。why 的取值是封闭的清单，所以不为它另设取值，排障时按此理解。
 export const callApp = async ($: EngineInterface): Promise<AppCall> => {
   let deadline: Deadline
@@ -782,23 +776,15 @@ export const callApp = async ($: EngineInterface): Promise<AppCall> => {
 // 调用抛异常、超时、isError、解析失败、时钟坏都不写确认：另一个会话可能马上成功，
 // 失败的会话不能抢先写一个会让小窗误判的确认；小窗靠超时判断没有会话回应。
 // unavailable 也要写确认：调用通了但没有可用数据，让小窗立刻显示结果，而不是干等超时。
-// 退避记录：两个名字都抛异常记下这次尝试开始的引擎时间 startMs；有名字回应了（哪怕回应是 isError 或读不懂）
-// 说明服务在，清掉记录；超时不动它，挂住不等于没有这个服务。
 const refreshFromApp = async (
   $: EngineInterface,
-  ctx: WatchCtx,
-  startMs: number,
   target: string,
   ackTarget: string,
   requestId: string,
 ): Promise<Outcome> => {
   const call = await callApp($)
   if (call.kind === 'timeout') return outcome({ why: 'mcp_timeout' })
-  if (call.kind === 'failed') {
-    ctx.appFailAt = startMs
-    return outcome({ why: 'mcp_error:' + errName(call.err) })
-  }
-  ctx.appFailAt = null
+  if (call.kind === 'failed') return outcome({ why: 'mcp_error:' + errName(call.err) })
   const res = call.res
   if (isRecord(res) && res.isError === true) return outcome({ why: 'app_is_error' })
   const payload = extractPayload(res)
@@ -879,7 +865,6 @@ const noteRequestText = (ctx: WatchCtx, text: unknown): void => {
 // 太旧或来自未来的请求静默忽略，不记日志：多半是重启后残留的旧文件，记了只是噪声。
 // lastCallAt 记在调用之前：这次调用失败也算一次，连点不会把桌面应用打爆。
 // 限频用本会话两次 nowMs 之差，与请求年龄同一个引擎时钟，不另取别的时间。
-// 退避在限频之后：限频先把紧接着的连点挡掉（记 throttled），过了限频才看 appFailAt。退避期内不调用，也就不动 lastCallAt。
 const handleRequest = async (
   $: EngineInterface,
   ctx: WatchCtx,
@@ -929,18 +914,8 @@ const handleRequest = async (
         return
       }
     }
-    // 两个服务器名都抛过异常的会话（终端会话）：APP_BACKOFF_MS 内不再调用，这次点击只记一条 mcp_backoff，
-    // 让排障日志仍能看出点击到了这个会话。不写确认（失败的会话不能让别的会话的点击看起来失败）。
-    // 恰好相差 APP_BACKOFF_MS 就重试；差为负（时钟被往回调过）按已过期处理，与限频同一做法。
-    if (ctx.appFailAt !== null) {
-      const sinceFail = nowMs - ctx.appFailAt
-      if (sinceFail >= 0 && sinceFail < APP_BACKOFF_MS) {
-        await logEvent($, ctx, eventsTarget, 'refresh.app', outcome({ why: 'mcp_backoff', nowMs }), [])
-        return
-      }
-    }
     ctx.lastCallAt = nowMs
-    const result = await refreshFromApp($, ctx, nowMs, target, ackTarget, req.id)
+    const result = await refreshFromApp($, target, ackTarget, req.id)
     await logEvent($, ctx, eventsTarget, 'refresh.app', result, [])
   } catch {
     // 任何异常直接结束。
@@ -1042,7 +1017,6 @@ export const register: Register = (on, options) => {
     lastSeenId: null,
     lastSeenText: null,
     lastCallAt: null,
-    appFailAt: null,
     badEventsMark: null,
     timer: null,
     ticks: 0,

@@ -5,7 +5,7 @@ import pathlib
 import sys
 import unittest
 from ctypes import wintypes
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import usage_widget as widget
@@ -101,7 +101,10 @@ class WindowEventTests(unittest.TestCase):
                     app.w32.taskbar_autohide.return_value = True
                 else:
                     app.w32.class_name.return_value = "NotifyIconOverflowWindow"
+                    # An overlapping shell panel makes the real taskbar_above false as well:
+                    # it is "taskbar above and the raise allowed".
                     app.w32.topmost_allowed.return_value = False
+                    app.w32.taskbar_above.return_value = False
                 app.on_z_order_check()
                 app.w32.keep_topmost.assert_not_called()
                 if mode in ("fullscreen", "autohide"):
@@ -167,6 +170,155 @@ class WindowEventTests(unittest.TestCase):
         self.assertEqual(order, ["unhook", "destroy"])
         app.w32.post_z_order_check.assert_not_called()
         app.w32.keep_topmost.assert_not_called()
+
+
+class TopmostReassertTests(unittest.TestCase):
+    """The 2 s check is a fallback: it reasserts the window order only while the taskbar covers the
+    widget (the same taskbar_above test as on_z_order_check), plus once when the widget is shown
+    again. Raising a topmost window on every tick fights other topmost windows (an on-screen
+    keyboard, recording overlays) and notifies every EVENT_OBJECT_REORDER hook in the system."""
+
+    def test_check_tick_does_not_reassert_while_the_taskbar_is_not_above(self):
+        app = make_app()
+        app.w32.taskbar_above.return_value = False
+        for _ in range(5):
+            app.on_timer(widget.TIMER_CHECK)
+        self.assertEqual(app.w32.taskbar_above.call_args_list, [call(app.hwnd)] * 5)
+        app.w32.keep_topmost.assert_not_called()
+        app.w32.show_window.assert_not_called()
+
+    def test_check_tick_reasserts_on_every_tick_while_the_taskbar_covers_the_widget(self):
+        app = make_app()
+        for _ in range(3):
+            app.on_timer(widget.TIMER_CHECK)
+        self.assertEqual(app.w32.keep_topmost.call_args_list, [call(app.hwnd)] * 3)
+
+    def test_check_tick_follows_the_cover_state_tick_by_tick(self):
+        app = make_app()
+        app.w32.taskbar_above.side_effect = [False, True, False, True]
+        raised = []
+        for _ in range(4):
+            before = app.w32.keep_topmost.call_count
+            app.on_timer(widget.TIMER_CHECK)
+            raised.append(app.w32.keep_topmost.call_count - before)
+        self.assertEqual(raised, [0, 1, 0, 1])
+
+    def test_refresh_without_the_reassert_request_never_touches_the_window_order(self):
+        app = make_app()
+        app.refresh_view()
+        app.refresh_view(force=True)
+        app.w32.taskbar_above.assert_not_called()
+        app.w32.topmost_allowed.assert_not_called()
+        app.w32.keep_topmost.assert_not_called()
+
+    def test_shown_again_widget_is_raised_once_even_when_the_taskbar_is_not_above(self):
+        app = make_app()
+        app.visible = False
+        app.w32.taskbar_above.return_value = False
+        app.refresh_view(reassert_topmost=True)
+        app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_SHOWNOACTIVATE)
+        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+        self.assertTrue(app.visible)
+        # Visible now: the next tick falls back to the cover test, which says no.
+        app.refresh_view(reassert_topmost=True)
+        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+
+    def test_shown_again_widget_is_raised_even_when_a_plain_refresh_shows_it(self):
+        # The 15 s poll, a theme change or a system message can be the refresh that re-shows
+        # the widget; it must not wait for the taskbar to cover it first.
+        app = make_app()
+        app.visible = False
+        app.w32.taskbar_above.return_value = False
+        app.refresh_view()
+        app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_SHOWNOACTIVATE)
+        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+        app.w32.taskbar_above.assert_not_called()
+
+    def test_shown_again_widget_stays_put_when_a_shell_panel_overlaps_it(self):
+        app = make_app()
+        app.visible = False
+        app.w32.taskbar_above.return_value = False
+        app.w32.topmost_allowed.return_value = False
+        app.refresh_view(reassert_topmost=True)
+        app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_SHOWNOACTIVATE)
+        app.w32.topmost_allowed.assert_called_once_with(app.hwnd)
+        app.w32.keep_topmost.assert_not_called()
+
+    def test_fullscreen_exit_shows_and_raises_once_then_waits_for_the_taskbar(self):
+        app = make_app()
+        app.w32.taskbar_above.return_value = False
+        app.w32.notification_state.return_value = 3  # a full-screen app is running
+        app.on_timer(widget.TIMER_CHECK)
+        app.on_timer(widget.TIMER_CHECK)
+        self.assertFalse(app.visible)
+        app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_HIDE)
+        app.w32.keep_topmost.assert_not_called()
+        app.w32.notification_state.return_value = 5  # it has ended
+        app.on_timer(widget.TIMER_CHECK)
+        self.assertTrue(app.visible)
+        self.assertEqual(app.w32.show_window.call_args_list, [
+            call(app.hwnd, widget.SW_HIDE), call(app.hwnd, widget.SW_SHOWNOACTIVATE)])
+        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+        for _ in range(3):
+            app.on_timer(widget.TIMER_CHECK)
+        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+
+
+class MoveToTests(unittest.TestCase):
+    """geom must follow the window, so a SetWindowPos that failed has to be retried."""
+
+    def moved_app(self):
+        app = make_app()
+        app._apply = widget.WidgetApp._apply.__get__(app, widget.WidgetApp)
+        app.geom = None
+        display = widget.build_display(None, 0.0, "dark", 1.0, 36)
+        app._apply(display, (100, 100, display.width, display.height), True)
+        app.w32.move_window.reset_mock()
+        return app, display
+
+    def test_failed_move_keeps_geom_and_reports_failure(self):
+        app, display = self.moved_app()
+        before = app.geom
+        app.w32.move_window.return_value = False
+        self.assertFalse(app.move_to(130, 100))
+        app.w32.move_window.assert_called_once_with(app.hwnd, 130, 100)
+        self.assertEqual(app.geom, before)
+
+    def test_successful_move_updates_position_only(self):
+        app, display = self.moved_app()
+        app.w32.move_window.return_value = True
+        self.assertTrue(app.move_to(130, 104))
+        self.assertEqual(app.geom, (130, 104, display.width, display.height))
+
+    def test_apply_retries_a_failed_move_until_it_succeeds(self):
+        app, display = self.moved_app()
+        target = (130, 100, display.width, display.height)
+        app.w32.move_window.return_value = False
+        app._apply(display, target, False)
+        app._apply(display, target, False)
+        self.assertEqual(app.w32.move_window.call_args_list, [call(app.hwnd, 130, 100)] * 2)
+        self.assertEqual(app.geom[:2], (100, 100))
+        app.w32.move_window.return_value = True
+        app._apply(display, target, False)
+        self.assertEqual(app.w32.move_window.call_count, 3)
+        self.assertEqual(app.geom, target)
+        # In place now: nothing left to retry.
+        app._apply(display, target, False)
+        self.assertEqual(app.w32.move_window.call_count, 3)
+
+    def test_failed_drag_step_leaves_geom_at_the_real_position(self):
+        app, display = self.moved_app()
+        app.taskbar = ((0, 100, 1000, 140), widget.ABE_BOTTOM)
+        app.drag = {"cursor_x": 10, "window_x": 100, "moved": False}
+        app.w32.cursor_pos.return_value = (50, 8)
+        app.w32.move_window.return_value = False
+        app.on_mouse_move(widget.MK_LBUTTON)
+        app.w32.move_window.assert_called_once_with(app.hwnd, 140, 100)
+        self.assertTrue(app.drag["moved"])
+        self.assertEqual(app.geom[:2], (100, 100))
+        app.w32.move_window.return_value = True
+        app.on_mouse_move(widget.MK_LBUTTON)
+        self.assertEqual(app.geom[:2], (140, 100))
 
 
 class Win32EventTests(unittest.TestCase):

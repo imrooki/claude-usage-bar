@@ -333,6 +333,9 @@ class OwnerWindowTests(unittest.TestCase):
                 def reenter(*args):
                     self.assertTrue(app._busy)
                     app.window_proc(app.hwnd, widget.WM_SETTINGCHANGE, 0, 0)
+                    # SetWindowPos reports success with a true value; a falsy result is a
+                    # failed move, which move_to retries instead of recording the position.
+                    return True
 
                 native_call = getattr(app.w32, operation)
                 native_call.reset_mock()

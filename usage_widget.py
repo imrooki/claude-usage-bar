@@ -1537,6 +1537,7 @@ def _pill_mask(width, height, radius):
     return big.resize((width, height), Image.Resampling.BOX)
 
 
+@functools.lru_cache(maxsize=256)
 def _compose_bar(width, height, radius, fill_width, track_rgba, fill_rgba):
     """进度条（空槽加填充）的直通 alpha RGBA 图，像素在整数域里精确合成。
 
@@ -1547,6 +1548,11 @@ def _compose_bar(width, height, radius, fill_width, track_rgba, fill_rgba):
         颜色 = (Cf * wf + Ct * wt) / (wf + wt)，alpha = (wf + wt) / 255²
     内部像素（f = 255）恰好得到填充色与 Af，空槽内部（f = 0，t = 255）恰好得到
     空槽色与 At；圆角边缘按覆盖度在预乘空间里过渡，不会出现染暗的毛边。
+
+    逐像素的 Python 循环，一条约 1 毫秒；入参的取值范围很小（尺寸随 scale 变化，填充宽度
+    最多 bar 宽 + 1 种，颜色只有几种），所以结果按入参缓存，同一个画面里的各条进度条和
+    相邻两帧都直接复用。缓存返回的是同一个图对象：调用方只能读它（paste 不改源图），不得
+    原地修改。
     """
     track_mask = _pill_mask(width, height, radius).tobytes()
     if fill_rgba is not None and fill_width > 0:
@@ -1686,6 +1692,8 @@ def render_display(display):
       - 文字画在一张"预先填好文字颜色、alpha 为 0"的图层上，抗锯齿边缘只改变 alpha，
         颜色保持不变；直接画在透明底上会把颜色朝黑色混合，预乘后边缘就偏暗偏细。
       - 进度条由 _compose_bar 精确合成，保证内部像素恰为规定的颜色与 alpha。
+    元组相等画面就相同，所以 WidgetApp 会把最近一次的结果按显示元组缓存起来复用；
+    返回的图因此不得被原地修改，要变暗请用 dim_image 另取新图。
     """
     theme = display.theme
     text_rgb = TEXT_RGB[theme]
@@ -1729,16 +1737,6 @@ def render_display(display):
     return Image.merge("RGBA", (red, green, blue, alpha.point(_ALPHA_FLOOR)))
 
 
-@functools.lru_cache(maxsize=1)
-def _premultiply_table():
-    """按 alpha 分行、按通道值分列：floor(c * a / 255)。
-
-    向下取整保证预乘后的通道值不超过 alpha；UpdateLayeredWindow 要求预乘数据满足
-    这一点，否则会画出错误的颜色。
-    """
-    return tuple(bytes((c * a) // 255 for c in range(256)) for a in range(256))
-
-
 def dim_image(image, scale):
     """返回一张新的 RGBA 图：alpha 乘 scale 后向下取整，且不低于 BACKGROUND_ALPHA。
 
@@ -1752,18 +1750,18 @@ def dim_image(image, scale):
 
 
 def premultiply_bgra(image):
-    """RGBA 图转成预乘 alpha 的 BGRA 字节串（每个像素 B、G、R 乘 a/255 后向下取整）。"""
+    """RGBA 图转成预乘 alpha 的 BGRA 字节串（每个像素 B、G、R 乘 a/255），供 UpdateLayeredWindow 提交。
+
+    交给 Pillow 的原生转换：先对调红、蓝两个通道，再转成预乘的 RGBa 模式，取出的字节顺序
+    就是 B、G、R、A。以前是逐像素的 Python 生成器，高 DPI 下每帧 3 到 12 毫秒，现在不到
+    1 毫秒。Pillow 把 c * a / 255 四舍五入，原来的实现向下取整，所以每个字节最多差 1。
+    UpdateLayeredWindow 要求的不变式不受影响：每个像素的 B、G、R 都不超过 alpha（c 不大于
+    255，c * a / 255 取整后不会大于 a）。传入的图不改。
+    """
     if image.mode != "RGBA":
         raise ValueError("expected an RGBA image, got %s" % image.mode)
-    data = image.tobytes()
-    alphas = data[3::4]
-    table = _premultiply_table()
-    out = bytearray(len(data))
-    out[0::4] = bytes(table[a][c] for a, c in zip(alphas, data[2::4]))
-    out[1::4] = bytes(table[a][c] for a, c in zip(alphas, data[1::4]))
-    out[2::4] = bytes(table[a][c] for a, c in zip(alphas, data[0::4]))
-    out[3::4] = alphas
-    return bytes(out)
+    red, green, blue, alpha = image.split()
+    return Image.merge("RGBA", (blue, green, red, alpha)).convert("RGBa").tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -3253,18 +3251,52 @@ class WidgetApp:
         geom = compute_layout(rect, edge, scale, display.width, self.mode, self.offset, tray)
         self.scale = scale
         self._apply(display, geom, force)
-        if not self.visible:
+        shown_now = not self.visible
+        if shown_now:
             self.w32.show_window(self.hwnd, SW_SHOWNOACTIVATE)
             self.visible = True
-        if reassert_topmost and self.w32.topmost_allowed(self.hwnd):
+        # 只在需要时恢复置顶层级：任务栏确实盖在小窗上方，判据与 on_z_order_check 相同
+        # （taskbar_above：任务栏在上方，且没有重叠的系统面板）。以前只要允许就每 2 秒无条件
+        # 置顶一次，会和屏幕键盘、录屏浮层这类置顶窗口来回抢层级，还让系统里每个
+        # EVENT_OBJECT_REORDER 钩子都被通知一遍。例外：小窗刚从隐藏变为显示（例如全屏应用
+        # 退出之后）时它可能落在置顶带的任何位置，所以只要允许就无条件置顶一次；这一轮
+        # 是不是 TIMER_CHECK 带着 reassert_topmost 来的都一样，否则恰好由 15 秒轮询重新
+        # 显示的小窗就要等到任务栏盖住它才会被抬起来。
+        if shown_now:
+            raise_window = self.w32.topmost_allowed(self.hwnd)
+        elif reassert_topmost:
+            raise_window = self.w32.taskbar_above(self.hwnd)
+        else:
+            raise_window = False
+        if raise_window:
             self.w32.keep_topmost(self.hwnd)
 
+    # 最近一次渲染的未变暗画面：(显示元组, RGBA 图)。类级默认 None，首次渲染后落到实例上。
+    _frame = None
+
+    def _frame_image(self, display):
+        """显示元组对应的未变暗画面，与上一次相同的元组直接复用。
+
+        元组相等画面就相同（见 build_display），所以点 Refresh now 时变暗、恢复和前面那次
+        带反馈文字的重绘用的是同一个元组，只渲染第一次，之后只重新预乘并提交。缓存里是
+        未变暗的原图：变暗由调用方用 dim_image 另取新图，绝不改它。渲染抛错时缓存保持原样。
+        """
+        frame = self._frame
+        if frame is not None and frame[0] == display:
+            return frame[1]
+        image = render_display(display)
+        self._frame = (display, image)
+        return image
+
     def _apply(self, display, geom, force):
-        """内容或尺寸变了就重绘并提交位图（同时设定位置与尺寸），只是位置变了才移动。"""
+        """内容或尺寸变了就重绘并提交位图（同时设定位置与尺寸），只是位置变了才移动。
+
+        重绘时画面按显示元组缓存（_frame_image），变暗只作用在缓存图的副本上。
+        """
         x, y, width, height = geom
         old = self.geom
         if force or old is None or old[2:] != (width, height) or display != self.shown_display:
-            image = render_display(display)
+            image = self._frame_image(display)
             if self._flashing:
                 image = dim_image(image, FLASH_ALPHA_SCALE)
             data = premultiply_bgra(image)
@@ -3277,8 +3309,15 @@ class WidgetApp:
             self.move_to(x, y)
 
     def move_to(self, x, y):
-        self.w32.move_window(self.hwnd, x, y)
-        self.geom = (x, y, self.geom[2], self.geom[3])
+        """只移动窗口，SetWindowPos 成功才记下新位置，返回是否成功。
+
+        失败时 geom 保持原值，下一轮刷新仍会看到位置差异并重试；记下没移成的位置会让
+        重试一直被压住，直到位置再次变化。
+        """
+        moved = bool(self.w32.move_window(self.hwnd, x, y))
+        if moved:
+            self.geom = (x, y, self.geom[2], self.geom[3])
+        return moved
 
     def _hide(self):
         if self.visible:
@@ -3605,7 +3644,11 @@ class WidgetApp:
         self.refresh_view()
 
     def _end_flash(self):
-        """结束变暗。先丢掉已显示的元组，下一轮即使被挡住也会重画未变暗的画面。"""
+        """结束变暗。先丢掉已显示的元组，下一轮即使被挡住也会重画未变暗的画面。
+
+        丢掉的只是"窗口里现在是什么"的记录，渲染缓存（_frame_image）不受影响：重画只重新
+        预乘并提交，不再渲染。
+        """
         self._flashing = False
         self.shown_display = None
         self.refresh_view(force=True)
@@ -3636,9 +3679,10 @@ class WidgetApp:
     def _begin_flash(self):
         """刷新后把画面短暂变暗再恢复，数据没变时点击也有可见反馈。
 
-        闪烁不进显示元组，所以开始和结束都用 force=True 重绘。已经在闪时再点刷新
-        只重设定时器，不再多画一次。重绘抛错也要建上定时器；定时器建不起来就立刻
-        取消变暗，避免小窗一直停在暗的画面上。
+        闪烁不进显示元组，所以开始和结束都用 force=True 重绘；显示元组通常与前面那次带
+        反馈文字的重绘相同，此时命中渲染缓存，只重新预乘并提交，不再渲染。已经在闪时
+        再点刷新只重设定时器，不再多画一次。重绘抛错也要建上定时器；定时器建不起来就
+        立刻取消变暗，避免小窗一直停在暗的画面上。
         """
         if self.exiting or not self.hwnd:
             return

@@ -1733,12 +1733,17 @@ class SourceGuardTests(unittest.TestCase):
         # Expectation updated on purpose. The callback factory is WINFUNCTYPE on Windows and
         # CFUNCTYPE elsewhere (so the offline tests can import the module), and the literal name
         # now appears once in the fallback line instead of once per callback. Pin the fallback
-        # line and the two callback definitions by name, so a third callback type still fails.
+        # line and the two callback definitions by name, and count every spelling of the factory
+        # in the whole file: a callback built indented (inside a method) or through a second
+        # getattr fallback at module level must fail too.
         self.assertIn(
             '_CALLBACK_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)', self.source)
         self.assertEqual(
             re.findall(r"^(\w+) = _CALLBACK_TYPE\(", self.source, re.M),
             ["WNDPROC", "WINEVENTPROC"])
+        self.assertEqual(self.source.count("_CALLBACK_TYPE("), 2)
+        self.assertEqual(self.source.count("WINFUNCTYPE"), 1)
+        self.assertEqual(self.source.count("ctypes.CFUNCTYPE"), 1)
 
     def test_timer_ids_are_unique(self):
         values = []

@@ -71,5 +71,12 @@ class PollThemeTests(unittest.TestCase):
         self.assertEqual(self.app.w32.update_layered.call_count, 3)
 
 
+class ReadLightThemeTests(unittest.TestCase):
+    def test_without_the_registry_module_the_theme_reads_as_light(self):
+        # Offline runs have no winreg; the fallback is light, the same as an unreadable value.
+        with patch.object(widget, "winreg", None):
+            self.assertTrue(widget.read_light_theme())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 """Startup and error log: the data folder, parse_args warnings, log rotation and the no-file caption.
 
-Everything runs on temporary folders with the window (run_app) and the console (say) patched out.
+Everything runs on temporary folders, with the Win32 layer, the window (WidgetApp) and the console
+(say) replaced by fakes.
 """
 
 import json
@@ -10,7 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import usage_widget as widget
@@ -43,47 +44,116 @@ class TempFolderTestCase(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Data folder: main creates it, and says so once when it cannot
+# Data folder: only the running instance creates it, and says so once when it cannot
 # ---------------------------------------------------------------------------
 
-class DataFolderStartupTests(TempFolderTestCase):
-    def run_main(self, argv):
-        """main with the window stubbed out. Returns (exit code, say mock, run_app mock)."""
-        with patch.object(widget, "run_app", return_value=0) as run_app, \
+ALREADY_EXISTS = widget.ERROR_ALREADY_EXISTS
+
+
+class StartupTestCase(TempFolderTestCase):
+    def run_main(self, argv, mutex=(1234, 0), app=None, w32=None):
+        """main() with the Win32 layer, the window (WidgetApp) and the console (say) replaced.
+
+        mutex is what create_mutex returns: (handle, GetLastError). Returns
+        (exit code, say mock, Win32 mock, WidgetApp class mock).
+        """
+        if w32 is None:
+            w32 = Mock()
+            w32.create_mutex.return_value = mutex
+        if app is None:
+            app = Mock()
+            app.run.return_value = 0
+        with patch.object(widget, "Win32", return_value=w32), \
+                patch.object(widget, "WidgetApp", return_value=app) as app_cls, \
                 patch.object(widget, "say") as say:
             code = widget.main(argv)
-        return code, say, run_app
+        return code, say, w32, app_cls
 
-    def test_missing_data_folder_is_created_before_the_app_starts(self):
+
+class DataFolderStartupTests(StartupTestCase):
+    def test_missing_data_folder_is_created_after_the_instance_check_and_before_the_app(self):
         target = os.path.join(self.root, "nested", "data")
-        code, say, run_app = self.run_main(["--data-dir", target])
+        seen = []
+
+        def create_mutex(name):
+            seen.append(("mutex", os.path.isdir(target)))
+            return 1234, 0
+
+        def start_app(opts, _win32, _log):
+            seen.append(("app", os.path.isdir(target)))
+            app = Mock()
+            app.run.return_value = 0
+            return app
+
+        w32 = Mock()
+        w32.create_mutex.side_effect = create_mutex
+        with patch.object(widget, "Win32", return_value=w32), \
+                patch.object(widget, "WidgetApp", side_effect=start_app), \
+                patch.object(widget, "say") as say:
+            code = widget.main(["--data-dir", target])
         self.assertEqual(code, 0)
-        self.assertTrue(os.path.isdir(target))
+        self.assertEqual(seen, [("mutex", False), ("app", True)])
         say.assert_not_called()
-        run_app.assert_called_once()
-        self.assertEqual(run_app.call_args.args[0].data_dir, os.path.abspath(target))
 
     def test_existing_data_folder_is_left_alone(self):
         target = os.path.join(self.root, "data")
         os.mkdir(target)
         marker = os.path.join(target, "usage.json")
         self.write_bytes(marker, b"{}")
-        code, say, run_app = self.run_main(["--data-dir", target])
+        code, say, w32, app_cls = self.run_main(["--data-dir", target])
         self.assertEqual(code, 0)
         say.assert_not_called()
+        app_cls.assert_called_once()
         self.assertEqual(self.read_bytes(marker), b"{}")
 
     def test_uncreatable_data_folder_is_reported_once_and_startup_continues(self):
         blocker = os.path.join(self.root, "blocker")
         self.write_bytes(blocker, b"a file, not a folder")
         target = os.path.join(blocker, "data")
-        code, say, run_app = self.run_main(["--data-dir", target])
+        code, say, w32, app_cls = self.run_main(["--data-dir", target])
         self.assertEqual(code, 0)
-        run_app.assert_called_once()
+        app_cls.assert_called_once()
         self.assertEqual(say.call_count, 1)
         message = say.call_args.args[0]
         self.assertIn(os.path.abspath(target), message)
         self.assertIn("could not be created", message)
+
+    def test_second_instance_creates_no_folder_and_writes_nothing(self):
+        target = os.path.join(self.root, "other", "data")
+        code, say, w32, app_cls = self.run_main(
+            ["--data-dir", target, "--bogus"], mutex=(1234, ALREADY_EXISTS))
+        self.assertEqual(code, 0)
+        self.assertEqual(os.listdir(self.root), [])
+        app_cls.assert_not_called()
+        w32.close_handle.assert_called_once_with(1234)
+        # Only the "already running" line: the second start does not print or log its warnings.
+        self.assertEqual(say.call_count, 1)
+        self.assertIn("already running", say.call_args.args[0])
+
+    def test_failed_mutex_creates_no_folder(self):
+        target = os.path.join(self.root, "data")
+        code, say, w32, app_cls = self.run_main(["--data-dir", target], mutex=(0, 5))
+        self.assertEqual(code, 1)
+        self.assertEqual(os.listdir(self.root), [])
+        app_cls.assert_not_called()
+
+    def test_failed_mutex_logs_only_into_a_folder_that_already_exists(self):
+        target = os.path.join(self.root, "data")
+        os.mkdir(target)
+        code, say, w32, app_cls = self.run_main(["--data-dir", target], mutex=(0, 5))
+        self.assertEqual(code, 1)
+        lines = self.read_text(os.path.join(target, widget.ERROR_LOG_NAME)).splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("MutexError: CreateMutexW failed, error 5", lines[0])
+
+    def test_failure_before_the_instance_check_creates_no_folder(self):
+        target = os.path.join(self.root, "data")
+        with patch.object(widget, "Win32", side_effect=OSError("no user32")), \
+                patch.object(widget, "say") as say:
+            code = widget.main(["--data-dir", target])
+        self.assertEqual(code, 1)
+        self.assertEqual(os.listdir(self.root), [])
+        self.assertEqual(say.call_args.args[0], "fatal: OSError: no user32")
 
     def test_selftest_render_does_not_create_the_data_folder(self):
         target = os.path.join(self.root, "data")
@@ -97,12 +167,37 @@ class DataFolderStartupTests(TempFolderTestCase):
         self.assertFalse(os.path.exists(target))
 
 
-class WarningOutputTests(TempFolderTestCase):
+class StartupErrorLogTests(StartupTestCase):
+    def test_error_in_the_window_reaches_the_error_log_in_the_new_folder(self):
+        target = os.path.join(self.root, "data")
+        app = Mock()
+        app.run.side_effect = RuntimeError("boom in the window")
+        code, say, w32, app_cls = self.run_main(["--data-dir", target], app=app)
+        self.assertEqual(code, 1)
+        lines = self.read_text(os.path.join(target, widget.ERROR_LOG_NAME)).splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith("RuntimeError: boom in the window"))
+        self.assertEqual(say.call_args.args[0], "fatal: RuntimeError: boom in the window")
+
+    def test_error_after_the_folder_but_before_the_window_reaches_the_error_log(self):
+        target = os.path.join(self.root, "data")
+        fake_win32 = Mock()
+        fake_win32.create_mutex.return_value = (1234, 0)
+        fake_win32.set_dpi_awareness.side_effect = OSError("no dpi api")
+        code, say, _win32, app_cls = self.run_main(["--data-dir", target], w32=fake_win32)
+        self.assertEqual(code, 1)
+        app_cls.assert_not_called()
+        lines = self.read_text(os.path.join(target, widget.ERROR_LOG_NAME)).splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith("OSError: no dpi api"))
+
+
+class WarningOutputTests(StartupTestCase):
     def test_each_warning_is_logged_and_printed_once(self):
         target = os.path.join(self.root, "data")
-        with patch.object(widget, "run_app", return_value=0), \
-                patch.object(widget, "say") as say:
-            widget.main(["--data-dir", target, "--bogus", "--exit-after=abc"])
+        code, say, w32, app_cls = self.run_main(
+            ["--data-dir", target, "--bogus", "--exit-after=abc"])
+        self.assertEqual(code, 0)
         printed = [item.args[0] for item in say.call_args_list]
         self.assertEqual(len(printed), 2)
         lines = self.read_text(os.path.join(target, widget.ERROR_LOG_NAME)).splitlines()
@@ -112,9 +207,8 @@ class WarningOutputTests(TempFolderTestCase):
 
     def test_clean_arguments_write_no_log_and_print_nothing(self):
         target = os.path.join(self.root, "data")
-        with patch.object(widget, "run_app", return_value=0), \
-                patch.object(widget, "say") as say:
-            widget.main(["--data-dir", target, "--no-codex-ping"])
+        code, say, w32, app_cls = self.run_main(["--data-dir", target, "--no-codex-ping"])
+        self.assertEqual(code, 0)
         say.assert_not_called()
         self.assertFalse(os.path.exists(os.path.join(target, widget.ERROR_LOG_NAME)))
 

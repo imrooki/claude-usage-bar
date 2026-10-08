@@ -59,7 +59,7 @@
 //
 // 并发说明：可能同时运行多个会话，它们都会写同一个文件。"读快照、合并、写快照"
 // 之间没有锁（设计约束禁止加锁等待），极端时序下会丢一次更新；每次事件带的都是全量窗口、
-// 合并基本只增不减（同一会话自己的新读数、账号现取的读数是例外，见 merge 与 mergeApp），
+// 合并基本只增不减（同一会话自己的新读数、账号现取的较低读数是例外，见 merge 与 mergeApp），
 // 下一次事件即自愈，所以不为它引入锁。
 // 事件日志同样是"读、追加、写回"，没有锁，多个会话并发时可能丢记录；极端时序下读到
 // 另一个会话写了一半的日志，readEvents 读不出，这一次不写（丢这一条），下一次读到写完的就接着追加，
@@ -111,15 +111,17 @@ const REQUEST_MAX_AGE_S = 30
 const REQUEST_FUTURE_SLOP_S = 5
 // 下面这两个常量要与小窗（usage_widget.py）的刷新协议对齐，改其中一边时把另一边一起看。
 // 本会话两次调用桌面应用的最小间隔，防止刷新按钮被连点时刷屏。它不能比小窗的重试节奏更长：
-// 小窗等不到确认（APP_REFRESH_WAIT_SECONDS，8 秒）之后，再过 APP_REFRESH_RETRY_SECONDS（10 秒）就允许用户重试，
+// 小窗等不到确认（APP_REFRESH_WAIT_SECONDS，9 秒）之后，再过 APP_REFRESH_RETRY_SECONDS（10 秒）就允许用户重试，
 // 那次重试到达时离上一次调用至少已过 10 秒。间隔若更长（例如 30 秒），这次重试会被限频、得不到回应，
 // 小窗又显示 no session，尽管桌面会话在、数据也是新的。失败或超时的调用同样算一次调用（见 handleRequest）。
 const APP_CALL_GAP_MS = 10000
 // 一次尝试等桌面应用的期限，到期就放弃，不拖住定时检查。小窗写出请求后只等 APP_REFRESH_WAIT_SECONDS
-// （8 秒）的确认，而定时检查每 REFRESH_POLL_MS（3 秒）才看一次请求文件，最坏要等 3 秒才发现请求，所以尝试最多再等
-// 5 秒：3 + 5 = 8，成功的调用最迟约在小窗放弃时写出确认。两个服务器名共用这一个期限（见 callApp）：
-// 前一个慢慢失败、后一个再各等 5 秒的话，一次尝试可以拖到 10 秒，超过小窗的 8 秒。上限若更长（例如 15 秒），
-// 一次耗时 8 到 15 秒的调用会在插件这边成功（写了 usage.json 和确认），而小窗早已显示 no session。
+// （9 秒）的确认，而定时检查每 REFRESH_POLL_MS（3 秒）才看一次请求文件，最坏要等 3 秒才发现请求，所以尝试最多再等
+// 5 秒：3 + 5 = 8，成功的调用最迟约在发现请求后第 5 秒返回，离小窗放弃的 9 秒还剩约 1 秒，留给读写 usage.json 和写确认。
+// 两个服务器名共用这一个期限（见 callApp）：
+// 前一个慢慢失败、后一个再各等 5 秒的话，一次尝试可以拖到 10 秒，超过小窗的 9 秒。上限若更长（例如 15 秒），
+// 一次耗时 6 到 15 秒（小窗的 9 秒减去最坏 3 秒才发现请求）的调用会在插件这边成功（写了 usage.json 和确认），
+// 而小窗早已显示 no session。
 const APP_CALL_TIMEOUT_MS = 5000
 // 同一服务的两种写法，依次尝试；第一个调用没抛异常的就用，不是失败后重试。
 const APP_SERVERS = ['ccd_session_mgmt', 'ccd-session-mgmt'] as const
@@ -141,11 +143,12 @@ type Drops = { [R in DropReason]?: number }
 type Fresh = { used_percentage: number; resets_at: number }
 type Stored = { used_percentage: number; resets_at: number; observed_at: number; session_id: string | null }
 type Windows<T> = { [K in Kind]?: T }
-// 两边都有值时的决定：take 用本次读数（会话 id 也换成本次的）；confirm 保留已存的用量与重置时间，只刷新 observed_at 与会话 id；
-// hold 保留已存的值并记入 held。
+// 两边都有值时的决定：take 用本次读数（会话 id 也换成 mergeWindows 收到的那个：引擎读数是本会话的，账号读数是 null）；
+// confirm 保留已存的用量、重置时间与会话 id，只刷新 observed_at；hold 保留已存的值并记入 held。
 type Decision = 'take' | 'confirm' | 'hold'
-// 同一周期（resets_at 相差不超过 SAME_PERIOD_SECONDS）时的决定，merge 与 mergeApp 只在这里不同。
-type SamePeriod = (n: Fresh, o: Stored, sessionId: string | null) => Decision
+// 同一周期（resets_at 相差不超过 SAME_PERIOD_SECONDS）时的决定，merge 与 mergeApp 只在这里不同。now 是本次合并的时刻（秒），
+// 与 observed_at 同一个时钟；mergeApp 用它看已存的数据有多旧。
+type SamePeriod = (n: Fresh, o: Stored, now: number) => Decision
 type MergeResult = { windows: Windows<Stored>; held: Kind[] }
 
 // feed 的结果，交给 logEvent 记成一行日志。nowMs 与 sessionId 让日志复用 feed 已经读到的值。
@@ -254,12 +257,12 @@ const fromEngine = (list: unknown): { windows: Windows<Fresh>; drops: Drops } =>
 }
 
 // 读进来的文本先看长度再 JSON.parse。不是字符串、超过 maxChars（按字符数）、解析失败都返回 null（不可用）。
-// stripBom 为真时去掉开头的一个 BOM（只去一个：两个就不可用）；别的写入方或编辑器可能留下它。
+// 一律去掉开头的一个 BOM（只去一个：两个就不可用）：别的写入方、编辑器或桌面应用返回的文本块都可能带着它，文件与文本块同一个做法。
 // 返回 null 也可能是合法 JSON 的 null，调用方一律只看它是不是对象，所以两者不必区分。
-const parseJson = (text: unknown, maxChars: number, stripBom = true): unknown => {
+const parseJson = (text: unknown, maxChars: number): unknown => {
   if (typeof text !== 'string' || text.length > maxChars) return null
   try {
-    return JSON.parse(stripBom && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+    return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
   } catch {
     return null
   }
@@ -297,6 +300,7 @@ const mergeSame: SamePeriod = (n, o) => (n.used_percentage >= o.used_percentage 
 // 会话 id 相同时是否一律取新（sessionWins）。缺席的一侧原样保留或直接取新；两边都有值时：
 // 先看会话（sessionWins 为真，且新读数与已存窗口的 session_id 相同、都不是 null），再看周期：
 // 同一周期交给 samePeriod；不同周期更晚的取新（百分比小也取新），更早的留旧。
+// 取新（含原来没有的）写进窗口的会话 id 是 sessionId，账号读数传 null；确认时保留已存窗口自己的 session_id。
 // held 只收录"本次有新读数、但留下了旧值"的 kind，按 KINDS 顺序。
 const mergeWindows = (
   old: Windows<Stored>,
@@ -322,13 +326,13 @@ const mergeWindows = (
     }
     let decision: Decision
     if (sessionWins && sessionId !== null && o.session_id === sessionId) decision = 'take'
-    else if (Math.abs(n.resets_at - o.resets_at) <= SAME_PERIOD_SECONDS) decision = samePeriod(n, o, sessionId)
+    else if (Math.abs(n.resets_at - o.resets_at) <= SAME_PERIOD_SECONDS) decision = samePeriod(n, o, now)
     else decision = n.resets_at > o.resets_at ? 'take' : 'hold'
     if (decision === 'hold') {
       merged[kind] = o
       held.push(kind)
     } else if (decision === 'confirm') {
-      merged[kind] = stored(o.used_percentage, o.resets_at, now, sessionId)
+      merged[kind] = stored(o.used_percentage, o.resets_at, now, o.session_id)
     } else {
       merged[kind] = stored(n.used_percentage, n.resets_at, now, sessionId)
     }
@@ -337,10 +341,11 @@ const mergeWindows = (
 }
 
 // merge 的规则：闲置会话重跑时拿到的是旧数，不能覆盖已确认的新数。
-// 例外：新读数的会话 id 与已存窗口的 session_id 相同（都不是 null）时一律取新，不论周期。同一个会话的读数有先后之分，
+// 例外：新读数的会话 id 与已存窗口的 session_id 相同（都不是 null）时一律取新，不论周期。同一个进程里同一个会话的读数有先后之分，
 // 这一条一定比它自己写的上一条新；套餐升级之类让上限变高时，同一周期里百分比会掉下来，
 // 不放行的话要等到 resets_at 往后走（seven_day 最长七天）才显示新的数。别的会话写的更高的数仍然挡住更低的读数。
-// 两边的 id 只要有一个读不到（null），就不知道是不是同一个会话，不算。
+// 两边的 id 只要有一个读不到（null），就不知道是不是同一个会话，不算。账号读数（mergeApp）写的 session_id 是 null，
+// 所以这一条管不到它：点击的那个会话随后读到的、比账号读数旧的数，照常被挡住。
 const merge = (old: Windows<Stored>, fresh: Windows<Fresh>, now: number, sessionId: string | null): MergeResult =>
   mergeWindows(old, fresh, now, sessionId, mergeSame, true)
 
@@ -374,13 +379,13 @@ export const parseAck = (text: unknown): { id: string; status: string } | null =
 }
 
 // content 里第一个 type 为 text 且 text 为字符串的块解析出的对象。超过 MAX_PAYLOAD_CHARS、解析失败、
-// 根不是对象都是 null，解析失败不拿后面的块补位。
+// 根不是对象都是 null，解析失败不拿后面的块补位。开头的一个 BOM 照样去掉（与上面几个读取相同），
+// 否则带 BOM 的回复会是 parse_failed、不写确认，小窗显示 no session。
 const textPayload = (content: unknown): Record<string, unknown> | null => {
   if (!Array.isArray(content)) return null
   for (const block of content as unknown[]) {
     if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') continue
-    // 不去 BOM：这里的文本与上面几个读取不同，原样保留这个差别。
-    const obj = parseJson(block.text, MAX_PAYLOAD_CHARS, false)
+    const obj = parseJson(block.text, MAX_PAYLOAD_CHARS)
     return isRecord(obj) ? obj : null
   }
   return null
@@ -442,26 +447,36 @@ export const windowsFromApp = (
   return { status, fresh, drops, count }
 }
 
-// 同一周期内 mergeApp 的决定：账号值低于已存值、且相差不到 1 点，视为同一个读数的取整差，保留已存的用量与重置时间并确认；
-// 其余（账号值不低，或低了 1 点以上）取账号值。
-const mergeAppSame: SamePeriod = (n, o) =>
-  n.used_percentage < o.used_percentage && o.used_percentage - n.used_percentage < 1 ? 'confirm' : 'take'
+// 账号值比已存值低 1 个点以上时，已存的数据至少要有这么久（秒）没被观察或确认过，账号值才取代它。
+const APP_LOWER_MIN_AGE_S = 120
+
+// 同一周期内 mergeApp 的决定：账号值不低于已存值，取账号值；低于已存值但相差不到 1 点，视为同一个读数的取整差，
+// 保留已存的用量、重置时间与会话 id 并确认；低了 1 点以上，已存的至少已有 APP_LOWER_MIN_AGE_S 没被观察过才取账号值，更新的保留（hold）。
+// 年龄是 now 减已存的 observed_at：恰为 APP_LOWER_MIN_AGE_S 就取；差为负（已存的时间在 now 之后）算新的，保留。
+const mergeAppSame: SamePeriod = (n, o, now) => {
+  const gap = o.used_percentage - n.used_percentage
+  if (gap <= 0) return 'take'
+  if (gap < 1) return 'confirm'
+  return now - o.observed_at >= APP_LOWER_MIN_AGE_S ? 'take' : 'hold'
+}
 
 // 把桌面应用的账号读数并进已有快照。与 merge 共用 mergeWindows，只有同一周期内的决定不同：账号读数是整数、会话读数最多一位小数，
 // 规则不同。held 只收录"本次有新读数、但留下了旧值"的 kind，按 KINDS 顺序。
+// 账号读数不属于任何一个会话：取走（含原来没有的）时 session_id 写 null，不写点击的那个会话的 id；确认时保留已存的 session_id。
+// 写成点击会话的 id 的话，那个会话的下一条读数会因 merge 里"同一会话一律取新"压过一个比它新的账号读数
+// （账号写 67，同一会话随后读到的 60 就把它换掉）。所以这里用不到会话 id，参数里也没有。
 // 同一周期里，账号值不低于已存值就取账号值。否则若两者相差小于 1，视为同一个读数的取整差并确认：
 // 朴素的"只增不减"会把刚确认过的整数读数（例如会话读数 66.4、账号读数 66）当成旧数挡掉，
-// observed_at 就不刷新，小窗会一直显示旧时间。确认时保留已存的用量值和重置时间，只刷新
-// observed_at 与 session_id，不进 held。相差达到 1 时账号值取代已存值：账号值是点击那一刻现取的，
-// 比已存值低一个点以上，说明已存的是过时的数。典型的是套餐升级、上限变高，同一周期里百分比掉下来，
-// 若还留着旧值，要等 resets_at 往后走（seven_day 最长七天）才显示新的数。held 因此只剩"账号读数属于更早的周期"一种。
-// 这里假定 get_usage 返回的是实时数；若它其实缓存了几分钟，一次点击可能把刚写的会话读数换成稍旧的账号值，下一次会话读数会改回来。
-export const mergeApp = (
-  old: Windows<Stored>,
-  fresh: Windows<Fresh>,
-  now: number,
-  sessionId: string | null,
-): MergeResult => mergeWindows(old, fresh, now, sessionId, mergeAppSame, false)
+// observed_at 就不刷新，小窗会一直显示旧时间。确认时保留已存的用量值、重置时间与 session_id，只刷新
+// observed_at，不进 held。相差达到 1 时，已存的若至少已有 APP_LOWER_MIN_AGE_S 没被观察过，账号值取代它：
+// 账号值是点击那一刻向桌面应用现取的，已存的又这么久没动，说明它是过时的数。典型的是套餐升级、上限变高，
+// 同一周期里百分比掉下来，若还留着旧值，要等 resets_at 往后走（seven_day 最长七天）才显示新的数。
+// 已存的若更新就保留并记入 held：get_usage 不保证返回实时数，它若缓存了几分钟，刚跑完一个回合就点刷新，
+// 会把那个回合写的更高的读数换成稍旧的账号值，在会话的下一条读数改回来之前小窗显示的是旧数。
+// 年龄门槛只管"账号值低了 1 点以上"这一种；账号值更高、或相差不到 1 都不看年龄。
+// held 因此有两种：账号读数属于更早的周期，或账号值比一个还新的已存值低了 1 点以上。
+export const mergeApp = (old: Windows<Stored>, fresh: Windows<Fresh>, now: number): MergeResult =>
+  mergeWindows(old, fresh, now, null, mergeAppSame, false)
 
 // list 不是数组则为 []；否则取前 MAX_KINDS 个条目，三种 kind 原样保留，其余记 other。
 const kindsOf = (list: unknown): string[] => {
@@ -544,7 +559,7 @@ const tidyEvents = (list: unknown[]): unknown[] => {
 
 // 读旧快照、按 mergeFn 合并、整体写回：feed 与 refreshFromApp 共用，引擎调用的顺序是 读、写。
 // 读不出当作没有旧快照；写失败不抛出，由返回值的 failed 告诉调用方。held 在两种情形下都返回。
-// 时钟与会话 id 由调用方先读好再传进来，顺序在调用方那边决定。
+// 时钟与会话 id 由调用方先读好再传进来，顺序在调用方那边决定（mergeApp 不用会话 id）。
 const writeMerged = async (
   $: EngineInterface,
   target: string,
@@ -732,7 +747,7 @@ export type AppCall = { kind: 'answered'; res: unknown } | { kind: 'timeout' } |
 
 // 向桌面应用要一次 get_usage：先 ccd_session_mgmt，抛异常再试 ccd-session-mgmt，两个名字共用同一个
 // APP_CALL_TIMEOUT_MS 期限（一个计时器，先设计时器、再发调用）。不是各等各的：前一个慢慢失败、后一个再等满，
-// 一次尝试会拖过小窗的 8 秒。期限到了就返回 timeout，哪怕是前一个失败之后才发现已到，也不再发下一个调用。
+// 一次尝试会拖过小窗的 9 秒。期限到了就返回 timeout，哪怕是前一个失败之后才发现已到，也不再发下一个调用。
 // 超时取消不了已发出的调用，所以给每个调用本身挂一个空 catch：它若在期限之后才失败，不能变成未处理的 promise 拒绝
 // （Promise.race 也会给它挂上处理函数，这里不依赖这个实现细节）；才返回的结果也没人用，调用方已经放弃这一次，
 // 什么都不写。结束时一定取消计时器。
@@ -810,6 +825,7 @@ const refreshFromApp = async (
     }
     return outcome({ n: count, kinds, kept, drops, why, nowMs })
   }
+  // 会话 id 只进事件日志，不写进快照：账号读数不属于任何一个会话（见 mergeApp）。
   const sessionId = await readSid($)
   const written = await writeMerged($, target, fresh, now, sessionId, mergeApp)
   if (written.failed) {

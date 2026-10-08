@@ -1930,13 +1930,23 @@ test('app pure: extractPayload does not fall through after the first text block'
   ).toEqual({ plan: { status: 'ok' } })
 })
 
-test('app pure: extractPayload does not strip a BOM from a text block, unlike the files, so a BOM-prefixed reply is unusable', () => {
-  // 文件读取会去掉开头的一个 BOM；桌面应用返回的文本块原样解析，这个差别保留，并由这个用例钉住。
+test('app pure: extractPayload strips one leading BOM from a text block like the files do, two stay unusable', () => {
+  // 文件读取与文本块用同一个 parseJson：开头的一个 BOM 去掉，两个就不可用。带 BOM 的回复不能因此变成 parse_failed、没有确认。
   const good = JSON.stringify({ plan: { status: 'ok' } })
-  expect(extractPayload({ content: [{ type: 'text', text: '\uFEFF' + good }] }), 'one BOM').toBeNull()
+  const parsed = { plan: { status: 'ok' } }
+  expect(extractPayload({ content: [{ type: 'text', text: '\uFEFF' + good }] }), 'one BOM').toEqual(parsed)
   expect(
-    extractPayload({ content: [{ type: 'text', text: '\uFEFF' + good }, { type: 'text', text: good }] }),
-    'no fall through to the next block',
+    extractPayload({ structuredContent: { ok: true }, content: [{ type: 'text', text: '\uFEFF' + good }] }),
+    'one BOM, structured object without a plan',
+  ).toEqual(parsed)
+  expect(extractPayload({ content: [{ type: 'text', text: '\uFEFF\uFEFF' + good }] }), 'two BOMs').toBeNull()
+  expect(
+    extractPayload({ content: [{ type: 'text', text: '\uFEFF\uFEFF' + good }, { type: 'text', text: good }] }),
+    'two BOMs: no fall through to the next block',
+  ).toBeNull()
+  expect(
+    extractPayload({ content: [{ type: 'text', text: ' \uFEFF' + good }] }),
+    'a BOM that is not first is still invalid json',
   ).toBeNull()
 })
 
@@ -2275,21 +2285,22 @@ test('app pure: mergeApp keeps stored windows when the app reading has none', ()
     seven_day: win(10, R7, OLD_AT, 'old-b'),
     spend_limit: win(1, R7, OLD_AT, 'old-c'),
   }
-  const all = mergeApp(old, {}, NOW, SID)
+  const all = mergeApp(old, {}, NOW)
   expect(all.windows, 'all kept').toEqual(old)
   expect(all.held, 'nothing held').toEqual([])
-  const one = mergeApp(old, { five_hour: fr(50, R5) }, NOW, SID)
+  const one = mergeApp(old, { five_hour: fr(50, R5) }, NOW)
   expect(one.windows.seven_day, 'seven_day untouched').toEqual(old.seven_day)
   expect(one.windows.spend_limit, 'spend_limit untouched').toEqual(old.spend_limit)
 })
 
-test('app pure: mergeApp takes an app window when nothing is stored', () => {
-  const got = mergeApp({}, { five_hour: fr(12.5, R5) }, NOW, SID)
-  expect(got.windows, 'new window').toEqual({ five_hour: win(12.5, R5, NOW, SID) })
+// 账号读数不属于任何一个会话：取走（含原来没有的）写 null，确认时保留已存的 session_id。mergeApp 没有会话 id 的参数。
+test('app pure: mergeApp takes an app window when nothing is stored, with a null session id', () => {
+  const got = mergeApp({}, { five_hour: fr(12.5, R5) }, NOW)
+  expect(got.windows, 'new window').toEqual({ five_hour: win(12.5, R5, NOW, null) })
   expect(got.held, 'nothing held').toEqual([])
 })
 
-test('app pure: mergeApp takes the app value in the same period when it is not lower', () => {
+test('app pure: mergeApp takes the app value in the same period when it is not lower, and drops the stored session id', () => {
   const old = { five_hour: win(40, R5, OLD_AT, 'old-a') }
   const rows: { label: string; used: number; resets: number }[] = [
     { label: 'equal', used: 40, resets: R5 + 60 },
@@ -2297,12 +2308,13 @@ test('app pure: mergeApp takes the app value in the same period when it is not l
     { label: 'minus 120', used: 41, resets: R5 - 120 },
   ]
   for (const row of rows) {
-    const got = mergeApp(old, { five_hour: fr(row.used, row.resets) }, NOW, SID)
-    expect(got.windows, row.label).toEqual({ five_hour: win(row.used, row.resets, NOW, SID) })
+    const got = mergeApp(old, { five_hour: fr(row.used, row.resets) }, NOW)
+    expect(got.windows, row.label).toEqual({ five_hour: win(row.used, row.resets, NOW, null) })
     expect(got.held, row.label).toEqual([])
   }
 })
 
+// 确认保留已存的 session_id（只刷新 observed_at）；取走写 null。已存的 OLD_AT 离 NOW 有 900 秒，过了取走更低值的年龄门槛（见下面的用例）。
 test('app pure: mergeApp confirms a rounding gap under 1 and takes the app value from a gap of 1 up', () => {
   const confirm: { label: string; used: number }[] = [
     { label: 'gap 0.4', used: 66.4 },
@@ -2311,8 +2323,8 @@ test('app pure: mergeApp confirms a rounding gap under 1 and takes the app value
   ]
   for (const row of confirm) {
     const old = { five_hour: win(row.used, R5, OLD_AT, 'old-a') }
-    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW, SID)
-    expect(got.windows, row.label).toEqual({ five_hour: win(row.used, R5, NOW, SID) })
+    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW)
+    expect(got.windows, row.label).toEqual({ five_hour: win(row.used, R5, NOW, 'old-a') })
     expect(got.held, row.label).toEqual([])
   }
   // 账号值是点击那一刻现取的：比已存值低 1 个点以上，说明已存的是过时的数，取账号值（原来是保留旧值并计入 held）。
@@ -2323,14 +2335,14 @@ test('app pure: mergeApp confirms a rounding gap under 1 and takes the app value
   ]
   for (const row of take) {
     const old = { five_hour: win(row.used, R5, OLD_AT, 'old-a') }
-    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW, SID)
-    expect(got.windows, row.label).toEqual({ five_hour: win(66, R5 + 60, NOW, SID) })
+    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW)
+    expect(got.windows, row.label).toEqual({ five_hour: win(66, R5 + 60, NOW, null) })
     expect(got.held, row.label).toEqual([])
   }
 })
 
-test('app pure: mergeApp takes a live value far below the stored one in the same period (a raised limit)', () => {
-  // 套餐升级、上限变高：同一周期里账号百分比从 80 掉到 20，不能等到 resets_at 往后走才显示。
+test('app pure: mergeApp takes a value far below an old stored one in the same period (a raised limit)', () => {
+  // 套餐升级、上限变高：同一周期里账号百分比从 80 掉到 20，不能等到 resets_at 往后走才显示。已存的 OLD_AT 离 NOW 有 900 秒，不新了。
   const rows: { label: string; kind: 'five_hour' | 'seven_day'; reset: number; stored: number; live: number; sid: string | null }[] = [
     { label: '5h from another session', kind: 'five_hour', reset: R5, stored: 80, live: 20, sid: 'old-a' },
     { label: '5h from the same session', kind: 'five_hour', reset: R5, stored: 80, live: 20, sid: SID },
@@ -2340,26 +2352,66 @@ test('app pure: mergeApp takes a live value far below the stored one in the same
   const one = <V>(kind: 'five_hour' | 'seven_day', value: V) => (kind === 'five_hour' ? { five_hour: value } : { seven_day: value })
   for (const row of rows) {
     const old = one(row.kind, win(row.stored, row.reset, OLD_AT, row.sid))
-    const got = mergeApp(old, one(row.kind, fr(row.live, row.reset + 90)), NOW, SID)
-    expect(got.windows, row.label).toEqual(one(row.kind, win(row.live, row.reset + 90, NOW, SID)))
+    const got = mergeApp(old, one(row.kind, fr(row.live, row.reset + 90)), NOW)
+    expect(got.windows, row.label).toEqual(one(row.kind, win(row.live, row.reset + 90, NOW, null)))
     expect(got.held, row.label).toEqual([])
   }
+})
+
+// 账号值比已存值低 1 个点以上时，已存的至少已有 120 秒没被观察过才取账号值。get_usage 不保证返回实时数：
+// 刚跑完回合（已存的很新）就点刷新，不能把更新的会话读数换成稍旧的账号值。年龄是 now 减 observed_at，恰为 120 秒就取。
+test('app pure: mergeApp takes a lower app value only when the stored window is at least 120 s old', () => {
+  const rows: { label: string; age: number; take: boolean }[] = [
+    { label: 'observed an hour ago', age: 3600, take: true },
+    { label: 'observed 121 s ago', age: 121, take: true },
+    { label: 'observed exactly 120 s ago', age: 120, take: true },
+    { label: 'observed 119.999 s ago', age: 119.999, take: false },
+    { label: 'observed 119 s ago', age: 119, take: false },
+    { label: 'observed 1 s ago', age: 1, take: false },
+    { label: 'observed just now', age: 0, take: false },
+    { label: 'stamped 30 s after now (clock set back) counts as new', age: -30, take: false },
+  ]
+  for (const row of rows) {
+    const old = { five_hour: win(70, R5, NOW - row.age, 'old-a') }
+    const got = mergeApp(old, { five_hour: fr(66, R5 + 60) }, NOW)
+    if (row.take) {
+      expect(got.windows, row.label).toEqual({ five_hour: win(66, R5 + 60, NOW, null) })
+      expect(got.held, row.label).toEqual([])
+    } else {
+      expect(got.windows, row.label + ': kept untouched').toEqual(old)
+      expect(got.held, row.label).toEqual(['five_hour'])
+    }
+  }
+})
+
+test('app pure: the age guard of mergeApp only concerns a value 1 point or more below the stored one', () => {
+  // 已存的是 1 秒前观察的：账号值不低、相差不到 1、更晚的周期都照常，只有"低了 1 点以上"被挡住。
+  const old = { five_hour: win(70, R5, NOW - 1, 'old-a') }
+  const merged = (used: number, resets = R5) => mergeApp(old, { five_hour: fr(used, resets) }, NOW)
+  expect(merged(70).windows, 'equal').toEqual({ five_hour: win(70, R5, NOW, null) })
+  expect(merged(75).windows, 'higher').toEqual({ five_hour: win(75, R5, NOW, null) })
+  expect(merged(69.5).windows, 'gap 0.5 confirmed').toEqual({ five_hour: win(70, R5, NOW, 'old-a') })
+  expect(merged(69.01).windows, 'gap 0.99 confirmed').toEqual({ five_hour: win(70, R5, NOW, 'old-a') })
+  expect(merged(69).windows, 'gap 1 kept').toEqual(old)
+  expect(merged(69).held, 'gap 1 held').toEqual(['five_hour'])
+  expect(merged(3, R5 + 121).windows, 'a later period is not held back by age').toEqual({ five_hour: win(3, R5 + 121, NOW, null) })
+  expect(merged(99, R5 - 121).held, 'an earlier period is still held').toEqual(['five_hour'])
 })
 
 test('app pure: mergeApp still holds a reading from an earlier period, however high', () => {
   const old = { five_hour: win(10, R5, OLD_AT, 'old-a') }
   for (const used of [5, 10, 99]) {
-    const got = mergeApp(old, { five_hour: fr(used, R5 - 121) }, NOW, SID)
+    const got = mergeApp(old, { five_hour: fr(used, R5 - 121) }, NOW)
     expect(got.windows, String(used)).toEqual(old)
     expect(got.held, String(used)).toEqual(['five_hour'])
   }
 })
 
 test('app pure: mergeApp follows the later reset across periods', () => {
-  const later = mergeApp({ five_hour: win(90, R5, OLD_AT, 'old-a') }, { five_hour: fr(3, R5 + 121) }, NOW, SID)
-  expect(later.windows, 'later period').toEqual({ five_hour: win(3, R5 + 121, NOW, SID) })
+  const later = mergeApp({ five_hour: win(90, R5, OLD_AT, 'old-a') }, { five_hour: fr(3, R5 + 121) }, NOW)
+  expect(later.windows, 'later period').toEqual({ five_hour: win(3, R5 + 121, NOW, null) })
   expect(later.held, 'later period').toEqual([])
-  const earlier = mergeApp({ five_hour: win(10, R5, OLD_AT, 'old-a') }, { five_hour: fr(99, R5 - 121) }, NOW, SID)
+  const earlier = mergeApp({ five_hour: win(10, R5, OLD_AT, 'old-a') }, { five_hour: fr(99, R5 - 121) }, NOW)
   expect(earlier.windows, 'earlier period').toEqual({ five_hour: win(10, R5, OLD_AT, 'old-a') })
   expect(earlier.held, 'earlier period').toEqual(['five_hour'])
 })
@@ -2368,25 +2420,25 @@ test('app pure: mergeApp treats 120 seconds as the same period and 121 as a new 
   // 同一周期里相差不到 1 的是取整差，保留已存的值和重置时间；换了周期则整个取账号的。靠这一点区分边界
   // （同一周期里低得多的账号值现在也会被取走，分不出边界）。
   const old = { five_hour: win(66.4, R5, OLD_AT, 'old-a') }
-  const plus120 = mergeApp(old, { five_hour: fr(66, R5 + 120) }, NOW, SID)
-  expect(plus120.windows, '+120 is the same period: confirmed').toEqual({ five_hour: win(66.4, R5, NOW, SID) })
+  const plus120 = mergeApp(old, { five_hour: fr(66, R5 + 120) }, NOW)
+  expect(plus120.windows, '+120 is the same period: confirmed').toEqual({ five_hour: win(66.4, R5, NOW, 'old-a') })
   expect(plus120.held, '+120 held').toEqual([])
-  const plus121 = mergeApp(old, { five_hour: fr(66, R5 + 121) }, NOW, SID)
-  expect(plus121.windows, '+121 is a new period: takes app').toEqual({ five_hour: win(66, R5 + 121, NOW, SID) })
+  const plus121 = mergeApp(old, { five_hour: fr(66, R5 + 121) }, NOW)
+  expect(plus121.windows, '+121 is a new period: takes app').toEqual({ five_hour: win(66, R5 + 121, NOW, null) })
   expect(plus121.held, '+121 held').toEqual([])
-  const minus120 = mergeApp(old, { five_hour: fr(66, R5 - 120) }, NOW, SID)
-  expect(minus120.windows, '-120 is the same period: confirmed').toEqual({ five_hour: win(66.4, R5, NOW, SID) })
+  const minus120 = mergeApp(old, { five_hour: fr(66, R5 - 120) }, NOW)
+  expect(minus120.windows, '-120 is the same period: confirmed').toEqual({ five_hour: win(66.4, R5, NOW, 'old-a') })
   expect(minus120.held, '-120 held').toEqual([])
-  const minus121 = mergeApp(old, { five_hour: fr(99, R5 - 121) }, NOW, SID)
+  const minus121 = mergeApp(old, { five_hour: fr(99, R5 - 121) }, NOW)
   expect(minus121.windows, '-121 is an earlier period: keeps old').toEqual(old)
   expect(minus121.held, '-121 held').toEqual(['five_hour'])
   // 同一周期的另一侧：差得多的账号值取走，resets_at 用账号的（+120、-120 都在同一周期内）。
   const wide = { five_hour: win(90, R5, OLD_AT, 'old-a') }
-  expect(mergeApp(wide, { five_hour: fr(3, R5 + 120) }, NOW, SID).windows, '+120 far below').toEqual({
-    five_hour: win(3, R5 + 120, NOW, SID),
+  expect(mergeApp(wide, { five_hour: fr(3, R5 + 120) }, NOW).windows, '+120 far below').toEqual({
+    five_hour: win(3, R5 + 120, NOW, null),
   })
-  expect(mergeApp(wide, { five_hour: fr(3, R5 - 120) }, NOW, SID).windows, '-120 far below').toEqual({
-    five_hour: win(3, R5 - 120, NOW, SID),
+  expect(mergeApp(wide, { five_hour: fr(3, R5 - 120) }, NOW).windows, '-120 far below').toEqual({
+    five_hour: win(3, R5 - 120, NOW, null),
   })
 })
 
@@ -2396,30 +2448,29 @@ test('app pure: mergeApp keeps kind order and lists held kinds in kind order', (
     seven_day: win(10, R7, OLD_AT, 'old-b'),
     spend_limit: win(1, R7, OLD_AT, 'old-c'),
   }
-  // held 现在只剩"账号读数属于更早的周期"一种，所以用更早的 resets_at 造出被挡住的 kind。
+  // 这里用更早的 resets_at 造出被挡住的 kind（另一种 held 是已存的还新、账号值低了 1 点以上，见上面的年龄用例）。
   const fresh = {
     spend_limit: fr(2, R7),
     seven_day: fr(9, R7 - 121),
     five_hour: fr(39.5, R5 + 60),
   }
-  const got = mergeApp(old, fresh, NOW, SID)
+  const got = mergeApp(old, fresh, NOW)
   expect(Object.keys(got.windows), 'kind order').toEqual(['five_hour', 'seven_day', 'spend_limit'])
-  expect(got.windows.five_hour, 'confirmed').toEqual(win(40, R5, NOW, SID))
+  expect(got.windows.five_hour, 'confirmed').toEqual(win(40, R5, NOW, 'old-a'))
   expect(got.windows.seven_day, 'held').toEqual(old.seven_day)
-  expect(got.windows.spend_limit, 'taken').toEqual(win(2, R7, NOW, SID))
+  expect(got.windows.spend_limit, 'taken').toEqual(win(2, R7, NOW, null))
   expect(got.held, 'only seven_day').toEqual(['seven_day'])
   const two = mergeApp(
     old,
     { spend_limit: fr(0, R7 - 121), five_hour: fr(30, R5 - 5 * 3600), seven_day: fr(11, R7) },
     NOW,
-    SID,
   )
   expect(two.held, 'two kinds in kind order').toEqual(['five_hour', 'spend_limit'])
-  expect(two.windows.seven_day, 'the third is taken').toEqual(win(11, R7, NOW, SID))
+  expect(two.windows.seven_day, 'the third is taken').toEqual(win(11, R7, NOW, null))
 })
 
-test('app pure: mergeApp writes a null session id and a fixed field order', () => {
-  const taken = mergeApp({}, { five_hour: fr(12, R5) }, NOW, null)
+test('app pure: mergeApp writes a null session id on a take, keeps the stored one on a confirm, and a fixed field order', () => {
+  const taken = mergeApp({}, { five_hour: fr(12, R5) }, NOW)
   expect(taken.windows.five_hour, 'null session').toEqual(win(12, R5, NOW, null))
   expect(Object.keys(taken.windows.five_hour), 'taken field order').toEqual([
     'used_percentage',
@@ -2427,7 +2478,10 @@ test('app pure: mergeApp writes a null session id and a fixed field order', () =
     'observed_at',
     'session_id',
   ])
-  const confirmed = mergeApp({ five_hour: win(66.4, R5, OLD_AT, 'old-a') }, { five_hour: fr(66, R5) }, NOW, SID)
+  const confirmed = mergeApp({ five_hour: win(66.4, R5, OLD_AT, 'old-a') }, { five_hour: fr(66, R5) }, NOW)
+  expect(confirmed.windows.five_hour, 'the stored session id stays').toEqual(win(66.4, R5, NOW, 'old-a'))
+  const bare = mergeApp({ five_hour: win(66.4, R5, OLD_AT, null) }, { five_hour: fr(66, R5) }, NOW)
+  expect(bare.windows.five_hour, 'a stored null stays null').toEqual(win(66.4, R5, NOW, null))
   expect(Object.keys(confirmed.windows.five_hour), 'confirmed field order').toEqual([
     'used_percentage',
     'resets_at',
@@ -2441,7 +2495,7 @@ test('app pure: mergeApp does not mutate its inputs', () => {
   const fresh = { five_hour: fr(66, R5 + 60), seven_day: fr(9, R7) }
   const oldText = JSON.stringify(old)
   const freshText = JSON.stringify(fresh)
-  mergeApp(old, fresh, NOW, SID)
+  mergeApp(old, fresh, NOW)
   expect(JSON.stringify(old), 'old unchanged').toBe(oldText)
   expect(JSON.stringify(fresh), 'fresh unchanged').toBe(freshText)
 })
@@ -2763,8 +2817,8 @@ const okSnap = () => ({
   schema: 1,
   written_at: TICK1,
   windows: {
-    five_hour: win(67, R5, TICK1, 'sess-new'),
-    seven_day: win(57, R7, TICK1, 'sess-new'),
+    five_hour: win(67, R5, TICK1, null),
+    seven_day: win(57, R7, TICK1, null),
   },
 })
 const okAck = (id: string) => ({ schema: 1, id, status: 'ok', at: TICK1, windows: 2 })
@@ -3149,8 +3203,8 @@ appScenario('app flow: a stored spend_limit window is kept beside the app window
   }
   expect(parsed.written_at, 'rewritten').toBe(TICK1)
   expect(Object.keys(parsed.windows), 'kind order').toEqual(['five_hour', 'seven_day', 'spend_limit'])
-  expect(parsed.windows.five_hour, 'five_hour').toEqual(win(67, R5, TICK1, 'sess-new'))
-  expect(parsed.windows.seven_day, 'seven_day').toEqual(win(57, R7, TICK1, 'sess-new'))
+  expect(parsed.windows.five_hour, 'five_hour').toEqual(win(67, R5, TICK1, null))
+  expect(parsed.windows.seven_day, 'seven_day').toEqual(win(57, R7, TICK1, null))
   expect(parsed.windows.spend_limit, 'spend_limit kept').toEqual(win(105.5, R7, T0 - 600, 'old-c'))
 })
 
@@ -3282,8 +3336,13 @@ appScenario('app flow: isError skips a usable text body and does not try the sec
   expect(appLog(a), 'is error').toEqual([skipLog(TICK1, 'app_is_error')])
 })
 
+const BOM = String.fromCharCode(0xfeff)
 const parseFailRows: { label: string; res: unknown }[] = [
   { label: 'not json', res: { isError: false, content: [{ type: 'text', text: 'not json' }] } },
+  {
+    label: 'two leading BOMs',
+    res: { isError: false, content: [{ type: 'text', text: BOM + BOM + JSON.stringify(appPayload()) }] },
+  },
   { label: 'json array', res: { isError: false, content: [{ type: 'text', text: '[1]' }] } },
   { label: 'image only', res: { isError: false, content: [{ type: 'image' }] } },
   { label: 'empty content', res: { isError: false, content: [] } },
@@ -3302,6 +3361,17 @@ for (const row of parseFailRows) {
     expect(a.writes.map((w) => w.path), row.label).toEqual([EVENTS])
   })
 }
+
+// 文本块开头的一个 BOM 与文件一样去掉：带 BOM 的回复照常写 usage.json 与确认，不是 parse_failed、没有确认、小窗显示 no session。
+appScenario('app flow: a text block reply with one leading BOM is handled like a clean one', async (a, $) => {
+  a.mcp.ccd_session_mgmt = { isError: false, content: [{ type: 'text', text: BOM + JSON.stringify(appPayload()) }] }
+  await boot(a, $)
+  stageRequest(a, 'bom1')
+  await tick(a)
+  expect(appLog(a), 'wrote').toEqual([wroteLog()])
+  expect(JSON.parse(a.files.get(TARGET) ?? 'null'), 'snapshot').toEqual(okSnap())
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('bom1'))
+})
 
 const payloadCapRows = [
   { label: 'a text block of exactly 64 KB is read', size: 64 * 1024, ok: true },
@@ -3354,7 +3424,7 @@ appScenario('app flow: a hanging call times out once and later periods do not ov
 })
 
 // 两个服务器名共用一个 5 秒期限。第一个名字失败得慢（4 秒后才失败），第二个挂住：整次尝试在第 5 秒结束
-// （t=3 发出，t=8 放弃），不是第二个再等满 5 秒（t=12）。小窗只等 8 秒，晚于它写出的确认没有意义。
+// （t=3 发出，t=8 放弃），不是第二个再等满 5 秒（t=12）。小窗只等 9 秒，晚于它写出的确认没有意义。
 appScenario('app flow: a slow failure of the first name leaves the second name only the rest of the same 5 s', async (a, $) => {
   a.mcp.ccd_session_mgmt = 'slowfail'
   a.mcp['ccd-session-mgmt'] = 'hang'
@@ -3502,8 +3572,8 @@ appScenario('app flow: a gap under 1 confirms the stored percent and refreshes t
   stageRequest(a, 'req1')
   await tick(a)
   const snap = readSnap(a)
-  expect(snap.windows.five_hour, 'confirmed').toEqual(win(66.4, R5, TICK1, 'sess-new'))
-  expect(snap.windows.seven_day, 'app value').toEqual(win(57, R7, TICK1, 'sess-new'))
+  expect(snap.windows.five_hour, 'confirmed').toEqual(win(66.4, R5, TICK1, 'old-a'))
+  expect(snap.windows.seven_day, 'app value').toEqual(win(57, R7, TICK1, null))
   expect(appLog(a)[0], 'not held').toMatchObject({ held: [], kept: 2, out: 'wrote' })
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual(okAck('req1'))
 })
@@ -3514,34 +3584,35 @@ appScenario('app flow: a higher app percent in the same period replaces the stor
   stageStored(a, { five_hour: ow(66, R5, T0 - 100, 'old-a') })
   stageRequest(a, 'req1')
   await tick(a)
-  expect(readSnap(a).windows.five_hour, 'replaced').toEqual(win(67, R5, TICK1, 'sess-new'))
+  expect(readSnap(a).windows.five_hour, 'replaced').toEqual(win(67, R5, TICK1, null))
 })
 
-// 账号读数是点击那一刻现取的：同一周期里比已存值低 1 个点以上，说明已存的是过时的数（套餐升级、上限变高），取账号值。
-appScenario('app flow: a live value 3 points below the stored one replaces it and is not held', async (a, $) => {
+// 账号读数是点击那一刻现取的：同一周期里比已存值低 1 个点以上、而已存的至少已有 120 秒没被观察过（这里 303 秒），
+// 说明已存的是过时的数（套餐升级、上限变高），取账号值。已存的更新时的情形见后面的年龄用例。
+appScenario('app flow: a live value 3 points below an old stored one replaces it and is not held', async (a, $) => {
   a.mcp.ccd_session_mgmt = textResult(appPayload(67, 57))
   await boot(a, $)
-  stageStored(a, { five_hour: ow(70, R5, T0 - 100, 'old-a') })
+  stageStored(a, { five_hour: ow(70, R5, T0 - 300, 'old-a') })
   stageRequest(a, 'req1')
   await tick(a)
   const snap = readSnap(a)
   expect(snap.written_at, 'rewritten').toBe(TICK1)
-  expect(snap.windows.five_hour, 'taken from the app').toEqual(win(67, R5, TICK1, 'sess-new'))
-  expect(snap.windows.seven_day, 'new').toEqual(win(57, R7, TICK1, 'sess-new'))
+  expect(snap.windows.five_hour, 'taken from the app').toEqual(win(67, R5, TICK1, null))
+  expect(snap.windows.seven_day, 'new').toEqual(win(57, R7, TICK1, null))
   expect(appLog(a)[0]?.held, 'not held').toEqual([])
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack ok').toEqual(okAck('req1'))
 })
 
-appScenario('app flow: after a plan upgrade the live percentages replace the stored ones at once', async (a, $) => {
-  // 上限变高：账号百分比同一周期里从 80/90 掉到 20/30。5 小时的和 7 天的（原来要等 resets_at 往后走，最长七天）都立刻跟上。
+appScenario('app flow: after a plan upgrade the live percentages replace the old stored ones without waiting for the period to end', async (a, $) => {
+  // 上限变高：账号百分比同一周期里从 80/90 掉到 20/30。已存的是 303 秒前观察的，5 小时的和 7 天的（原来要等 resets_at 往后走，最长七天）一次点击就都跟上。
   a.mcp.ccd_session_mgmt = textResult(appPayload(20, 30))
   await boot(a, $)
-  stageStored(a, { five_hour: ow(80, R5, T0 - 100, 'old-a'), seven_day: ow(90, R7, T0 - 100, 'old-b') })
+  stageStored(a, { five_hour: ow(80, R5, T0 - 300, 'old-a'), seven_day: ow(90, R7, T0 - 300, 'old-b') })
   stageRequest(a, 'upg1')
   await tick(a)
   const snap = readSnap(a)
-  expect(snap.windows.five_hour).toEqual(win(20, R5, TICK1, 'sess-new'))
-  expect(snap.windows.seven_day).toEqual(win(30, R7, TICK1, 'sess-new'))
+  expect(snap.windows.five_hour).toEqual(win(20, R5, TICK1, null))
+  expect(snap.windows.seven_day).toEqual(win(30, R7, TICK1, null))
   expect(appLog(a)[0]).toEqual(wroteLog())
   expect(JSON.parse(a.files.get(ACK) ?? 'null')).toEqual(okAck('upg1'))
 })
@@ -3549,10 +3620,10 @@ appScenario('app flow: after a plan upgrade the live percentages replace the sto
 appScenario('app flow: a gap of exactly 1 is taken and a gap of 0.01 is confirmed', async (a, $) => {
   a.mcp.ccd_session_mgmt = textResult(appPayload(66, 57))
   await boot(a, $)
-  stageStored(a, { five_hour: ow(67, R5, T0 - 100, 'old-a') })
+  stageStored(a, { five_hour: ow(67, R5, T0 - 300, 'old-a') })
   stageRequest(a, 'gap1')
   await tick(a)
-  expect(readSnap(a).windows.five_hour, 'gap 1 taken').toEqual(win(66, R5, TICK1, 'sess-new'))
+  expect(readSnap(a).windows.five_hour, 'gap 1 taken').toEqual(win(66, R5, TICK1, null))
   expect(appLog(a)[0]?.held, 'gap 1 not held').toEqual([])
   // 同一个 id 不会再处理，换一个 id 才能测差 0.01。限频要等满 10 秒：第一次调用在 t=3，新请求在 t=15 被读到，已隔 12 秒。
   await tick(a, 3)
@@ -3560,8 +3631,68 @@ appScenario('app flow: a gap of exactly 1 is taken and a gap of 0.01 is confirme
   stageRequest(a, 'gap001')
   await tick(a)
   const second = readSnap(a)
-  expect(second.windows.five_hour, 'gap 0.01 confirmed').toEqual(win(66.01, R5, T0 + 15, 'sess-new'))
+  expect(second.windows.five_hour, 'gap 0.01 confirmed').toEqual(win(66.01, R5, T0 + 15, 'old-a'))
   expect(appLog(a)[1]?.held, 'gap 0.01 not held').toEqual([])
+})
+
+// 账号读数不带会话 id。若写成点击会话的 id，那个会话的下一条读数会因"同一会话一律取新"压过一个比它新的账号读数：
+// 账号写 67，同一会话随后读到的 60 就把它换掉。不带 id 时 60 照常被更高的 67 挡住，会话自己的读数之间的规则不受影响。
+appScenario("app flow: an app figure carries no session id, so the clicking session's next lower reading does not replace it", async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(67, 57))
+  await boot(a, $)
+  stageRequest(a, 'noid1')
+  await tick(a)
+  expect(readSnap(a).windows.five_hour, 'the app figure has no session id').toEqual(win(67, R5, TICK1, null))
+  expect(readSnap(a).windows.seven_day, 'neither has the other one').toEqual(win(57, R7, TICK1, null))
+  await measure($, [lim('five_hour', 60, R5)])
+  expect(readSnap(a).windows.five_hour, "the same session's older 60 is held").toEqual(win(67, R5, TICK1, null))
+  await measure($, [lim('five_hour', 70, R5)])
+  expect(readSnap(a).windows.five_hour, 'a higher reading is taken, with the session id').toEqual(win(70, R5, TICK1, 'sess-new'))
+  await measure($, [lim('five_hour', 50, R5)])
+  expect(readSnap(a).windows.five_hour, "the session's own lower reading still replaces its own earlier one").toEqual(
+    win(50, R5, TICK1, 'sess-new'),
+  )
+})
+
+// 账号值比已存值低 1 个点以上：已存的至少已有 120 秒没被观察过才取账号值（get_usage 不保证实时）。边界：119 秒保留并记入 held，120 秒取走。
+const lowerAgeRows = [
+  { label: 'observed 119 s ago is kept and held', age: 119, take: false },
+  { label: 'observed exactly 120 s ago is replaced', age: 120, take: true },
+]
+for (const row of lowerAgeRows) {
+  appScenario('app flow: a live value 4 points below a stored window ' + row.label, async (a, $) => {
+    a.mcp.ccd_session_mgmt = textResult(appPayload(66, 57))
+    await boot(a, $)
+    stageStored(a, { five_hour: ow(70, R5, TICK1 - row.age, 'old-a') })
+    stageRequest(a, 'age1')
+    await tick(a)
+    const snap = readSnap(a)
+    if (row.take) {
+      expect(snap.windows.five_hour, row.label).toEqual(win(66, R5, TICK1, null))
+      expect(appLog(a), row.label).toEqual([wroteLog()])
+    } else {
+      expect(snap.windows.five_hour, row.label).toEqual(win(70, R5, TICK1 - row.age, 'old-a'))
+      expect(appLog(a), row.label).toEqual([{ ...wroteLog(), held: ['five_hour'] }])
+    }
+    expect(snap.windows.seven_day, 'the window with nothing stored is new').toEqual(win(57, R7, TICK1, null))
+    expect(snap.written_at, 'rewritten').toBe(TICK1)
+    expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'the ack is ok either way').toEqual(okAck('age1'))
+  })
+}
+
+// 复现：刚跑完一个回合（会话读数 70）就点刷新，而 get_usage 给出的是稍旧的 67。已存的才 3 秒，会话读数保留，账号值不换掉它。
+appScenario('app flow: a click right after a turn keeps the fresher session reading over a lower app value', async (a, $) => {
+  a.mcp.ccd_session_mgmt = textResult(appPayload(67, 57))
+  await boot(a, $)
+  await measure($, [lim('five_hour', 70, R5)])
+  expect(readSnap(a).windows.five_hour, 'the turn wrote it at t=0').toEqual(win(70, R5, T0, 'sess-new'))
+  stageRequest(a, 'cache1')
+  await tick(a)
+  const snap = readSnap(a)
+  expect(snap.windows.five_hour, 'the session reading is kept').toEqual(win(70, R5, T0, 'sess-new'))
+  expect(snap.windows.seven_day, 'the window with nothing stored is new').toEqual(win(57, R7, TICK1, null))
+  expect(appLog(a)[0]?.held, 'held').toEqual(['five_hour'])
+  expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'the click is still answered').toEqual(okAck('cache1'))
 })
 
 appScenario('app flow: a later app period replaces the stored window even when the percent is lower', async (a, $) => {
@@ -3570,7 +3701,7 @@ appScenario('app flow: a later app period replaces the stored window even when t
   stageStored(a, { five_hour: ow(90, R5 - 5 * 3600, T0 - 100, 'old-a') })
   stageRequest(a, 'req1')
   await tick(a)
-  expect(readSnap(a).windows.five_hour, 'new period').toEqual(win(3, R5, TICK1, 'sess-new'))
+  expect(readSnap(a).windows.five_hour, 'new period').toEqual(win(3, R5, TICK1, null))
   expect(appLog(a)[0]?.held, 'not held').toEqual([])
 })
 
@@ -3610,7 +3741,7 @@ appScenario('app flow: a stored snapshot with a leading BOM is read and its othe
   const snap = readSnap(a)
   expect(Object.keys(snap.windows), 'kind order').toEqual(['five_hour', 'seven_day', 'spend_limit'])
   expect(snap.windows.spend_limit, 'kept').toEqual(win(105.5, R7, T0 - 600, 'old-c'))
-  expect(snap.windows.five_hour, 'new').toEqual(win(67, R5, TICK1, 'sess-new'))
+  expect(snap.windows.five_hour, 'new').toEqual(win(67, R5, TICK1, null))
 })
 
 // ---------------------------------------------------------------- 刷新请求：写失败、时钟与 fs 故障、卫生、启动
@@ -3670,7 +3801,7 @@ appScenario('app flow: a refused event log does not block the snapshot or the ne
   expect(appLog(a)[0]?.why, 'idB wrote').toBe('')
 })
 
-appScenario('app flow: a non-string session id is stored and logged as null', async (a, $) => {
+appScenario('app flow: a non-string session id is logged as null, and the snapshot carries none either way', async (a, $) => {
   a.sessionId = 42
   a.mcp.ccd_session_mgmt = APP_OK
   await boot(a, $)
@@ -3813,46 +3944,52 @@ appScenario('app flow: after a hang times out a later request is handled', async
   expect(JSON.parse(a.files.get(ACK) ?? 'null').id, 'ack id').toBe('h2')
   const snap = readSnap(a)
   expect(snap.written_at, 'written at t=15').toBe(T0 + 15)
-  expect(snap.windows.five_hour, 'five_hour').toEqual(win(67, R5, T0 + 15, 'sess-new'))
-  expect(snap.windows.seven_day, 'seven_day').toEqual(win(57, R7, T0 + 15, 'sess-new'))
+  expect(snap.windows.five_hour, 'five_hour').toEqual(win(67, R5, T0 + 15, null))
+  expect(snap.windows.seven_day, 'seven_day').toEqual(win(57, R7, T0 + 15, null))
 })
 
 // 下面两个用例钉住 usage_widget.py 的刷新协议（常量在 Python 里，这里不能导入，所以写字面量）：
-// 小窗写出请求后等 APP_REFRESH_WAIT_SECONDS = 8 秒的确认；等不到就放弃，再过 APP_REFRESH_RETRY_SECONDS = 10 秒才接受下一次点击。
+// 小窗写出请求后等 APP_REFRESH_WAIT_SECONDS = 9 秒的确认；等不到就放弃，再过 APP_REFRESH_RETRY_SECONDS = 10 秒才接受下一次点击。
 appScenario("app flow: a retry at the widget's earliest retry time is not throttled by the call that timed out", async (a, $) => {
-  // 第一次点击写于 t=2，t=3 的检查读到并调用；插件 5 秒后放弃，小窗 8 秒后放弃（t=10），再过 10 秒（t=20）才接受重试。
-  // 重试请求写于 t=20，t=21 被读到，离第一次调用 18 秒：不能被限频，否则有桌面会话时小窗还是显示 no session。
+  // 最坏对齐：第一次点击写于 t=0，刚过一次检查，t=3 才读到并调用；插件 5 秒后放弃（t=8），小窗 9 秒后放弃（t=9），再过 10 秒（t=19）才接受重试。
+  // 重试请求写于 t=19，t=21 被读到，离第一次调用 18 秒：不能被限频，否则有桌面会话时小窗还是显示 no session。
   a.mcp.ccd_session_mgmt = 'hang'
   await boot(a, $)
-  stageRequest(a, 'try1')
+  stageRequest(a, 'try1', 3)
   await tick(a)
   await a.clock.advance(5000)
   expect(whys(a), 'first call given up').toEqual(['mcp_timeout'])
   a.mcp.ccd_session_mgmt = APP_OK
   await a.clock.advance(10000)
-  stageRequest(a, 'try2')
+  stageRequest(a, 'try2', 2)
   await tick(a)
   expect(a.mcpCalls, 'the retry is handled').toHaveLength(2)
   expect(whys(a), 'timeout then wrote').toEqual(['mcp_timeout', ''])
   expect(JSON.parse(a.files.get(ACK) ?? 'null'), 'ack').toEqual({ ...okAck('try2'), at: T0 + 21 })
 })
 
-appScenario("app flow: the slowest answer the plugin waits for still lands within the widget's 8s wait", async (a, $) => {
-  // 最坏情形：点击恰好发生在一次定时检查之后，要等满 3 秒才被发现；调用在 5 秒上限前 1 毫秒才返回。
-  // 3 + 5 = 8：确认离请求时间不能超过小窗等待的 8 秒。
+// 最坏情形：点击恰好发生在一次定时检查之后（写于 t=0），要等满 3 秒（REFRESH_POLL_MS）才被发现；调用拖到插件自己布下的期限前 1 毫秒才返回。
+// 期限取插件实际布下的值（a.afterMs），不写死 5000：把 APP_CALL_TIMEOUT_MS 改大，确认就会晚于小窗放弃前 1 秒，这个用例随之失败。
+// 量的是"调用最晚能返回的时刻"：确认里的 at 是调用返回后、写文件之前读的时钟，mock 时钟里读写文件不占时间，所以测不到它们的耗时。
+// 3 + 5 = 8，离小窗放弃的 9 秒还剩约 1 秒，留给读写 usage.json 和写确认；这 1 秒的余量写成字面量 SLACK_S。
+appScenario("app flow: an answer 1 ms before the plugin's own deadline is written 1 s before the widget's 9 s wait ends", async (a, $) => {
+  const WIDGET_WAIT_S = 9
+  const SLACK_S = 1
   a.mcp.ccd_session_mgmt = 'late'
   await boot(a, $)
   stageRequest(a, 'slow1', 3)
   await tick(a)
   expect(a.release, 'the call is waiting').toHaveLength(1)
-  await a.clock.advance(4999)
+  expect(a.afterMs, 'one deadline armed').toHaveLength(1)
+  const limitMs = a.afterMs[0]!
+  await a.clock.advance(limitMs - 1)
   a.release[0]?.()
   await a.clock.settle()
   const ack = JSON.parse(a.files.get(ACK) ?? 'null') as { id: string; status: string; at: number }
   expect(ack.id, 'ack id').toBe('slow1')
   expect(ack.status, 'ack status').toBe('ok')
-  expect(ack.at - T0, 'ack lands within the widget wait').toBeLessThanOrEqual(8)
-  expect(ack.at - T0, 'ack is written when the call returns').toBeGreaterThan(7.9)
+  expect(Math.round((ack.at - T0) * 1000), 'written when the call returned: 3 s to find it + the deadline - 1 ms').toBe(3000 + limitMs - 1)
+  expect(ack.at - T0, 'the ack lands with the slack to spare').toBeLessThanOrEqual(WIDGET_WAIT_S - SLACK_S)
   expect(whys(a), 'wrote').toEqual([''])
 })
 

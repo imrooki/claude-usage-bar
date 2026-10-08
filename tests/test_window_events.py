@@ -357,8 +357,14 @@ class Win32EventTests(unittest.TestCase):
         self.assertEqual((query.left, query.top, query.right, query.bottom), TASKBAR_RECT)
         self.assertEqual(flags, widget.MONITOR_DEFAULTTONULL)
         self.assertEqual(widget.MONITOR_DEFAULTTONULL, 0)
-        self.assertEqual(ctypes.sizeof(widget.MONITORINFO), 40)
         self.assertEqual(seen, {"monitor": 77, "cb_size": ctypes.sizeof(widget.MONITORINFO)})
+
+    # The 40-byte size is the Win32 layout. ctypes.wintypes.RECT is built on C long, which is
+    # 8 bytes on 64-bit Linux, so only this size pin needs Windows; the logic test above runs everywhere.
+    @unittest.skipUnless(
+        sys.platform == "win32", "Win32 MONITORINFO is 40 bytes; wintypes.LONG is 8 bytes on Linux")
+    def test_monitor_info_has_the_win32_size(self):
+        self.assertEqual(ctypes.sizeof(widget.MONITORINFO), 40)
 
     def test_monitor_rect_for_reports_failure_as_none(self):
         for monitor in (0, None):

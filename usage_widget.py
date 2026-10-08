@@ -42,7 +42,12 @@ import subprocess
 import sys
 import threading
 import time
-import winreg
+
+# winreg 只在 Windows 上有；其他平台（离线测试）置为 None，read_light_theme 按浅色处理。
+try:
+    import winreg
+except ImportError:
+    winreg = None
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -685,6 +690,9 @@ CODEX_PING_COOLDOWN_SECONDS = 300.0
 CODEX_PING_POLL_MS = 500
 # 子进程的工作目录名，建在 data_dir 下，不借用用户正在用的目录。
 CODEX_PING_DIR_NAME = "codex-ping"
+# 子进程不弹控制台窗口。Windows 上就是 subprocess.CREATE_NO_WINDOW；非 Windows 上没有这个属性，
+# 退回同一个值 0x08000000，让离线测试也能构造 Popen 参数。
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 # 反馈文字。小窗上的字必须是纯 ASCII。
 CAPTION_ASKING = "asking"
 CAPTION_COOLDOWN = "cooldown"
@@ -844,7 +852,7 @@ class CodexPinger:
                 cwd=work,
                 env=env,
                 close_fds=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=CREATE_NO_WINDOW,
             )
         except (OSError, ValueError) as exc:
             self._proc = None
@@ -2140,6 +2148,9 @@ def save_position(data_dir, mode, offset):
 
 def read_light_theme():
     """只读注册表的 SystemUsesLightTheme；读不到按浅色。"""
+    if winreg is None:
+        # 没有注册表模块（非 Windows，离线测试）时同样按浅色。
+        return True
     key = None
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, THEME_KEY_PATH, 0, winreg.KEY_READ)
@@ -2205,9 +2216,11 @@ class BLENDFUNCTION(ctypes.Structure):
 
 # 64 位下 LRESULT 与 LPARAM 是指针宽度的有符号数，WPARAM 是指针宽度的无符号数，
 # 句柄一律 c_void_p；位宽写错会在 64 位上悄悄截断。
-WNDPROC = ctypes.WINFUNCTYPE(
+# 回调用 Windows 的 stdcall 约定；非 Windows（离线测试）没有它，退回 CFUNCTYPE，参数表相同。
+_CALLBACK_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+WNDPROC = _CALLBACK_TYPE(
     ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
-WINEVENTPROC = ctypes.WINFUNCTYPE(
+WINEVENTPROC = _CALLBACK_TYPE(
     None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
     ctypes.c_long, ctypes.c_long, ctypes.c_uint, ctypes.c_uint)
 

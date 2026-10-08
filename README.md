@@ -324,6 +324,9 @@ Widget regression tests run on Windows with Python and Pillow:
 python -B -m unittest discover -s tests -v
 ```
 
+The non-native widget tests also run on Linux, and the widget tests (Linux and Windows) and the
+plugin tests run in GitHub Actions on every push and pull request (see `.github/workflows/ci.yml`).
+
 To also check real Windows event delivery, repeated reordering, window ownership and the real message loop, enable the native tests. They create only their own off-screen windows and do not operate the real taskbar:
 
 ```powershell

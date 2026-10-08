@@ -1946,7 +1946,15 @@ class SourceGuardAppTests(unittest.TestCase):
         self.assertEqual(
             re.findall(r'WinDLL\("(\w+)"', self.source),
             ["user32", "gdi32", "shell32", "kernel32", "shcore"])
-        self.assertEqual(self.source.count("WINFUNCTYPE"), 2)
+        # Expectation updated on purpose. The callback factory is WINFUNCTYPE on Windows and
+        # CFUNCTYPE elsewhere (so the offline tests can import the module), and the literal name
+        # now appears once in the fallback line instead of once per callback. Pin the fallback
+        # line and the two callback definitions by name, so a third callback type still fails.
+        self.assertIn(
+            '_CALLBACK_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)', self.source)
+        self.assertEqual(
+            re.findall(r"^(\w+) = _CALLBACK_TYPE\(", self.source, re.M),
+            ["WNDPROC", "WINEVENTPROC"])
 
     def test_timer_ids_are_unique_and_app_is_eleven(self):
         values = []

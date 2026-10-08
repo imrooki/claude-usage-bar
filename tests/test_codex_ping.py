@@ -1255,7 +1255,9 @@ class CodexPingerStartTests(PingerTestCase):
         self.assertEqual(kwargs["cwd"], self.work)
         self.assertTrue(os.path.isdir(self.work))
         self.assertTrue(kwargs["close_fds"])
-        self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+        # The module constant is the Windows flag itself, and the same value off Windows.
+        self.assertEqual(widget.CREATE_NO_WINDOW, 0x08000000)
+        self.assertEqual(kwargs["creationflags"], widget.CREATE_NO_WINDOW)
         self.assertTrue(pinger.running)
         self.assertEqual(self.find_calls, [None])
 
@@ -1676,7 +1678,16 @@ class SourceGuardTests(unittest.TestCase):
             node for node in ast.walk(self.tree)
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
             and node.value.id == "subprocess"]
-        self.assertEqual({node.attr for node in attributes}, {"Popen", "DEVNULL", "CREATE_NO_WINDOW"})
+        # CREATE_NO_WINDOW is read as getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) so that
+        # the module still imports off Windows; it is the only subprocess name allowed that way.
+        getattr_calls = [
+            node for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr" and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Name) and node.args[0].id == "subprocess"]
+        names = [ast.literal_eval(node.args[1]) for node in getattr_calls]
+        self.assertEqual({node.attr for node in attributes}, {"Popen", "DEVNULL"})
+        self.assertEqual(names, ["CREATE_NO_WINDOW"])
         calls = [
             node for node in ast.walk(self.tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -1719,7 +1730,15 @@ class SourceGuardTests(unittest.TestCase):
         self.assertEqual(
             re.findall(r'WinDLL\("(\w+)"', self.source),
             ["user32", "gdi32", "shell32", "kernel32", "shcore"])
-        self.assertEqual(self.source.count("WINFUNCTYPE"), 2)
+        # Expectation updated on purpose. The callback factory is WINFUNCTYPE on Windows and
+        # CFUNCTYPE elsewhere (so the offline tests can import the module), and the literal name
+        # now appears once in the fallback line instead of once per callback. Pin the fallback
+        # line and the two callback definitions by name, so a third callback type still fails.
+        self.assertIn(
+            '_CALLBACK_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)', self.source)
+        self.assertEqual(
+            re.findall(r"^(\w+) = _CALLBACK_TYPE\(", self.source, re.M),
+            ["WNDPROC", "WINEVENTPROC"])
 
     def test_timer_ids_are_unique(self):
         values = []

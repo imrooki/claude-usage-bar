@@ -763,21 +763,41 @@ def build_ping_argv(exe, model, cwd):
     ]
 
 
-def codex_ping_caption(read_caption, state):
-    """Codex 块的反馈文字。
+def cooldown_caption(read_caption):
+    """冷却期里 Refresh now 的反馈文字，两个提供方共用这一处定义。
 
-    冷却期里“没有新东西可报”的读数文字才换成 cooldown，已经有新数据或读取失败的文字保留。
+    “没有新东西可报”的读数文字（没有文字、no data、no file、same HH:MM，也就是 caption_text
+    的输出里除 new HH:MM 与 read error 之外的全部）换成 cooldown，其余保留。
     """
+    if read_caption in ("", "no data", CAPTION_NO_FILE) or read_caption.startswith("same"):
+        return CAPTION_COOLDOWN
+    return read_caption
+
+
+def codex_ping_caption(read_caption, state):
+    """Codex 块的反馈文字。冷却期里哪些读数文字换成 cooldown，见 cooldown_caption。"""
     if state == "asking":
         return CAPTION_ASKING
     if state == "failed":
         return CAPTION_PING_FAILED
     if state == "cooldown":
-        if (read_caption == "" or read_caption == "no data"
-                or read_caption.startswith("same")):
-            return CAPTION_COOLDOWN
-        return read_caption
+        return cooldown_caption(read_caption)
     return read_caption
+
+
+def cooldown_remaining(clock, since, seconds):
+    """从 since 起算的 seconds 秒冷却还剩几秒，已结束返回 0.0。两个驱动对象共用。
+
+    since 为 None 表示没设过冷却，此时不读时钟。时钟回拨（现在早于 since）按已结束处理，
+    否则冷却会被拉长。
+    """
+    if since is None:
+        return 0.0
+    now = clock()
+    if now < since:
+        return 0.0
+    left = seconds - (now - since)
+    return left if left > 0 else 0.0
 
 
 class CodexPinger:
@@ -809,15 +829,8 @@ class CodexPinger:
 
     def cooldown_left(self):
         """距上次成功启动不足冷却时长时返回剩余秒数，否则 0.0。时钟回拨视为已结束。"""
-        if self._last_started_at is None:
-            return 0.0
-        now = self._clock()
-        if now < self._last_started_at:
-            return 0.0
-        left = CODEX_PING_COOLDOWN_SECONDS - (now - self._last_started_at)
-        if left > 0:
-            return left
-        return 0.0
+        return cooldown_remaining(
+            self._clock, self._last_started_at, CODEX_PING_COOLDOWN_SECONDS)
 
     def _clear_proc(self):
         """丢掉这次子进程的跟踪。上次启动时刻留给冷却，不清。"""
@@ -982,17 +995,11 @@ def read_app_ack(path, expected_id):
 
 
 def app_refresh_caption(read_caption, state):
-    """Claude 块的反馈文字。
-
-    冷却期里“没有新东西可报”的读数文字才换成 cooldown，已经有新数据或读取失败的文字保留。
-    """
+    """Claude 块的反馈文字。冷却期里哪些读数文字换成 cooldown，见 cooldown_caption。"""
     if state == "asking":
         return CAPTION_ASKING
     if state == "cooldown":
-        if (read_caption == "" or read_caption == "no data"
-                or read_caption.startswith("same")):
-            return CAPTION_COOLDOWN
-        return read_caption
+        return cooldown_caption(read_caption)
     if state == "no_session":
         return CAPTION_NO_SESSION
     if state == "no_limits":
@@ -1026,15 +1033,7 @@ class AppRefresher:
 
     def cooldown_left(self):
         """剩余冷却秒数；未设冷却或单调钟回退都返回 0.0。"""
-        if self._cooldown_at is None:
-            return 0.0
-        now = self._monotonic()
-        if now < self._cooldown_at:
-            return 0.0
-        left = self._cooldown_for - (now - self._cooldown_at)
-        if left > 0:
-            return left
-        return 0.0
+        return cooldown_remaining(self._monotonic, self._cooldown_at, self._cooldown_for)
 
     def _begin_cooldown(self, seconds):
         self._cooldown_at = self._monotonic()
@@ -2815,6 +2814,41 @@ def _wnd_proc(hwnd, msg, wparam, lparam):
 _WNDPROC_REF = WNDPROC(_wnd_proc)
 
 
+# Refresh now 里一个提供方这一路（发出请求、定时轮询、收口）的固定参数。Codex 的 ping 与
+# 桌面会话的请求各是一路，共用 WidgetApp 的 _start_slot / _poll_slot / _stop_slot /
+# _drop_slot；驱动对象（CodexPinger、AppRefresher）各管各的内部。两路不同的地方只有这张
+# 表、各自的 _finish_*，以及 Codex 只在数据源可用时才发起。驱动对象和“点击时的观测时间”
+# 记的是属性名而不是对象：--no-* 会让驱动对象是 None，测试也会整个换掉它，所以每次现取。
+RefreshSlot = collections.namedtuple("RefreshSlot", [
+    "index",         # 反馈文字里的下标：0 是 Claude，1 是 Codex
+    "driver",        # WidgetApp 上驱动对象的属性名
+    "busy",          # 驱动对象上“已发出、尚未收口”的属性名
+    "before",        # WidgetApp 上存点击那一刻观测时间的属性名，收口时拿它判断 new 还是 same
+    "timer_id", "poll_ms",             # 轮询计时器的 id 与间隔
+    "caption",       # 反馈文字函数 (读数文字, 状态) -> 文字
+    "log_kind",      # 错误日志里的类别
+    "error_prefix",  # start() 的原因以它开头：请求没能发出
+    "error_state",   #   这时反馈文字的状态
+    "drop_state",    # 轮询计时器建不起来、只好放弃这一路时反馈文字的状态
+    "drop_note",     #   这时记进错误日志的话
+    "skip_notes",    # {start() 的原因: 日志里的话}：只记日志，文字不动
+])
+
+CODEX_SLOT = RefreshSlot(
+    index=1, driver="pinger", busy="running", before="_ping_before",
+    timer_id=TIMER_PING, poll_ms=CODEX_PING_POLL_MS, caption=codex_ping_caption,
+    log_kind="CodexPing", error_prefix="spawn_error:", error_state="failed",
+    drop_state="failed", drop_note="poll timer unavailable; ping abandoned",
+    skip_notes={"no_exe": "codex.exe not found; ping skipped"})
+APP_SLOT = RefreshSlot(
+    index=0, driver="app_refresher", busy="waiting", before="_app_before",
+    timer_id=TIMER_APP, poll_ms=APP_REFRESH_POLL_MS, caption=app_refresh_caption,
+    log_kind="AppRefresh", error_prefix="write_error:", error_state="not_sent",
+    drop_state="no_session", drop_note="poll timer unavailable; request abandoned",
+    skip_notes={})
+REFRESH_SLOTS = (CODEX_SLOT, APP_SLOT)  # 窗口重建后按这个顺序补计时器
+
+
 class WidgetApp:
     """窗口、定位与周期任务，全部在主线程。
 
@@ -3385,21 +3419,15 @@ class WidgetApp:
         self._codex_log_reason = reason
         self.log.log("CodexRead", reason)
 
-    def _rewrite_codex_caption(self, rewrite):
-        """改掉已有反馈文字里 Codex 那一项。没有反馈文字时什么也不做。"""
+    def _rewrite_slot_caption(self, index, rewrite):
+        """改掉已有反馈文字里下标 index（0 是 Claude，1 是 Codex）那一项，另一项不动。
+        没有反馈文字时什么也不做，截止时间不变。"""
         if self._caption is None:
             return
         deadline, texts = self._caption
-        pair = (tuple(texts) + ("", ""))[:2]
-        self._caption = (deadline, (pair[0], rewrite(pair[1])))
-
-    def _rewrite_claude_caption(self, rewrite):
-        """改掉已有反馈文字里 Claude 那一项。没有反馈文字时什么也不做，截止时间不变。"""
-        if self._caption is None:
-            return
-        deadline, texts = self._caption
-        pair = (tuple(texts) + ("", ""))[:2]
-        self._caption = (deadline, (rewrite(pair[0]), pair[1]))
+        pair = list((tuple(texts) + ("", ""))[:2])
+        pair[index] = rewrite(pair[index])
+        self._caption = (deadline, tuple(pair))
 
     def _set_slot_caption(self, index, text):
         """把反馈文字里下标 index（0 是 Claude，1 是 Codex）那一项换成 text。
@@ -3418,163 +3446,147 @@ class WidgetApp:
         self.set_timer(TIMER_CAPTION, CAPTION_MS)
         self.refresh_view()
 
+    # Refresh now 的两路（Codex ping、桌面会话请求）共用的流程。slot 是 RefreshSlot，
+    # 这些方法不认识 Codex 与 Claude。
+
+    def _slot_busy(self, slot):
+        """这一路有没有已发出、尚未收口的请求；驱动对象被关掉时没有。"""
+        driver = getattr(self, slot.driver)
+        return driver is not None and bool(getattr(driver, slot.busy))
+
+    def _start_slot(self, slot, before):
+        """发出这一路的请求并起轮询计时器。只在 Refresh now 里调用，TIMER_POLL 绝不会走到。
+
+        before 是点击那一刻这个提供方最新的 observed_at。冷却里只改这一路已有的文字
+        （改不改成 cooldown 由 slot.caption 定）；请求没能发出（原因以 slot.error_prefix
+        开头）就记日志并标成失败；正在等、没有可用目录这类原因什么也不改。内部绝不抛异常。
+        """
+        try:
+            driver = getattr(self, slot.driver)
+            if driver is None or self.exiting or not self.hwnd:
+                return
+            reason = driver.start()
+            if reason == "started":
+                setattr(self, slot.before, before)
+                if not self.set_timer(slot.timer_id, slot.poll_ms):
+                    self._drop_slot(slot)
+                    self._rewrite_slot_caption(
+                        slot.index, lambda _text: slot.caption("", slot.drop_state))
+                self.refresh_view()
+            elif reason == "cooldown":
+                self._rewrite_slot_caption(
+                    slot.index, lambda text: slot.caption(text, "cooldown"))
+                self.refresh_view()
+            elif reason in slot.skip_notes:
+                self.log.log(slot.log_kind, slot.skip_notes[reason])
+            elif reason.startswith(slot.error_prefix):
+                self.log.log(slot.log_kind, reason)
+                self._rewrite_slot_caption(
+                    slot.index, lambda _text: slot.caption("", slot.error_state))
+                self.refresh_view()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _poll_slot(self, slot, finish):
+        """轮询计时器到点：驱动对象还没有结果就等下一次，有结果就在这里统一收口。
+
+        只换这一路的那一项，另一路若仍未过期就保留。finish(outcome, detail, before)
+        做各提供方自己的事（重读数据源、记日志），返回这一项的反馈文字。
+        """
+        try:
+            driver = getattr(self, slot.driver)
+            result = None if driver is None else driver.poll()
+            if result is None:
+                if not self._slot_busy(slot):
+                    self.kill_timer(slot.timer_id)
+                return
+            self.kill_timer(slot.timer_id)
+            outcome, detail = result
+            text = finish(outcome, detail, getattr(self, slot.before))
+            setattr(self, slot.before, None)
+            self._set_slot_caption(slot.index, text)
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _stop_slot(self, slot):
+        """停掉这一路正在进行的请求。可重复调用，绝不抛异常。"""
+        try:
+            driver = getattr(self, slot.driver)
+            if driver is not None:
+                driver.stop()
+        except Exception as exc:
+            self._log_exception(exc)
+
+    def _drop_slot(self, slot):
+        """轮询计时器建不起来：没有计时器就没人收尾，这一路会一直停在 asking，所以放弃它。"""
+        self.log.log(slot.log_kind, slot.drop_note)
+        self._stop_slot(slot)
+        setattr(self, slot.before, None)
+
+    # Codex ping --------------------------------------------------------------
+
     def _start_codex_ping(self, before_codex):
         """只在 Refresh now 里调用，TIMER_POLL 不会走到。
 
         Codex 没装或还没用过（没有 sessions 目录）时，不替用户去启动它。
         """
-        try:
-            pinger = self.pinger
-            if pinger is None or self.codex is None or not self.codex.available:
-                return
-            if self.exiting or not self.hwnd:
-                return
-            reason = pinger.start()
-            if reason == "started":
-                self._ping_before = before_codex
-                if not self.set_timer(TIMER_PING, CODEX_PING_POLL_MS):
-                    self._drop_ping()
-                    self._rewrite_codex_caption(
-                        lambda _text: codex_ping_caption("", "failed"))
-                self.refresh_view()
-            elif reason == "cooldown":
-                if self._caption is not None:
-                    self._rewrite_codex_caption(
-                        lambda text: codex_ping_caption(text, "cooldown"))
-                self.refresh_view()
-            elif reason == "no_exe":
-                self.log.log("CodexPing", "codex.exe not found; ping skipped")
-            elif reason.startswith("spawn_error:"):
-                self.log.log("CodexPing", reason)
-                if self._caption is not None:
-                    self._rewrite_codex_caption(
-                        lambda _text: codex_ping_caption("", "failed"))
-                self.refresh_view()
-        except Exception as exc:
-            self._log_exception(exc)
+        if self.codex is None or not self.codex.available:
+            return
+        self._start_slot(CODEX_SLOT, before_codex)
 
     def _on_ping_timer(self):
         """ping 的结果只在这里统一收口。只换 Codex 那一项（下标 1），
         Claude 那一项若仍未过期就保留。"""
-        try:
-            pinger = self.pinger
-            if pinger is None:
-                self.kill_timer(TIMER_PING)
-                return
-            result = pinger.poll()
-            if result is None:
-                if not pinger.running:
-                    self.kill_timer(TIMER_PING)
-                return
-            self.kill_timer(TIMER_PING)
-            self._poll_codex(True)
-            outcome, detail = result
-            if outcome == "failed" or outcome == "timeout":
-                text = codex_ping_caption("", "failed")
-                self.log.log("CodexPing", "ping %s (%s)" % (outcome, detail))
-            else:
-                text = caption_text(
-                    self._ping_before,
-                    _snapshot_observed_at(self.codex.snapshot),
-                    self.codex.last_reason)
-            self._ping_before = None
-            self._set_slot_caption(1, text)
-        except Exception as exc:
-            self._log_exception(exc)
+        self._poll_slot(CODEX_SLOT, self._finish_ping)
+
+    def _finish_ping(self, outcome, detail, before):
+        """ping 结束：重读 Codex 日志，返回 Codex 那一项的反馈文字。"""
+        self._poll_codex(True)
+        if outcome == "failed" or outcome == "timeout":
+            self.log.log("CodexPing", "ping %s (%s)" % (outcome, detail))
+            return codex_ping_caption("", "failed")
+        return caption_text(
+            before, _snapshot_observed_at(self.codex.snapshot), self.codex.last_reason)
 
     def _stop_ping(self):
         """停掉正在跑的 ping。可重复调用，绝不抛异常。"""
-        try:
-            if self.pinger is not None:
-                self.pinger.stop()
-        except Exception as exc:
-            self._log_exception(exc)
+        self._stop_slot(CODEX_SLOT)
 
     def _drop_ping(self):
-        """轮询计时器建不起来：没有计时器就没人收尾，ping 会一直停在 asking，所以放弃它。"""
-        self.log.log("CodexPing", "poll timer unavailable; ping abandoned")
-        self._stop_ping()
-        self._ping_before = None
+        """轮询计时器建不起来，ping 会一直停在 asking，所以放弃它。"""
+        self._drop_slot(CODEX_SLOT)
+
+    # 桌面会话请求 ------------------------------------------------------------
 
     def _start_app_refresh(self, before_claude):
         """只在 Refresh now 里调用，TIMER_POLL 绝不会走到。内部绝不抛异常。"""
-        try:
-            refresher = self.app_refresher
-            if refresher is None or self.exiting or not self.hwnd:
-                return
-            reason = refresher.start()
-            if reason == "started":
-                self._app_before = before_claude
-                if not self.set_timer(TIMER_APP, APP_REFRESH_POLL_MS):
-                    self._drop_app_refresh()
-                    self._rewrite_claude_caption(
-                        lambda _text: app_refresh_caption("", "no_session"))
-                self.refresh_view()
-            elif reason == "waiting":
-                pass
-            elif reason == "cooldown":
-                if self._caption is not None:
-                    self._rewrite_claude_caption(
-                        lambda text: app_refresh_caption(text, "cooldown"))
-                self.refresh_view()
-            elif reason == "no_dir":
-                pass
-            elif reason.startswith("write_error:"):
-                self.log.log("AppRefresh", reason)
-                if self._caption is not None:
-                    self._rewrite_claude_caption(
-                        lambda _text: app_refresh_caption("", "not_sent"))
-                self.refresh_view()
-        except Exception as exc:
-            self._log_exception(exc)
+        self._start_slot(APP_SLOT, before_claude)
 
     def _on_app_timer(self):
         """TIMER_APP：读确认文件，收口后只换 Claude 那一项。"""
-        try:
-            refresher = self.app_refresher
-            if refresher is None:
-                self.kill_timer(TIMER_APP)
-                return
-            result = refresher.poll()
-            if result is None:
-                if not refresher.waiting:
-                    self.kill_timer(TIMER_APP)
-                return
-            self.kill_timer(TIMER_APP)
-            outcome, _detail = result
-            if outcome == "ok":
-                self.reader.refresh(force=True)
-                reason = self.reader.last_reason
-                if reason and reason != "missing":
-                    self.log.log("SnapshotInvalid", reason)
-                text = caption_text(
-                    self._app_before,
-                    _snapshot_observed_at(self.reader.snapshot),
-                    self.reader.last_reason)
-            elif outcome == "unavailable":
-                text = app_refresh_caption("", "no_limits")
-            else:
-                text = app_refresh_caption("", "no_session")
-                self.log.log(
-                    "AppRefresh", "no answer within %d s" % APP_REFRESH_WAIT_SECONDS)
-            self._app_before = None
-            self._set_slot_caption(0, text)
-        except Exception as exc:
-            self._log_exception(exc)
+        self._poll_slot(APP_SLOT, self._finish_app_refresh)
+
+    def _finish_app_refresh(self, outcome, _detail, before):
+        """请求收口：返回 Claude 那一项的反馈文字。只有 ok 才重读 usage.json。"""
+        if outcome == "ok":
+            self.reader.refresh(force=True)
+            reason = self.reader.last_reason
+            if reason and reason != "missing":
+                self.log.log("SnapshotInvalid", reason)
+            return caption_text(
+                before, _snapshot_observed_at(self.reader.snapshot), self.reader.last_reason)
+        if outcome == "unavailable":
+            return app_refresh_caption("", "no_limits")
+        self.log.log("AppRefresh", "no answer within %d s" % APP_REFRESH_WAIT_SECONDS)
+        return app_refresh_caption("", "no_session")
 
     def _stop_app_refresh(self):
         """停掉正在等的请求。可重复调用，绝不抛异常。"""
-        try:
-            if self.app_refresher is not None:
-                self.app_refresher.stop()
-        except Exception as exc:
-            self._log_exception(exc)
+        self._stop_slot(APP_SLOT)
 
     def _drop_app_refresh(self):
-        """轮询计时器建不起来，没有计时器就没人收尾，Claude 项会一直停在 asking，所以放弃这次请求。"""
-        self.log.log("AppRefresh", "poll timer unavailable; request abandoned")
-        self._stop_app_refresh()
-        self._app_before = None
+        """轮询计时器建不起来，Claude 项会一直停在 asking，所以放弃这次请求。"""
+        self._drop_slot(APP_SLOT)
 
     def poll_theme(self):
         light = read_light_theme()
@@ -3808,14 +3820,10 @@ class WidgetApp:
         if recreated:
             if self._exit_deadline is not None:
                 self.set_timer(TIMER_EXIT, max(10, int((self._exit_deadline - time.monotonic()) * 1000)))
-            if self.pinger is not None and self.pinger.running:
-                # 窗口重建清掉了全部计时器；补不上就放弃，否则没人再收尾这个 ping。
-                if not self.set_timer(TIMER_PING, CODEX_PING_POLL_MS):
-                    self._drop_ping()
-            if self.app_refresher is not None and self.app_refresher.waiting:
-                # 窗口重建清掉了全部计时器；补不上就放弃，否则没人再收尾这个请求。
-                if not self.set_timer(TIMER_APP, APP_REFRESH_POLL_MS):
-                    self._drop_app_refresh()
+            for slot in REFRESH_SLOTS:
+                # 窗口重建清掉了全部计时器；补不上就放弃，否则没人再收尾这一路。
+                if self._slot_busy(slot) and not self.set_timer(slot.timer_id, slot.poll_ms):
+                    self._drop_slot(slot)
         elif self.opts.exit_after is not None:
             self.set_timer(TIMER_EXIT, int(self.opts.exit_after * 1000))
         if self.opts.selftest_gdi and not recreated:

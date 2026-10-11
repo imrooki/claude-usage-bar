@@ -3975,7 +3975,11 @@ def _arg_text(text):
 
 def parse_args(argv):
     """宽松解析：未知参数、缺值或值不合法的参数一律忽略，每一处各记一条到 warnings。不做任何 I/O。"""
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, "data")
     exit_after = None
     render_dir = None
     gdi_count = None

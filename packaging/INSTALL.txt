@@ -1,0 +1,115 @@
+claude-usage-bar for Windows 11
+===============================
+
+A small transparent widget on the Windows 11 taskbar that shows your Claude plan
+usage: the 5-hour and the 7-day windows, as two bars with the used percentage and
+the reset time. No Python is needed; everything runs from this folder.
+
+What is in this folder
+----------------------
+
+  claude-usage-bar.exe      the taskbar widget
+  plugins\usage-feed\       the Claude Code plugin that writes your usage numbers
+  plugins\.claude-plugin\   only needed for the terminal-only install (README.md)
+  data\                     the plugin writes usage.json here, the widget reads it
+  README.md                 full documentation
+  LICENSE                   MIT license
+
+The widget cannot see your usage on its own. The numbers come from the usage-feed
+plugin, which runs inside your Claude Code sessions, so steps 2 and 4 are required.
+
+Requirements
+------------
+
+- Windows 11, taskbar at the bottom or the top.
+- A Claude Pro or Max plan.
+- The Claude desktop app with its Code tab (Claude Code with mod support).
+
+1. Put the folder in a local place
+----------------------------------
+
+Unzip so that you get one folder, for example
+
+  C:\Tools\claude-usage-bar
+
+The folder must NOT be inside OneDrive and must not be on a network drive: the
+plugin refuses such paths and then writes nothing. On many PCs the Desktop and
+Documents folders are synced by OneDrive, so do not use those.
+
+2. Tell Claude Code where the plugin is
+---------------------------------------
+
+Open %USERPROFILE%\.claude\settings.json in a text editor (make a copy first) and
+add these two keys. Keep everything else in the file. If "env" already exists, add
+the line inside it instead of creating a second "env". Replace the paths with your
+folder; note the doubled backslashes in the first path and the forward slashes in
+the second:
+
+  "env": {
+    "CLAUDE_CODE_PLUGIN_DIRS": "C:\\Tools\\claude-usage-bar\\plugins\\usage-feed"
+  },
+  "pluginConfigs": {
+    "usage-feed@inline": {
+      "options": { "dataDir": "C:/Tools/claude-usage-bar/data" }
+    }
+  }
+
+Then quit the Claude desktop app completely and start it again.
+
+3. Start the widget
+-------------------
+
+Double-click claude-usage-bar.exe. It appears next to the notification area of the
+taskbar. Only one copy runs at a time.
+
+The exe is not code-signed, so the first start may show "Windows protected your
+PC". Click "More info", then "Run anyway".
+
+4. Open a new Code session
+--------------------------
+
+Open a NEW session in the Code tab of the Claude desktop app and send one message.
+After the reply the widget shows your numbers within about 15 seconds, and
+data\usage.json exists. Sessions that were already open before step 2 do not run
+the plugin.
+
+Refresh now
+-----------
+
+Right-click the widget and choose "Refresh now" to ask the desktop app for your
+account's current usage. If the Codex CLI is installed, the same click also sends
+one tiny request through your own Codex CLI. To switch these off, start the exe
+with --no-app-refresh or --no-codex-ping (in a shortcut, after the exe path).
+
+Start at login
+--------------
+
+Press Win+R, run shell:startup, and put a shortcut to claude-usage-bar.exe in the
+folder that opens.
+
+Updating
+--------
+
+Right-click the widget and choose Quit. Replace claude-usage-bar.exe and the
+plugins folder with the ones from the new zip, keep the data folder and your
+settings, start the exe again, and open a new Code session.
+
+Uninstalling
+------------
+
+Quit the widget, remove the two keys from settings.json, delete the shortcut in
+shell:startup if you made one, and delete the folder.
+
+If the numbers do not show or do not move
+-----------------------------------------
+
+See the sections "When the numbers do not move" and "Install by hand" in
+README.md. The most common causes: the folder is inside OneDrive, the paths in
+settings.json do not match the folder, or the Code session was opened before the
+settings were changed.
+
+Privacy
+-------
+
+The widget only reads local files. It never opens login tokens, cookies or
+auth.json, and it makes no network connection itself.

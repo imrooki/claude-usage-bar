@@ -42,13 +42,29 @@ usage_widget.py: reads data/usage.json every 15 s and draws the bars
 ## Requirements
 
 - Windows 11. Developed on build 26100 and tested on build 26200, with the taskbar at the bottom and 100 % display scaling. Only the primary taskbar is handled, and only a bottom or top taskbar.
-- Python 3 with [Pillow](https://pypi.org/project/pillow/) (developed with Python 3.13 and Pillow 11). The widget uses nothing else outside the standard library.
+- Python 3 with [Pillow](https://pypi.org/project/pillow/) (developed with Python 3.13 and Pillow 11), unless you use the release zip, whose `claude-usage-bar.exe` has Python built in. The widget uses nothing else outside the standard library.
 - Claude Code with mod support. Claude Code's documentation says mods need v2.1.287 or later; this project was tested in the Claude desktop app's Code tab with Claude Code 2.1.286, with the plugin loaded through `CLAUDE_CODE_PLUGIN_DIRS` (see Install).
 - A Claude Pro or Max plan. Rate-limit windows are only reported for subscription plans.
 - Optional: for the click-to-refresh of the Claude numbers, a session in the Claude desktop app's Code tab with the plugin loaded. The app's usage tool does not exist in terminal sessions; with only terminal sessions open, `Refresh now` still works but reports `no session` for Claude (or `no file` while `usage.json` is missing).
 - Optional: the Codex CLI or Codex app signed in with a ChatGPT plan, for the Codex block. Nothing needs to be configured for it. The Codex request on `Refresh now` additionally needs the native `codex.exe` of the Codex CLI to be found (see "Codex usage").
 
 ## Install
+
+### From the release zip (no Python needed)
+
+Download `claude-usage-bar-<version>-<commit>.zip` from the repository's Releases page and check it against the `.sha256` file published with it. The zip holds one folder:
+
+| Path | Content |
+|---|---|
+| `claude-usage-bar.exe` | The widget, built with PyInstaller (Python and Pillow inside) |
+| `plugins/usage-feed/` | The plugin, the same version the exe was built with |
+| `plugins/.claude-plugin/` | The local marketplace, only for the terminal-only install |
+| `data/` | Where the plugin writes `usage.json` and the widget reads it |
+| `INSTALL.txt`, `README.md`, `LICENSE` | Step-by-step install, this file and the MIT license |
+
+Follow `INSTALL.txt`. In short: unzip into a local folder outside OneDrive (for example `C:\Tools\claude-usage-bar`); merge the two keys shown under "Install by hand" into `%USERPROFILE%\.claude\settings.json`, with `CLAUDE_CODE_PLUGIN_DIRS` pointing at `<folder>\plugins\usage-feed` and `dataDir` at `<folder>/data`; restart the desktop app; start `claude-usage-bar.exe`; open a new Code session and send one message.
+
+The exe reads `data` next to itself, so keep it in the unzipped folder, or pass `--data-dir <folder>`. All the widget options of this README work on the exe the same way. It is not code-signed, so Windows SmartScreen asks once ("More info", then "Run anyway"). To update, quit the widget, replace the exe and the `plugins` folder with the new zip's, keep `data` and your settings, and open a new Code session.
 
 ### Let an AI assistant deploy it
 
@@ -164,7 +180,7 @@ After the first completed turn, `data/usage.json` should carry that session's `s
 
 **Updating.** After `git pull`, nothing has to be reinstalled when the plugin is loaded from its folder with `CLAUDE_CODE_PLUGIN_DIRS`: sessions that start afterwards run the new code, sessions that are already open keep the version they loaded, so open a new one. Restart the widget too (`Quit`, then start it again). A marketplace install in a terminal needs no reinstall either: the local marketplace is a folder and its entry has a relative `source`, so the plugin is read from the folder itself (`/reload-plugins` picks up a change in an open session; `claude plugin update usage-feed@usage-bar-local` is not needed for that). Bumping the version in `plugin.json` with each plugin change is still harmless.
 
-By default the widget reads `data/usage.json` next to the script. To use another folder pass `--data-dir <folder>`; it has to be the same folder you gave the plugin.
+By default the widget reads `data/usage.json` next to the script (next to `claude-usage-bar.exe` for the release build). To use another folder pass `--data-dir <folder>`; it has to be the same folder you gave the plugin.
 
 To start it at login, put a shortcut in your Startup folder (press Win+R and run `shell:startup`) whose target is `pythonw.exe` and whose arguments are the full path of `usage_widget.py` in quotes. The widget runs as a single instance, so a second start exits at once.
 
@@ -316,6 +332,18 @@ Known limitations:
 | `plugins/.claude-plugin/marketplace.json` | Local marketplace that lists the plugin |
 | `plugins/usage-feed/` | The Claude Code plugin: `hooks/register.ts` and its tests in `tests/` |
 | `tests/` | Widget tests (native and real-Codex tests opt-in): window events and topmost handling, taskbar ownership and recovery, full-screen detection, drag and the position file, usage.json and Codex log reading, layout and pixel rules, render caches, captions and Refresh now (fake process, temporary folders, fake clocks), startup and the error log |
+| `claude-usage-bar.spec` | PyInstaller recipe for the one-file, windowless `claude-usage-bar.exe` |
+| `packaging/build_release.ps1`, `packaging/INSTALL.txt` | Builds the release zip; the install guide that goes into it |
+
+### Building a release
+
+On Windows, with PyInstaller installed in the same Python that runs the tests (`python -m pip install pyinstaller`):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging\build_release.ps1 -Python python
+```
+
+The script runs the widget tests (skip with `-SkipTests`), builds the exe from `claude-usage-bar.spec`, runs it once with `--selftest-render` as a smoke test, and writes `dist\claude-usage-bar-<version>-<commit>.zip` and its `.sha256`. The version is the plugin's version in `plugin.json`; a build from a tree with uncommitted changes gets `-dirty` in its name, so publish only zips built from a clean commit.
 
 The plugin has 273 tests that run on Claude Code's own test kit (they use stand-ins for the engine, so `$.mcp.call` is never really called):
 
@@ -356,6 +384,10 @@ Choose `Quit` in the widget's right-click menu and delete the Startup shortcut i
 ```powershell
 claude plugin marketplace remove usage-bar-local
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
 
 ## Disclaimer
 

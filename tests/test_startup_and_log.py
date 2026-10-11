@@ -250,6 +250,36 @@ class ParseArgsWarningTests(unittest.TestCase):
         self.assertFalse(opts.no_app_refresh)
         self.assertEqual(list(opts.warnings), [])
 
+    def test_frozen_default_data_dir_is_next_to_the_executable(self):
+        exe = os.path.join(tempfile.gettempdir(), "bundle", "claude-usage-bar.exe")
+        with patch.object(sys, "frozen", True, create=True), \
+                patch.object(sys, "executable", exe):
+            opts = widget.parse_args([])
+        self.assertEqual(
+            opts.data_dir,
+            os.path.join(os.path.dirname(os.path.abspath(exe)), "data"))
+        self.assertEqual(list(opts.warnings), [])
+
+    def test_frozen_data_dir_argument_still_wins(self):
+        exe = os.path.join(tempfile.gettempdir(), "bundle", "claude-usage-bar.exe")
+        target = os.path.join(tempfile.gettempdir(), "elsewhere", "data")
+        with patch.object(sys, "frozen", True, create=True), \
+                patch.object(sys, "executable", exe):
+            opts = widget.parse_args(["--data-dir", target])
+        self.assertEqual(opts.data_dir, os.path.abspath(target))
+        self.assertNotEqual(
+            opts.data_dir,
+            os.path.join(os.path.dirname(os.path.abspath(exe)), "data"))
+
+    def test_not_frozen_falls_back_to_the_script_folder(self):
+        exe = os.path.join(tempfile.gettempdir(), "bundle", "claude-usage-bar.exe")
+        with patch.object(sys, "frozen", False, create=True), \
+                patch.object(sys, "executable", exe):
+            opts = widget.parse_args([])
+        self.assertEqual(
+            opts.data_dir,
+            os.path.join(os.path.dirname(os.path.abspath(widget.__file__)), "data"))
+
     def test_unknown_token_gives_one_warning(self):
         opts = widget.parse_args(["--bogus=1", "--no-codex"])
         self.assertEqual(len(opts.warnings), 1)

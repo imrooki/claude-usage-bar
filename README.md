@@ -328,7 +328,8 @@ Known limitations:
 
 | Path | Content |
 |---|---|
-| `usage_widget.py` | The taskbar widget |
+| `usage_widget.py` | Entry point: CLI parsing, single-instance mutex, app wiring; re-exports the widget's public names |
+| `usage_bar/` | The widget, split by layer: `win32.py` (thin ctypes wrappers), `data.py` (usage.json and Codex log readers, plugin answer, error log, position file), `render.py` (layout math and PIL drawing), `app.py` (window, timers, refresh loop) |
 | `plugins/.claude-plugin/marketplace.json` | Local marketplace that lists the plugin |
 | `plugins/usage-feed/` | The Claude Code plugin: `hooks/register.ts` and its tests in `tests/` |
 | `tests/` | Widget tests (native and real-Codex tests opt-in): window events and topmost handling, taskbar ownership and recovery, full-screen detection, drag and the position file, usage.json and Codex log reading, layout and pixel rules, render caches, captions and Refresh now (fake process, temporary folders, fake clocks), startup and the error log |

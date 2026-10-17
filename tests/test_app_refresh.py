@@ -1955,9 +1955,17 @@ def imported_roots(source_text):
     return roots
 
 
+def widget_source_files():
+    """usage_widget.py 与拆分出的 usage_bar 包内每个模块；源码守卫扫描全部来源。"""
+    files = sorted(pathlib.Path(widget.__file__).resolve().parent.glob("usage_bar/*.py"))
+    files.append(pathlib.Path(widget.__file__))
+    return files
+
+
 class SourceGuardAppTests(unittest.TestCase):
     def setUp(self):
-        self.source = pathlib.Path(widget.__file__).read_text(encoding="utf-8")
+        self.source = "\n".join(
+            path.read_text(encoding="utf-8") for path in widget_source_files())
         self.tree = ast.parse(self.source)
         self.lines = self.source.splitlines()
 

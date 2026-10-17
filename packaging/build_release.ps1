@@ -1,8 +1,8 @@
 # Build a redistributable zip of claude-usage-bar.
 #
-# Runs the unit tests, packs usage_widget.py with the repo spec via
-# PyInstaller, smoke-tests the exe, then writes a zip and a .sha256
-# sidecar. The zip runs without a Python install.
+# Runs the unit tests, packs the widget (usage_widget.py and the usage_bar
+# package) with the repo spec via PyInstaller, smoke-tests the exe, then writes a
+# zip and a .sha256 sidecar. The zip runs without a Python install.
 #
 # Parameters:
 #   -Python     Interpreter used for tests and PyInstaller. Default: python

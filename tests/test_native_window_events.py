@@ -15,6 +15,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+# The sibling import below also has to work when this module is run by its dotted name.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import usage_widget as widget
 
 

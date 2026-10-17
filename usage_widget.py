@@ -25,7 +25,8 @@
 代码分三层：
   1. 纯函数（快照读取与校验、显示状态、显示元组、布局、文字、渲染、预乘转换），可离线测试；
   2. Win32 薄封装（ctypes，只用白名单里的函数）；
-  3. 窗口与周期任务（WidgetApp，全部在主线程，周期任务用 SetTimer 与 WM_TIMER）。
+  3. 窗口与周期任务（WidgetApp，全部在主线程；周期任务用 SetTimer 与 WM_TIMER，
+     窗口事件（前台切换、外壳重排、顶层窗口尺寸/位置变化）经消息投递驱动同一条刷新路径）。
 """
 
 import collections
@@ -157,6 +158,7 @@ GWL_EXSTYLE = -20
 MAX_Z_ORDER_WINDOWS = 1024
 EVENT_SYSTEM_FOREGROUND = 0x0003
 EVENT_OBJECT_REORDER = 0x8004
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
 OBJID_WINDOW = 0
 OBJID_CLIENT = -4
 CHILDID_SELF = 0
@@ -2585,7 +2587,10 @@ class Win32:
         return int(self.user32.RegisterWindowMessageW(name))
 
     def watch_window_events(self, handler):
-        """进程外只读事件通知；回调只投递消息，不在回调里改变窗口层级。"""
+        """进程外只读事件通知；回调只投递消息，不在回调里改变窗口层级。
+
+        覆盖前台切换、外壳重排与普通窗口的尺寸/位置变化——全屏进出主要靠最后一个。
+        """
         def callback(_hook, event, hwnd, object_id, child_id, _thread, _time):
             try:
                 handler(event, hwnd or 0, object_id, child_id)
@@ -2595,7 +2600,9 @@ class Win32:
 
         self._event_callback = WINEVENTPROC(callback)
         try:
-            for event in (EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_REORDER):
+            for event in (
+                    EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_REORDER,
+                    EVENT_OBJECT_LOCATIONCHANGE):
                 hook = self.user32.SetWinEventHook(
                     event, event, None, self._event_callback, 0, 0,
                     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
@@ -3301,7 +3308,10 @@ class WidgetApp:
     # 显示与定位 --------------------------------------------------------------
 
     def on_window_event(self, event, hwnd, object_id, child_id):
-        """合并窗口事件，每批最多投递一次检查；对象内部的列表重排不相关。"""
+        """合并窗口事件，每批最多投递一次检查；对象内部的列表重排不相关。
+
+        尺寸/位置变化只看顶层窗口自身（全屏进出）；光标与子控件的变化忽略。
+        """
         if self.exiting or not self.hwnd or not hwnd or self._z_order_pending:
             return
         if event == EVENT_OBJECT_REORDER:
@@ -3309,6 +3319,9 @@ class WidgetApp:
                 return
             if object_id != OBJID_WINDOW and not (
                     object_id == OBJID_CLIENT and hwnd == self.w32.desktop_hwnd()):
+                return
+        elif event == EVENT_OBJECT_LOCATIONCHANGE:
+            if object_id != OBJID_WINDOW or child_id != CHILDID_SELF:
                 return
         elif event != EVENT_SYSTEM_FOREGROUND:
             return
@@ -3318,11 +3331,12 @@ class WidgetApp:
 
     def on_z_order_check(self):
         self._z_order_pending = False
-        if self.exiting or not self.hwnd or not self.visible:
+        if self.exiting or not self.hwnd:
             return
-        # 只在任务栏确实盖住小窗时恢复层级，避免自己的重排通知形成循环。
-        if self.w32.taskbar_above(self.hwnd):
-            self.refresh_view(reassert_topmost=True)
+        # 事件既驱动层级恢复也驱动可见性复核（全屏进出即时隐藏/恢复）。
+        # 层级恢复的代价守卫在 _refresh_once 内部（新显示看 topmost_allowed，
+        # 已显示才问 taskbar_above）；自身事件被 SKIPOWNPROCESS 滤掉，不成环。
+        self.refresh_view(reassert_topmost=True)
 
     def _current_snapshot(self):
         if self.snapshot_override is not None:

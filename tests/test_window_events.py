@@ -74,9 +74,19 @@ class WindowEventTests(unittest.TestCase):
                      (widget.EVENT_OBJECT_REORDER, 40, widget.OBJID_CLIENT, 1),
                      (widget.EVENT_OBJECT_REORDER, 20, -7, 0),
                      (widget.EVENT_SYSTEM_FOREGROUND, 0, 0, 0),
+                     (widget.EVENT_OBJECT_LOCATIONCHANGE, 0, 0, 0),
+                     (widget.EVENT_OBJECT_LOCATIONCHANGE, 20, widget.OBJID_CLIENT, 0),
+                     (widget.EVENT_OBJECT_LOCATIONCHANGE, 20, widget.OBJID_WINDOW, 1),
+                     (widget.EVENT_OBJECT_LOCATIONCHANGE, 20, -9, 0),
                      (999, 20, 0, 0)):
             app.on_window_event(*args)
         app.w32.post_z_order_check.assert_not_called()
+
+    def test_location_changes_coalesce_into_one_check(self):
+        app = make_app()
+        app.on_window_event(widget.EVENT_OBJECT_LOCATIONCHANGE, 20, widget.OBJID_WINDOW, 0)
+        app.on_window_event(widget.EVENT_OBJECT_LOCATIONCHANGE, 21, widget.OBJID_WINDOW, 0)
+        app.w32.post_z_order_check.assert_called_once_with(app.hwnd)
 
     def test_failed_post_can_retry(self):
         app = make_app()
@@ -110,13 +120,31 @@ class WindowEventTests(unittest.TestCase):
                 if mode in ("fullscreen", "autohide"):
                     app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_HIDE)
 
-    def test_hidden_or_exiting_widget_does_not_raise(self):
-        for attribute, value in (("visible", False), ("exiting", True), ("hwnd", 0)):
+    def test_hidden_widget_shows_again_when_events_fire(self):
+        app = make_app()
+        app.visible = False
+        app.on_z_order_check()
+        app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_SHOWNOACTIVATE)
+        self.assertTrue(app.visible)
+        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+
+    def test_hidden_widget_stays_hidden_while_fullscreen_is_present(self):
+        app = make_app()
+        app.visible = False
+        app.w32.fullscreen_window_present.return_value = True
+        app.on_z_order_check()
+        app.w32.show_window.assert_not_called()
+        app.w32.keep_topmost.assert_not_called()
+        self.assertFalse(app.visible)
+
+    def test_exiting_or_ownerless_widget_ignores_events(self):
+        for attribute, value in (("exiting", True), ("hwnd", 0)):
             with self.subTest(attribute=attribute):
                 app = make_app()
                 setattr(app, attribute, value)
                 app.on_z_order_check()
                 app.w32.keep_topmost.assert_not_called()
+                app.w32.show_window.assert_not_called()
 
     def test_fullscreen_window_hides_widget_in_any_notification_state(self):
         for state in (2, 5, None):
@@ -387,10 +415,10 @@ class Win32EventTests(unittest.TestCase):
 
     def test_callback_retained_until_unhook_succeeds(self):
         w32 = self.make_win32()
-        w32.user32.SetWinEventHook.side_effect = [100, 101]
+        w32.user32.SetWinEventHook.side_effect = [100, 101, 102]
         w32.watch_window_events(Mock())
         callback = w32._event_callback
-        w32.user32.UnhookWinEvent.side_effect = [False, True, True]
+        w32.user32.UnhookWinEvent.side_effect = [False, True, True, True]
         w32.unwatch_window_events()
         self.assertEqual(w32._event_hooks, [100])
         self.assertIs(w32._event_callback, callback)

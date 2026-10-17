@@ -43,7 +43,7 @@ def make_app(argv=None):
     w32.taskbar_pos.return_value = ((0, 100, 1000, 140), widget.ABE_BOTTOM)
     w32.taskbar_autohide.return_value = False
     w32.notification_state.return_value = 5
-    w32.foreground_covers_taskbar.return_value = False
+    w32.fullscreen_window_present.return_value = False
     w32.scale_for.return_value = 1.0
     w32.tray_notify_rect.return_value = None
     w32.foreground_hwnd.return_value = 30
@@ -384,7 +384,7 @@ class OptionsAndPollTests(unittest.TestCase):
         self.assertEqual(override.rows[0].pct_text, "30%")
 
 
-GEOMETRY_QUERIES = ("taskbar_pos", "taskbar_autohide", "notification_state", "scale_for", "tray_notify_rect")
+GEOMETRY_QUERIES = ("taskbar_pos", "taskbar_autohide", "notification_state", "scale_for", "tray_notify_rect", "fullscreen_window_present")
 
 
 def geometry_calls(app):

@@ -886,7 +886,7 @@ def make_app(claude=None, codex=NO_CODEX, pinger=False, refresher=True, options=
     w32.taskbar_pos.return_value = ((0, 100, 1000, 140), widget.ABE_BOTTOM)
     w32.taskbar_autohide.return_value = False
     w32.notification_state.return_value = 5
-    w32.foreground_covers_taskbar.return_value = False
+    w32.fullscreen_window_present.return_value = False
     w32.scale_for.return_value = 1.0
     w32.tray_notify_rect.return_value = None
     w32.foreground_hwnd.return_value = 30
@@ -2019,7 +2019,7 @@ class SourceGuardAppTests(unittest.TestCase):
         names = {
             "%s.%s" % pair
             for pair in re.findall(r"_signature\(\s*self\.(\w+)\.(\w+)", self.source)}
-        self.assertEqual(len(names), 60)
+        self.assertEqual(len(names), 63)
         self.assertEqual(names, FROZEN_CTYPES)
         structures = []
         for node in ast.walk(self.tree):
@@ -2034,19 +2034,19 @@ class SourceGuardAppTests(unittest.TestCase):
             ["APPBARDATA", "MONITORINFO", "BITMAPINFOHEADER", "BLENDFUNCTION", "WNDCLASSEXW"])
         self.assertEqual(
             re.findall(r'WinDLL\("(\w+)"', self.source),
-            ["user32", "gdi32", "shell32", "kernel32", "shcore"])
+            ["user32", "gdi32", "shell32", "kernel32", "shcore", "dwmapi"])
         # Expectation updated on purpose. The callback factory is WINFUNCTYPE on Windows and
         # CFUNCTYPE elsewhere (so the offline tests can import the module), and the literal name
         # now appears once in the fallback line instead of once per callback. Pin the fallback
-        # line and the two callback definitions by name, and count every spelling of the factory
+        # line and the three callback definitions by name, and count every spelling of the factory
         # in the whole file: a callback built indented (inside a method) or through a second
         # getattr fallback at module level must fail too.
         self.assertIn(
             '_CALLBACK_TYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)', self.source)
         self.assertEqual(
             re.findall(r"^(\w+) = _CALLBACK_TYPE\(", self.source, re.M),
-            ["WNDPROC", "WINEVENTPROC"])
-        self.assertEqual(self.source.count("_CALLBACK_TYPE("), 2)
+            ["WNDPROC", "WINEVENTPROC", "WNDENUMPROC"])
+        self.assertEqual(self.source.count("_CALLBACK_TYPE("), 3)
         self.assertEqual(self.source.count("WINFUNCTYPE"), 1)
         self.assertEqual(self.source.count("ctypes.CFUNCTYPE"), 1)
 

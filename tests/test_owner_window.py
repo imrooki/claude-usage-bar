@@ -646,6 +646,7 @@ class Win32OwnerTests(unittest.TestCase):
         w32 = self.make_win32()
         w32.gdi32, w32.shell32 = Mock(), Mock()
         w32.shcore = None
+        w32.dwmapi = None
         w32._declare()
         handle = ctypes.c_void_p
         expected = (

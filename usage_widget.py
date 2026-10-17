@@ -153,6 +153,7 @@ WS_EX_NOACTIVATE = 0x08000000
 HWND_TOPMOST = -1
 GW_HWNDPREV = 3
 GW_OWNER = 4
+GWL_EXSTYLE = -20
 MAX_Z_ORDER_WINDOWS = 1024
 EVENT_SYSTEM_FOREGROUND = 0x0003
 EVENT_OBJECT_REORDER = 0x8004
@@ -182,6 +183,7 @@ DPI_CONTEXT_PER_MONITOR_V2 = -4
 MONITOR_DEFAULTTONULL = 0
 BUSY_NOTIFICATION_STATE = 2
 HIDE_NOTIFICATION_STATES = frozenset({3, 4})
+DWMWA_CLOAKED = 14
 SUPPORTED_EDGES = frozenset({ABE_TOP, ABE_BOTTOM})
 TOPMOST_SKIP_CLASSES = frozenset({
     "Windows.UI.Core.CoreWindow",
@@ -191,8 +193,8 @@ TOPMOST_SKIP_CLASSES = frozenset({
     "XamlExplorerHostIslandWindow",
     "#32768",
 })
-# 前台是这些窗口时用户点的是任务栏或桌面本身，不是全屏应用；它们的矩形恰好等于
-# 任务栏或铺满显示器，只按矩形判断会把它们误当成全屏。
+# 任务栏与桌面（含铺满多屏的 WorkerW）的矩形恰好等于任务栏或覆盖显示器；
+# 用户点任务栏或桌面后它们也在顶层窗口列表里，只按矩形判断会把它们误当成全屏。
 SHELL_SURFACE_CLASSES = frozenset({
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
@@ -2330,6 +2332,8 @@ WNDPROC = _CALLBACK_TYPE(
 WINEVENTPROC = _CALLBACK_TYPE(
     None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
     ctypes.c_long, ctypes.c_long, ctypes.c_uint, ctypes.c_uint)
+# EnumWindows 回调：返回 0 会中止枚举，所以固定返回 1 收满全部句柄。
+WNDENUMPROC = _CALLBACK_TYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_ssize_t)
 
 
 class WNDCLASSEXW(ctypes.Structure):
@@ -2373,6 +2377,10 @@ class Win32:
             self.shcore = ctypes.WinDLL("shcore")
         except OSError:
             self.shcore = None
+        try:
+            self.dwmapi = ctypes.WinDLL("dwmapi")
+        except OSError:
+            self.dwmapi = None
         self.hinstance = None
         self._wndclass = None
         self._class_registered = False
@@ -2432,6 +2440,15 @@ class Win32:
         _signature(self.user32.MonitorFromRect, [ctypes.POINTER(wintypes.RECT), wintypes.DWORD], ptr)
         _signature(self.user32.GetMonitorInfoW, [ptr, ctypes.POINTER(MONITORINFO)], i32)
         _signature(self.user32.GetGuiResources, [ptr, u32], u32)
+        _signature(self.user32.EnumWindows, [WNDENUMPROC, ctypes.c_ssize_t], i32)
+        _signature(self.user32.GetWindowLongPtrW, [ptr, i32], ctypes.c_ssize_t)
+        # dwmapi 较旧系统上也可能缺失；签名建不上就按「拿不到」处理
+        if self.dwmapi is not None:
+            try:
+                _signature(self.dwmapi.DwmGetWindowAttribute,
+                           [ptr, wintypes.DWORD, ptr, wintypes.DWORD], ctypes.c_long)
+            except AttributeError:
+                self.dwmapi = None
 
         _signature(self.gdi32.CreateCompatibleDC, [ptr], ptr)
         _signature(self.gdi32.DeleteDC, [ptr], i32)
@@ -2765,31 +2782,57 @@ class Win32:
         area = info.rcMonitor
         return area.left, area.top, area.right, area.bottom
 
-    def foreground_covers_taskbar(self, taskbar_rect):
-        """前台是否为铺满本任务栏所在显示器的普通应用窗口，即全屏应用。
+    def top_level_windows(self):
+        """当前所有顶层窗口句柄，顺序即 EnumWindows 的枚举顺序。"""
+        handles = []
 
-        有些机器上 SHQueryUserNotificationState 长期返回忙碌（桌面空闲时也是），单凭
-        它不能判全屏，所以调用方还要靠这个函数确认。下列前台都不算全屏，否则挂件会
-        把自己藏起来：
-        - 任务栏、副任务栏、桌面（SHELL_SURFACE_CLASSES）：用户点任务栏空白处或桌面
-          后它们成为前台，矩形等于任务栏或铺满显示器；前台停在任务栏时（例如开始菜单
-          用 Esc 关闭后焦点回到任务栏）挂件会一直出不来；
-        - 本进程自己的窗口（右键菜单期间本窗口是前台）；
-        - 铺不满显示器的窗口：最大化窗口只比工作区多出几个像素，盖不住整条任务栏。
-        目标矩形取任务栏所在显示器的完整矩形；查不到显示器时退回任务栏矩形本身。
+        def collect(hwnd, _lparam):
+            handles.append(hwnd)
+            return 1
+
+        callback = WNDENUMPROC(collect)
+        self.user32.EnumWindows(callback, 0)
+        return handles
+
+    def window_cloaked(self, hwnd):
+        """窗口是否被 DWM 隐藏（挂起的 UWP 等）；查询不可用时按未隐藏处理。"""
+        if self.dwmapi is None:
+            return False
+        value = wintypes.DWORD(0)
+        result = self.dwmapi.DwmGetWindowAttribute(
+            hwnd, DWMWA_CLOAKED, ctypes.byref(value), ctypes.sizeof(value))
+        if result != 0:
+            return False
+        return bool(value.value)
+
+    def fullscreen_window_present(self):
+        """是否有任一普通顶层窗口铺满其所在显示器，即全屏应用。
+
+        与前台焦点无关：全屏应用被切到后台后仍算。下列窗口都不算：不可见窗口、
+        工具窗、被 DWM 隐藏的窗口、本进程自己的窗口、任务栏与桌面外壳类、拿不到
+        矩形或所在显示器的窗口；最大化窗口盖不满显示器，天然不算。
         """
-        hwnd = self.foreground_hwnd()
-        if not hwnd or self.class_name(hwnd) in SHELL_SURFACE_CLASSES:
-            return False
-        if self.window_pid(hwnd) == self.kernel32.GetCurrentProcessId():
-            return False
-        foreground_rect = self.window_rect(hwnd)
-        if foreground_rect is None:
-            return False
-        target = self.monitor_rect_for(taskbar_rect)
-        if target is None:
-            target = taskbar_rect
-        return rect_inside(target, foreground_rect)
+        own_pid = self.kernel32.GetCurrentProcessId()
+        for hwnd in self.top_level_windows():
+            if not self.user32.IsWindowVisible(hwnd):
+                continue
+            if self.user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW:
+                continue
+            if self.window_cloaked(hwnd):
+                continue
+            if self.window_pid(hwnd) == own_pid:
+                continue
+            if self.class_name(hwnd) in SHELL_SURFACE_CLASSES:
+                continue
+            window = self.window_rect(hwnd)
+            if window is None:
+                continue
+            monitor = self.monitor_rect_for(window)
+            if monitor is None:
+                continue
+            if rect_inside(monitor, window):
+                return True
+        return False
 
     def shell_popup_overlaps(self, popup, hwnd):
         """只避让真正覆盖小窗的可见系统面板，不因面板打开就放弃层级。"""
@@ -3334,8 +3377,7 @@ class WidgetApp:
             return
         notification_state = self.w32.notification_state()
         if (notification_state in HIDE_NOTIFICATION_STATES
-                or (notification_state == BUSY_NOTIFICATION_STATE
-                    and self.w32.foreground_covers_taskbar(rect))):
+                or self.w32.fullscreen_window_present()):
             self._hide()
             return
         scale = self.w32.scale_for(self.hwnd)

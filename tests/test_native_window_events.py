@@ -111,6 +111,7 @@ class NativeWindowEventTests(unittest.TestCase):
             w32.taskbar_pos = lambda: ((-32000, -32000, -31000, -31960), widget.ABE_BOTTOM)
             w32.taskbar_autohide = lambda: False
             w32.notification_state = lambda: 5
+            w32.fullscreen_window_present = lambda: False
             w32.tray_notify_rect = lambda: None
             w32.foreground_hwnd = lambda: 0
             restored = []

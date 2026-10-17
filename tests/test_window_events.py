@@ -22,7 +22,7 @@ def make_app():
     w32.taskbar_pos.return_value = ((0, 100, 1000, 140), widget.ABE_BOTTOM)
     w32.taskbar_autohide.return_value = False
     w32.notification_state.return_value = 5
-    w32.foreground_covers_taskbar.return_value = False
+    w32.fullscreen_window_present.return_value = False
     w32.scale_for.return_value = 1.0
     w32.tray_notify_rect.return_value = None
     w32.foreground_hwnd.return_value = 30
@@ -118,19 +118,20 @@ class WindowEventTests(unittest.TestCase):
                 app.on_z_order_check()
                 app.w32.keep_topmost.assert_not_called()
 
-    def test_busy_state_requires_actual_foreground_taskbar_coverage(self):
-        for covers in (False, True):
-            with self.subTest(covers=covers):
-                app = make_app()
-                app.w32.notification_state.return_value = widget.BUSY_NOTIFICATION_STATE
-                app.w32.foreground_covers_taskbar.return_value = covers
-                app.refresh_view(reassert_topmost=True)
-                if covers:
-                    app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_HIDE)
-                    app.w32.keep_topmost.assert_not_called()
-                else:
-                    app.w32.show_window.assert_not_called()
-                    app.w32.keep_topmost.assert_called_once_with(app.hwnd)
+    def test_fullscreen_window_hides_widget_in_any_notification_state(self):
+        for state in (2, 5, None):
+            for present in (False, True):
+                with self.subTest(state=state, present=present):
+                    app = make_app()
+                    app.w32.notification_state.return_value = state
+                    app.w32.fullscreen_window_present.return_value = present
+                    app.refresh_view(reassert_topmost=True)
+                    if present:
+                        app.w32.show_window.assert_called_once_with(app.hwnd, widget.SW_HIDE)
+                        app.w32.keep_topmost.assert_not_called()
+                    else:
+                        app.w32.show_window.assert_not_called()
+                        app.w32.keep_topmost.assert_called_once_with(app.hwnd)
 
     def test_reentrant_refresh_preserves_topmost_request(self):
         app = make_app()
@@ -331,18 +332,48 @@ class Win32EventTests(unittest.TestCase):
         w32.window_rect = Mock(return_value=(0, 100, 100, 140))
         return w32
 
-    def make_foreground_win32(self, foreground_class="", rect=None, pid=FOREIGN_PID,
-                              monitor=MONITOR_RECT):
-        """前台是 hwnd 30；类名、矩形、进程号与任务栏所在显示器的矩形都用替身。"""
+    def make_census_win32(self, windows):
+        """按 windows 列表驱动真实的 Win32.fullscreen_window_present。
+
+        windows：dict 列表，键 hwnd / visible / ex_style / pid / class / rect /
+        monitor / cloaked，默认值由 window() 给出。
+        """
         w32 = self.make_win32()
         w32.kernel32 = Mock()
         w32.kernel32.GetCurrentProcessId.return_value = OWN_PID
-        w32.foreground_hwnd = Mock(return_value=30)
-        w32.class_name.return_value = foreground_class
-        w32.window_rect.return_value = rect
-        w32.window_pid = Mock(return_value=pid)
-        w32.monitor_rect_for = Mock(return_value=monitor)
+        w32.dwmapi = Mock()
+        w32.foreground_hwnd = Mock(return_value=0)
+        by_hwnd = {entry["hwnd"]: entry for entry in windows}
+        monitors = {entry["rect"]: entry["monitor"] for entry in windows}
+
+        def enum(callback, lparam):
+            for hwnd in by_hwnd:
+                callback(hwnd, lparam)
+            return 1
+
+        w32.user32.EnumWindows.side_effect = enum
+        w32.user32.IsWindowVisible.side_effect = lambda hwnd: by_hwnd[hwnd]["visible"]
+        w32.user32.GetWindowLongPtrW.side_effect = lambda hwnd, index: by_hwnd[hwnd]["ex_style"]
+        w32.window_pid = Mock()
+        w32.window_pid.side_effect = lambda hwnd: by_hwnd[hwnd]["pid"]
+        w32.class_name.side_effect = lambda hwnd: by_hwnd[hwnd]["class"]
+        w32.window_rect.side_effect = lambda hwnd: by_hwnd[hwnd]["rect"]
+        w32.monitor_rect_for = Mock()
+        w32.monitor_rect_for.side_effect = lambda rect: monitors.get(rect)
+
+        def dwm(hwnd, attribute, value_ref, size):
+            value_ref._obj.value = 1 if by_hwnd[hwnd]["cloaked"] else 0
+            return 0
+
+        w32.dwmapi.DwmGetWindowAttribute.side_effect = dwm
         return w32
+
+    def window(self, **overrides):
+        entry = {"hwnd": 30, "visible": True, "ex_style": 0, "pid": FOREIGN_PID,
+                 "class": "", "rect": MONITOR_RECT, "monitor": MONITOR_RECT,
+                 "cloaked": False}
+        entry.update(overrides)
+        return entry
 
     def test_partial_registration_failure_removes_first_hook(self):
         w32 = self.make_win32()
@@ -400,78 +431,91 @@ class Win32EventTests(unittest.TestCase):
                 self.assertTrue(w32.taskbar_above(10))
                 self.assertTrue(w32.topmost_allowed(10))
 
-    def test_foreground_coverage_distinguishes_maximized_and_fullscreen(self):
-        w32 = self.make_foreground_win32()
-        for rect, expected in (((-8, -8, 1928, 1040), False),
-                               ((560, 282, 1360, 1032), False),
-                               ((0, 0, 1920, 1080), True),
-                               ((1920, 0, 3840, 1080), False),
-                               (None, False)):
-            with self.subTest(rect=rect):
-                w32.window_rect.return_value = rect
-                self.assertEqual(w32.foreground_covers_taskbar(TASKBAR_RECT), expected)
+    def test_any_window_filling_its_own_monitor_is_fullscreen(self):
+        for rect, monitor, expected in (
+                (MONITOR_RECT, MONITOR_RECT, True),
+                ((-1, -1, 1921, 1081), MONITOR_RECT, True),
+                ((-8, -8, 1928, 1040), MONITOR_RECT, False),
+                ((560, 282, 1360, 1032), MONITOR_RECT, False),
+                ((0, 0, 1920, 1079), MONITOR_RECT, False),
+                (None, MONITOR_RECT, False),
+                (MONITOR_RECT, None, False)):
+            with self.subTest(rect=rect, monitor=monitor):
+                w32 = self.make_census_win32([self.window(rect=rect, monitor=monitor)])
+                self.assertEqual(w32.fullscreen_window_present(), expected)
 
-    def test_taskbar_and_desktop_foreground_never_count_as_fullscreen(self):
+    def test_a_fullscreen_window_counts_on_a_non_taskbar_monitor(self):
+        secondary = (1920, 0, 3840, 1080)
+        w32 = self.make_census_win32([self.window(rect=secondary, monitor=secondary)])
+        self.assertTrue(w32.fullscreen_window_present())
+
+    def test_a_background_fullscreen_window_still_counts(self):
+        # 回归：视频全屏后焦点切到别的窗口，全屏窗口转入后台，仍要隐藏挂件。
+        w32 = self.make_census_win32([self.window(rect=MONITOR_RECT)])
+        self.assertTrue(w32.fullscreen_window_present())
+        w32.foreground_hwnd.assert_not_called()
+
+    def test_shell_surface_windows_never_count_as_fullscreen(self):
         self.assertEqual(widget.SHELL_SURFACE_CLASSES,
                          frozenset({"Shell_TrayWnd", "Shell_SecondaryTrayWnd",
                                     "Progman", "WorkerW"}))
-        # 每组 (矩形, 显示器矩形) 下，普通应用窗口的结果见第三项；外壳窗口无论几何如何
-        # 都必须不算。前三组是普通窗口会被判成全屏的几何（点桌面、点跨显示器的整块
-        # 桌面、查不到显示器时点任务栏），最后一组是显示器已知时点任务栏。
-        for rect, monitor, ordinary_expected in ((MONITOR_RECT, MONITOR_RECT, True),
-                                                 ((0, 0, 3840, 1080), MONITOR_RECT, True),
-                                                 (TASKBAR_RECT, None, True),
-                                                 (TASKBAR_RECT, MONITOR_RECT, False)):
-            with self.subTest(foreground_class="ordinary", rect=rect, monitor=monitor):
-                ordinary = self.make_foreground_win32("", rect, monitor=monitor)
-                self.assertEqual(ordinary.foreground_covers_taskbar(TASKBAR_RECT),
-                                 ordinary_expected)
-            for foreground_class in sorted(widget.SHELL_SURFACE_CLASSES):
-                with self.subTest(foreground_class=foreground_class, rect=rect, monitor=monitor):
-                    shell = self.make_foreground_win32(foreground_class, rect, monitor=monitor)
-                    self.assertFalse(shell.foreground_covers_taskbar(TASKBAR_RECT))
+        for shell_class in sorted(widget.SHELL_SURFACE_CLASSES):
+            for rect in (MONITOR_RECT, (0, 0, 3840, 1080), (-1080, -119, 6400, 1920)):
+                with self.subTest(shell_class=shell_class, rect=rect):
+                    w32 = self.make_census_win32(
+                        [self.window(**{"class": shell_class, "rect": rect, "monitor": rect})])
+                    self.assertFalse(w32.fullscreen_window_present())
 
-    def test_own_process_foreground_is_not_a_fullscreen_app(self):
-        # 进程号取不到（0）时按外来窗口处理，由矩形决定
+    def test_own_process_windows_never_count_as_fullscreen(self):
         for pid, expected in ((OWN_PID, False), (FOREIGN_PID, True), (0, True)):
             with self.subTest(pid=pid):
-                w32 = self.make_foreground_win32(rect=MONITOR_RECT, pid=pid)
-                self.assertEqual(w32.foreground_covers_taskbar(TASKBAR_RECT), expected)
-                w32.window_pid.assert_called_with(30)
+                w32 = self.make_census_win32([self.window(pid=pid)])
+                self.assertEqual(w32.fullscreen_window_present(), expected)
 
-    def test_ordinary_window_must_fill_the_taskbar_monitor(self):
-        w32 = self.make_foreground_win32()
-        for rect, expected in ((MONITOR_RECT, True),
-                               ((-1, -1, 1921, 1081), True),
-                               ((0, 1000, 1920, 1080), False),
-                               ((0, 0, 1920, 1079), False)):
-            with self.subTest(rect=rect):
-                w32.window_rect.return_value = rect
-                self.assertEqual(w32.foreground_covers_taskbar(TASKBAR_RECT), expected)
-        w32.monitor_rect_for.assert_called_with(TASKBAR_RECT)
+    def test_invisible_windows_never_count_as_fullscreen(self):
+        for visible, expected in ((False, False), (True, True)):
+            with self.subTest(visible=visible):
+                w32 = self.make_census_win32([self.window(visible=visible)])
+                self.assertEqual(w32.fullscreen_window_present(), expected)
 
-    def test_unknown_monitor_falls_back_to_taskbar_rectangle(self):
-        w32 = self.make_foreground_win32(monitor=None)
-        for rect, expected in (((0, 1000, 1920, 1080), True),
-                               (MONITOR_RECT, True),
-                               ((0, 1040, 1920, 1080), False),
-                               ((-8, -8, 1928, 1040), False),
-                               ((1920, 0, 3840, 1080), False)):
-            with self.subTest(rect=rect):
-                w32.window_rect.return_value = rect
-                self.assertEqual(w32.foreground_covers_taskbar(TASKBAR_RECT), expected)
-        w32.monitor_rect_for.assert_called_with(TASKBAR_RECT)
+    def test_tool_windows_never_count_as_fullscreen(self):
+        for ex_style, expected in ((widget.WS_EX_TOOLWINDOW, False), (0, True)):
+            with self.subTest(ex_style=ex_style):
+                w32 = self.make_census_win32([self.window(ex_style=ex_style)])
+                self.assertEqual(w32.fullscreen_window_present(), expected)
 
-    def test_no_foreground_window_is_not_fullscreen(self):
-        w32 = self.make_foreground_win32(rect=MONITOR_RECT)
-        w32.foreground_hwnd.return_value = 0
-        self.assertFalse(w32.foreground_covers_taskbar(TASKBAR_RECT))
-        w32.window_pid.assert_not_called()
-        w32.window_rect.assert_not_called()
+    def test_cloaked_windows_never_count_as_fullscreen(self):
+        for cloaked, expected in ((True, False), (False, True)):
+            with self.subTest(cloaked=cloaked):
+                w32 = self.make_census_win32([self.window(cloaked=cloaked)])
+                self.assertEqual(w32.fullscreen_window_present(), expected)
+        w32 = self.make_census_win32([self.window()])
+        w32.dwmapi = None
+        self.assertTrue(w32.fullscreen_window_present())
+        w32 = self.make_census_win32([self.window()])
+        w32.dwmapi.DwmGetWindowAttribute.side_effect = lambda hwnd, attr, ref, size: 5
+        self.assertTrue(w32.fullscreen_window_present())
 
-    def test_busy_state_keeps_widget_visible_when_taskbar_or_desktop_is_foreground(self):
-        # 回归：忙碌状态下用户点任务栏空白处或桌面，前台成了外壳窗口，挂件不能因此隐藏。
-        # 前台判定走真实的 Win32.foreground_covers_taskbar，只把底层查询换成替身。
+    def test_no_top_level_windows_is_not_fullscreen(self):
+        w32 = self.make_census_win32([])
+        self.assertFalse(w32.fullscreen_window_present())
+
+    def test_one_qualifying_window_among_others(self):
+        windows = [self.window(hwnd=31, visible=False),
+                   self.window(hwnd=32, ex_style=widget.WS_EX_TOOLWINDOW),
+                   self.window(hwnd=33, **{"class": "Shell_TrayWnd"}),
+                   self.window(hwnd=34, cloaked=True),
+                   self.window(hwnd=35, rect=(0, 500, 1920, 1080)),
+                   self.window(hwnd=36, rect=(1920, 0, 3840, 1080),
+                               monitor=(1920, 0, 3840, 1080))]
+        w32 = self.make_census_win32(windows)
+        self.assertTrue(w32.fullscreen_window_present())
+        w32 = self.make_census_win32(windows[:-1])
+        self.assertFalse(w32.fullscreen_window_present())
+
+    def test_desktop_or_taskbar_windows_do_not_hide_the_widget(self):
+        # 回归：忙碌状态下用户点任务栏空白处或桌面，外壳窗口铺满也不得隐藏挂件。
+        # 判定走真实的 Win32.fullscreen_window_present，只把底层查询换成替身。
         taskbar = (0, 100, 1000, 140)
         monitor = (0, 0, 1000, 140)
         for foreground_class, rect in (("Shell_TrayWnd", taskbar),
@@ -481,8 +525,9 @@ class Win32EventTests(unittest.TestCase):
                 app = make_app()
                 app.w32.taskbar_pos.return_value = (taskbar, widget.ABE_BOTTOM)
                 app.w32.notification_state.return_value = widget.BUSY_NOTIFICATION_STATE
-                w32 = self.make_foreground_win32(foreground_class, rect, monitor=monitor)
-                app.w32.foreground_covers_taskbar = w32.foreground_covers_taskbar
+                census = self.make_census_win32(
+                    [self.window(**{"class": foreground_class, "rect": rect, "monitor": monitor})])
+                app.w32.fullscreen_window_present = census.fullscreen_window_present
                 app.refresh_view(reassert_topmost=True)
                 app.w32.show_window.assert_not_called()
                 self.assertTrue(app.visible)
@@ -560,6 +605,7 @@ class Win32EventTests(unittest.TestCase):
         w32 = widget.Win32.__new__(widget.Win32)
         w32.user32, w32.gdi32, w32.shell32, w32.kernel32 = Mock(), Mock(), Mock(), Mock()
         w32.shcore = None
+        w32.dwmapi = Mock()
         w32._declare()
         handle = ctypes.c_void_p
         expected = {
@@ -574,6 +620,15 @@ class Win32EventTests(unittest.TestCase):
                 [handle, ctypes.POINTER(widget.MONITORINFO)], ctypes.c_int),
             "kernel32.GetCurrentProcessId": (
                 w32.kernel32.GetCurrentProcessId, [], wintypes.DWORD),
+            "user32.EnumWindows": (
+                w32.user32.EnumWindows,
+                [widget.WNDENUMPROC, ctypes.c_ssize_t], ctypes.c_int),
+            "user32.GetWindowLongPtrW": (
+                w32.user32.GetWindowLongPtrW,
+                [handle, ctypes.c_int], ctypes.c_ssize_t),
+            "dwmapi.DwmGetWindowAttribute": (
+                w32.dwmapi.DwmGetWindowAttribute,
+                [handle, wintypes.DWORD, handle, wintypes.DWORD], ctypes.c_long),
         }
         for name, (func, argtypes, restype) in expected.items():
             with self.subTest(function=name):

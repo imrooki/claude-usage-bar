@@ -31,7 +31,7 @@ def make_app(data_dir):
     w32.taskbar_pos.return_value = TASKBAR
     w32.taskbar_autohide.return_value = False
     w32.notification_state.return_value = 5
-    w32.foreground_covers_taskbar.return_value = False
+    w32.fullscreen_window_present.return_value = False
     w32.scale_for.return_value = 1.0
     w32.tray_notify_rect.return_value = None
     w32.topmost_allowed.return_value = True

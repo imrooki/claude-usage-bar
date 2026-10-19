@@ -127,7 +127,7 @@ class DualDisplayTests(unittest.TestCase):
             widget._sample_snapshot("dual_mixed", SAMPLE_NOW), SAMPLE_NOW, "light", 1.0, height,
             codex=widget._sample_codex_snapshot("dual_mixed", SAMPLE_NOW), codex_available=True)
         self.assertEqual(mixed.rows[0].rows[0].state, "normal")
-        self.assertEqual(mixed.rows[0].rows[0].tier, "amber")
+        self.assertEqual(mixed.rows[0].rows[0].tier, "moderate")
         self.assertEqual(tuple(row.state for row in mixed.rows[1].rows), ("stale", "stale"))
 
         reset = widget.build_display(

@@ -287,7 +287,8 @@ class StaleFillPixelTests(unittest.TestCase):
                 edges, stale_y, _fresh_y = bar_sample_points(display)
                 pixel = image.getpixel((edges["bar"][0] + 10, stale_y))
                 self.assertEqual(pixel, widget.STALE_FILL_RGB + (widget.FILL_ALPHA,))
-                self.assertNotEqual(pixel, widget.TIER_RGB["amber"] + (255,))
+                self.assertNotEqual(
+                    pixel, widget.LEVEL_RGB[widget.usage_level(65.0)] + (widget.FILL_ALPHA,))
 
     def test_fresh_row_fill_keeps_its_tier_color(self):
         for theme in ("light", "dark"):
@@ -296,7 +297,11 @@ class StaleFillPixelTests(unittest.TestCase):
                 image = widget.render_display(display)
                 edges, _stale_y, fresh_y = bar_sample_points(display)
                 pixel = image.getpixel((edges["bar"][0] + 10, fresh_y))
-                self.assertEqual(pixel, widget.TIER_RGB["green"] + (widget.FILL_ALPHA,))
+                # 填充带渐变与高光，无法逐字节相等：比对等级基色并留出亮度余量。
+                level_rgb = widget.LEVEL_RGB[widget.usage_level(33.0)]
+                self.assertEqual(pixel[3], widget.FILL_ALPHA)
+                for channel, base in zip(pixel[:3], level_rgb):
+                    self.assertLessEqual(abs(channel - base), 60, (pixel, level_rgb))
 
     def test_unfilled_part_of_a_stale_bar_stays_the_track(self):
         for theme in ("light", "dark"):
@@ -964,7 +969,7 @@ class RefreshCaptionFlowTests(unittest.TestCase):
         app.reader = FakeReader(data_at(OBS_OLD))
         during_menu = []
 
-        def menu(hwnd, x, y):
+        def menu(hwnd, x, y, skin=None):
             # The modal menu loop still dispatches WM_TIMER: TIMER_POLL reads the
             # new file into the reader, and menu_open blocks the redraw.
             app.reader.queued = (data_at(OBS_NEW), "")

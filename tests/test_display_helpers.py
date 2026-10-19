@@ -1,4 +1,4 @@
-"""Display helpers: colour tiers, percentage rounding and caps, reset text, and per-row state."""
+"""Display helpers: colour levels, percentage rounding and caps, reset text, and per-row state."""
 
 import calendar
 import pathlib
@@ -13,17 +13,25 @@ import usage_widget as widget
 NOW = 1791000000.0
 
 
-class ColorTierTests(unittest.TestCase):
-    def test_tier_boundaries_are_under_fifty_under_eighty_and_above(self):
-        cases = ((0, "green"), (49.9, "green"), (50, "amber"), (79.9, "amber"), (80, "red"), (100, "red"))
-        for pct, tier in cases:
+class UsageLevelTests(unittest.TestCase):
+    def test_level_boundaries_are_under_forty_under_seventy_and_above(self):
+        cases = ((0, "safe"), (39.9, "safe"), (40, "moderate"), (46, "moderate"),
+                 (69.9, "moderate"), (70, "warning"), (89.9, "warning"),
+                 (90, "critical"), (100, "critical"), (250, "critical"))
+        for pct, level in cases:
             with self.subTest(pct=pct):
-                self.assertEqual(widget.color_tier(pct), tier)
+                self.assertEqual(widget.usage_level(pct), level)
 
-    def test_tier_uses_the_unrounded_percentage(self):
-        """49.5 is written as 50% but stays green: the tier is decided on the float."""
-        self.assertEqual(widget.display_percent(49.5), 50)
-        self.assertEqual(widget.color_tier(49.5), "green")
+    def test_level_ignores_invalid_readings(self):
+        """A missing, non-numeric or impossible reading has no level, it is not 0%."""
+        for pct in (None, "40", True, False, float("nan"), float("inf"), float("-inf"), -1, -0.5):
+            with self.subTest(pct=pct):
+                self.assertEqual(widget.usage_level(pct), "none")
+
+    def test_level_uses_the_unrounded_percentage(self):
+        """39.5 is written as 40% but stays safe: the level is decided on the float."""
+        self.assertEqual(widget.display_percent(39.5), 40)
+        self.assertEqual(widget.usage_level(39.5), "safe")
 
 
 class PercentRoundingTests(unittest.TestCase):

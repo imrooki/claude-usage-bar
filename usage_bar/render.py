@@ -19,7 +19,9 @@ from usage_bar.data import (
     CAPTION_NO_FILE,
     CAPTION_READ_ERROR,
     DEFAULT_OFFSET,
+    DEFAULT_SKIN,
     MODE_MANUAL,
+    SKINS,
     Win,
     app_refresh_caption,
     codex_ping_caption,
@@ -71,17 +73,14 @@ SUPERSAMPLE = 4
 
 INITIAL_WINDOW_PX = 8
 
-# 颜色与 alpha（直通 alpha 的 RGBA；提交前才转成预乘 alpha）
+# 颜色与 alpha（直通 alpha 的 RGBA；提交前才转成预乘 alpha）。进度条本身的颜色与
+# 画法在皮肤层（usage_bar.skins）：等级色 LEVEL_RGB、陈旧灰 STALE_FILL_RGB 都在那里。
 BACKGROUND_ALPHA = 1
 TEXT_RGB = {"light": (0x1B, 0x1B, 0x1B), "dark": (0xF2, 0xF2, 0xF2)}
 TRACK_RGBA = {"light": (0, 0, 0, 48), "dark": (255, 255, 255, 56)}
-TIER_RGB = {"green": (0x2E, 0xA0, 0x43), "amber": (0xD2, 0x99, 0x22), "red": (0xDA, 0x36, 0x33)}
 TEXT_ALPHA = 255
 TEXT_ALPHA_STALE = 150
 FILL_ALPHA = 255
-# 陈旧行的进度条填充用固定中性灰，alpha 与正常行相同。透明任务栏上看不出变淡，
-# 颜色被抽干才在任何壁纸上都站得住。
-STALE_FILL_RGB = (0x8A, 0x8A, 0x8A)
 
 NODATA_LINES = ("Claude usage", "no data yet")
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -98,9 +97,11 @@ BlockView = collections.namedtuple("BlockView", ["tag", "rows"])
 # 以及点 Refresh now 之后的反馈文字。它们属于显示元组，元组相等才仍然意味着画面
 # 相同；两条都是空串时存成 ()，所以没有这些文字的显示元组与原来的六字段写法相等。
 # nodata 布局没有进度条行，ages 恒为 ()，captions 至多一项（下标 0），是顶替第二行的那条反馈文字。
+# skin 是进度条皮肤名（见 usage_bar.data 的 SKINS）；旧写法不带它时用默认皮肤，
+# 所以默认皮肤下的显示元组与改动前相等，切皮肤才会改变元组、触发重绘。
 Display = collections.namedtuple(
-    "Display", ["kind", "rows", "theme", "scale", "width", "height", "ages", "captions"],
-    defaults=((), ()))
+    "Display", ["kind", "rows", "theme", "scale", "width", "height", "ages", "captions", "skin"],
+    defaults=((), (), DEFAULT_SKIN))
 
 
 def scaled(value, scale):
@@ -132,15 +133,6 @@ def fill_percent(pct):
     return max(0, min(100, percent_int(pct)))
 
 
-def color_tier(pct):
-    """按浮点百分比分档：<50 绿，50 到 <80 琥珀，>=80 红。"""
-    if pct < 50:
-        return "green"
-    if pct < 80:
-        return "amber"
-    return "red"
-
-
 def reset_text(resets_at, seven_day):
     """5h 行写本地 %H:%M，7d 行写固定英文星期缩写（不用 %a，避免受区域设置影响）。"""
     try:
@@ -160,7 +152,7 @@ def build_row(label, win, now, seven_day):
     if state == "reset":
         return RowView(label, state, 0, "none", "--", "reset")
     return RowView(
-        label, state, fill_percent(win.pct), color_tier(win.pct),
+        label, state, fill_percent(win.pct), _entry().usage_level(win.pct),
         "%d%%" % display_percent(win.pct), reset_text(win.resets_at, seven_day))
 
 
@@ -399,15 +391,55 @@ def _nodata_caption(texts):
     return ""
 
 
-def _nodata_display(theme, scale, height, caption):
+def _nodata_display(theme, scale, height, caption, skin=DEFAULT_SKIN):
     """无数据布局：没有进度条行，ages 恒为 ()，反馈文字至多一项。"""
     return Display(
         "nodata", NODATA_LINES, theme, scale,
         display_width("nodata", scale, height, caption), height,
-        (), _stored_strings((caption,)))
+        (), _stored_strings((caption,)), skin)
 
 
-def build_display(snapshot, now, theme, scale, height, codex=None, codex_available=False, captions=None):
+def _with_fills(rows, fills, offset):
+    """动画中间帧：把 normal 行的 fill 换成给定浮点百分比（其余行不动）。
+
+    fills 是四条进度条的中间值（双栏按 5h、7d、5h、7d 顺序，offset 指出本块从哪条起），
+    缺项或为 None 时该行保持原值。含在显示元组里的仍是取整后的整数百分比，元组相等
+    仍然一定意味着画面相同。
+    """
+    if fills is None:
+        return rows
+    out = []
+    for index, row in enumerate(rows):
+        value = fills[offset + index] if offset + index < len(fills) else None
+        if value is None or row.state != "normal":
+            out.append(row)
+        else:
+            out.append(row._replace(fill=max(0, min(100, int(math.floor(value + 0.5))))))
+    return tuple(out)
+
+
+def apply_fills(display, fills):
+    """动画中间帧：把显示元组里各条进度条的填充长度换成给定浮点百分比。
+
+    fills 的顺序与 app._display_fills 一致（5h、7d、5h、7d）；在 build_display 之后、
+    画出之前调用，返回换过填充长度的新显示元组。无进度条的布局与 fills 为 None 时
+    原样返回；换上的是取整后的整数百分比，元组相等仍然一定意味着画面相同。
+    """
+    if fills is None:
+        return display
+    if display.kind == "dual":
+        rows = tuple(
+            block._replace(rows=_with_fills(block.rows, fills, 2 * index))
+            for index, block in enumerate(display.rows))
+    elif display.kind == "data":
+        rows = _with_fills(display.rows, fills, 0)
+    else:
+        return display
+    return display._replace(rows=rows)
+
+
+def build_display(snapshot, now, theme, scale, height, codex=None, codex_available=False, captions=None,
+                  skin=DEFAULT_SKIN, fills=None):
     """把快照与当前时间整理成不可变的显示元组；元组相等就不用重绘。
 
     填充长度由取整后的百分比决定，这样元组相等一定意味着画面相同。宽度由内容、
@@ -418,27 +450,28 @@ def build_display(snapshot, now, theme, scale, height, codex=None, codex_availab
     有反馈文字时优先显示它，否则才显示年龄文字。nodata 没有进度条行可挂年龄文字，
     只保留反馈文字（单栏取 Claude 的；双栏两侧都没有窗口时 read error 优先，否则取
     第一条非空的），存成只有一项的 captions，渲染时顶替第二行 "no data yet"。
+    skin 是进度条皮肤名。fills 是填充长度动画的中间值（见 _with_fills），None 表示静态。
     """
     five, seven = _window_pair(snapshot)
     if not codex_available:
         if five is None and seven is None:
-            return _nodata_display(theme, scale, height, _caption_at(captions, 0))
+            return _nodata_display(theme, scale, height, _caption_at(captions, 0), skin)
         age = _age_text(five, seven, now)
         caption = _caption_at(captions, 0)
         aside = caption or age
-        rows = _metric_rows(five, seven, now)
+        rows = _with_fills(_metric_rows(five, seven, now), fills, 0)
         width = display_width("data", scale, height, aside)
         return Display(
             "data", rows, theme, scale, width, height,
-            _stored_strings((age,)), _stored_strings((caption,)))
+            _stored_strings((age,)), _stored_strings((caption,)), skin)
     codex_five, codex_seven = _window_pair(codex)
     if five is None and seven is None and codex_five is None and codex_seven is None:
         return _nodata_display(
             theme, scale, height,
-            _nodata_caption((_caption_at(captions, 0), _caption_at(captions, 1))))
+            _nodata_caption((_caption_at(captions, 0), _caption_at(captions, 1))), skin)
     blocks = (
-        BlockView(PROVIDER_TAGS[0], _metric_rows(five, seven, now)),
-        BlockView(PROVIDER_TAGS[1], _metric_rows(codex_five, codex_seven, now)),
+        BlockView(PROVIDER_TAGS[0], _with_fills(_metric_rows(five, seven, now), fills, 0)),
+        BlockView(PROVIDER_TAGS[1], _with_fills(_metric_rows(codex_five, codex_seven, now), fills, 2)),
     )
     ages = (
         _age_text(five, seven, now),
@@ -448,7 +481,7 @@ def build_display(snapshot, now, theme, scale, height, codex=None, codex_availab
     width = display_width("dual", scale, height)
     return Display(
         "dual", blocks, theme, scale, width, height,
-        _stored_strings(ages), _stored_strings(caption_pair))
+        _stored_strings(ages), _stored_strings(caption_pair), skin)
 
 
 def rect_inside(inner, outer):
@@ -643,11 +676,13 @@ def dual_header(display, index):
     return text, alpha
 
 
-def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rgba, row_height, origin=0.0):
+def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rgba, row_height,
+               skin, theme, origin=0.0):
     """画一个块里的两行：标签、进度条、百分比、重置时间。
 
     origin 为 0 时行中心与原来的单栏相同。双栏传入页眉高度，两行排在页眉下面。
-    陈旧行的填充是中性灰、alpha 与正常行相同；文字仍用 TEXT_ALPHA_STALE 变淡。
+    进度条交给当前皮肤的 paint_bar（等级色、陈旧灰、装饰都在皮肤层）。陈旧行的文字
+    仍用 TEXT_ALPHA_STALE 变淡。
     """
     bar_left, bar_right = edges["bar"]
     bar_width = bar_right - bar_left
@@ -658,18 +693,12 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
         stale = row.state == "stale"
         ink = text_rgb + (TEXT_ALPHA_STALE if stale else TEXT_ALPHA,)
         _draw_text(text_draw, font, edges["label"][0], center, row.label, ink, "l")
-        fill_rgba = None
         fill_width = 0
         if row.state in ("normal", "stale"):
             fill_width = int(math.floor(row.fill * bar_width / 100.0 + 0.5))
-            if stale:
-                fill_rgba = STALE_FILL_RGB + (FILL_ALPHA,)
-            else:
-                fill_rgba = TIER_RGB[row.tier] + (FILL_ALPHA,)
         top = int(math.floor(center - bar_height / 2.0 + 0.5))
-        canvas.paste(
-            _entry()._compose_bar(bar_width, bar_height, bar_radius, fill_width, track_rgba, fill_rgba),
-            (bar_left, top))
+        _entry().paint_bar(canvas, skin, bar_left, top, bar_width, bar_height, bar_radius,
+                           fill_width, row.tier, stale, theme, track_rgba)
         _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, ink, "r")
         if row.reset_text:
             _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")
@@ -716,10 +745,11 @@ def render_display(display):
             _draw_text(text_draw, header_font, (bar_left + bar_right) / 2.0, header_height / 2.0,
                        header_text, text_rgb + (tag_alpha,), "c")
             _draw_rows(canvas, text_draw, row_font, block.rows, edges, dual, text_rgb, track_rgba,
-                       dual["row_height"], header_height)
+                       dual["row_height"], display.skin, theme, header_height)
     else:
         edges = pixel_columns(scale)
-        _draw_rows(canvas, text_draw, font, display.rows, edges, metrics, text_rgb, track_rgba, row_height)
+        _draw_rows(canvas, text_draw, font, display.rows, edges, metrics, text_rgb, track_rgba,
+                   row_height, display.skin, theme)
         aside_text, aside_alpha = single_aside(display)
         if aside_text:
             _draw_text(text_draw, font, aside_left(scale), 0.5 * row_height, aside_text,
@@ -943,21 +973,24 @@ def _sample_captions(name, now):
     return None
 
 
-def sample_display(name, theme, scale):
+def sample_display(name, theme, scale, skin=DEFAULT_SKIN):
     """样张用的显示元组。时间固定，样张在任何时区、任何日期下都一样。"""
     now = time.mktime((2026, 10, 2, 15, 0, 0, 0, 0, -1))
     height = scaled(LOGICAL_H, scale)
     snapshot = _sample_snapshot(name, now)
     captions = _sample_captions(name, now)
     if name not in DUAL_SAMPLE_STATES and name not in EXTRA_DUAL_SAMPLE_STATES:
-        return build_display(snapshot, now, theme, scale, height, captions=captions)
+        return build_display(snapshot, now, theme, scale, height, captions=captions, skin=skin)
     return build_display(
         snapshot, now, theme, scale, height,
-        codex=_sample_codex_snapshot(name, now), codex_available=True, captions=captions)
+        codex=_sample_codex_snapshot(name, now), codex_available=True, captions=captions, skin=skin)
 
 
-def sample_filename(index, name, theme, scale):
-    return "%02d_%s_%s_%.2f.png" % (index, name, theme, scale)
+def sample_filename(index, name, theme, scale, skin=None):
+    """默认皮肤保持原来的文件名；其他皮肤在名字里带上皮肤名。"""
+    if skin is None:
+        return "%02d_%s_%s_%.2f.png" % (index, name, theme, scale)
+    return "%02d_%s_%s_%s_%.2f.png" % (index, name, skin, theme, scale)
 
 
 def composite_on(image, background_rgb):
@@ -1031,19 +1064,25 @@ def say(text):
 
 
 def selftest_render(out_dir):
-    """每个样张状态在两种主题与三种 scale 下各出一张 RGBA PNG，再拼 contact_sheet.png。"""
+    """每套皮肤下，每个样张状态在两种主题与三种 scale 下各出一张 RGBA PNG。
+
+    默认皮肤的文件名与 contact_sheet.png 与原来完全一致（测试按名字核对）；其他皮肤
+    在文件名里带上皮肤名，图拼成 contact_sheet_<皮肤>.png。
+    """
     os.makedirs(out_dir, exist_ok=True)
-    rows = []
-    for index, name in enumerate(ALL_SAMPLE_STATES, 1):
-        images = []
-        for theme, scale in SAMPLE_COMBOS:
-            image = _entry().render_display(sample_display(name, theme, scale))
-            path = os.path.join(out_dir, sample_filename(index, name, theme, scale))
-            image.save(path)
-            _entry().say(path)
-            images.append(image)
-        rows.append((name, images))
-    sheet_path = os.path.join(out_dir, "contact_sheet.png")
-    compose_contact_sheet(rows).save(sheet_path)
-    _entry().say(sheet_path)
+    for skin in SKINS:
+        default = skin == DEFAULT_SKIN
+        rows = []
+        for index, name in enumerate(ALL_SAMPLE_STATES, 1):
+            images = []
+            for theme, scale in SAMPLE_COMBOS:
+                image = _entry().render_display(sample_display(name, theme, scale, skin))
+                path = os.path.join(out_dir, sample_filename(index, name, theme, scale, None if default else skin))
+                image.save(path)
+                _entry().say(path)
+                images.append(image)
+            rows.append((name, images))
+        sheet_path = os.path.join(out_dir, "contact_sheet%s.png" % ("" if default else "_" + skin))
+        compose_contact_sheet(rows).save(sheet_path)
+        _entry().say(sheet_path)
     return 0

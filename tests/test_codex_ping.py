@@ -157,7 +157,7 @@ def last_display(app):
 def _menu_swaps_in_newer_codex(app):
     """Menu loop stand-in: a poll during the menu replaces the Codex snapshot."""
 
-    def menu(hwnd, x, y):
+    def menu(hwnd, x, y, skin=None):
         app.codex.snapshot = data_at(OBS_NEW)
         return widget.MENU_REFRESH
 
@@ -1641,6 +1641,7 @@ FROZEN_CTYPES = {
     "user32.RegisterWindowMessageW", "user32.ReleaseCapture", "user32.ReleaseDC",
     "user32.SetCapture", "user32.SetForegroundWindow", "user32.SetProcessDpiAwarenessContext",
     "user32.SetTimer", "user32.SetWinEventHook", "user32.SetWindowPos", "user32.ShowWindow",
+    "user32.SystemParametersInfoW",
     "user32.TrackPopupMenu", "user32.TranslateMessage", "user32.UnhookWinEvent",
     "user32.UnregisterClassW", "user32.UpdateLayeredWindow",
 }
@@ -1726,7 +1727,7 @@ class SourceGuardTests(unittest.TestCase):
         names = {
             "%s.%s" % pair
             for pair in re.findall(r"_signature\(\s*self\.(\w+)\.(\w+)", self.source)}
-        self.assertEqual(len(names), 63)
+        self.assertEqual(len(names), 64)
         self.assertEqual(names, FROZEN_CTYPES)
         structures = []
         for node in ast.walk(self.tree):
@@ -1811,7 +1812,8 @@ class PingSampleTests(unittest.TestCase):
         with patch.object(widget, "say"):
             self.assertEqual(widget.selftest_render(holder.name), 0)
         pngs = [name for name in os.listdir(holder.name) if name.lower().endswith(".png")]
-        self.assertEqual(len(pngs), 6 * len(widget.ALL_SAMPLE_STATES) + 1)
+        # 每套皮肤各出一整套样张与一张联系人表：默认皮肤与另一套皮肤（文件名带皮肤名）。
+        self.assertEqual(len(pngs), 2 * (6 * len(widget.ALL_SAMPLE_STATES) + 1))
         sheet = os.path.join(holder.name, "contact_sheet.png")
         self.assertGreater(os.path.getsize(sheet), 0)
         for index, name in enumerate(widget.ALL_SAMPLE_STATES, 1):

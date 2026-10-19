@@ -9,6 +9,8 @@ import ctypes
 import ctypes.wintypes as wintypes
 import sys
 
+from usage_bar.data import SKIN_LABELS, SKIN_MECHA, SKIN_NEON
+
 
 def _entry():
     """入口模块（usage_widget 或 __main__）：测试对入口模块打的补丁必须在这里仍然可见。"""
@@ -32,9 +34,17 @@ SCALE_MAX = 6.0
 MENU_REFRESH = 1
 MENU_SNAP = 2
 MENU_QUIT = 3
+MENU_SKIN_NEON = 4
+MENU_SKIN_MECHA = 5
+# 皮肤子菜单里的勾选项：(皮肤名, 命令号)。皮肤名取自数据层的 SKINS。
+SKIN_MENU_ITEMS = ((SKIN_NEON, MENU_SKIN_NEON), (SKIN_MECHA, MENU_SKIN_MECHA))
+# 子菜单在 MENU_ITEMS 里的占位命令号：TrackPopupMenu 永远返回不了它。
+MENU_SKIN_SUBMENU = -1
 MENU_ITEMS = (
     (MENU_REFRESH, "Refresh now"),
     (MENU_SNAP, "Snap to tray"),
+    (0, None),
+    (MENU_SKIN_SUBMENU, "Progress Bar Skin"),
     (0, None),
     (MENU_QUIT, "Quit"),
 )
@@ -78,6 +88,9 @@ BI_RGB = 0
 IDC_ARROW = 32512
 MF_STRING = 0
 MF_SEPARATOR = 0x800
+MF_CHECKED = 0x8
+MF_POPUP = 0x10
+SPI_GETCLIENTAREAANIMATION = 0x1042
 TPM_RIGHTBUTTON = 0x2
 TPM_NONOTIFY = 0x80
 TPM_RETURNCMD = 0x100
@@ -276,6 +289,7 @@ class Win32:
         _signature(self.user32.TrackPopupMenu, [ptr, u32, i32, i32, i32, ptr, ptr], i32)
         _signature(self.user32.DestroyMenu, [ptr], i32)
         _signature(self.user32.SetForegroundWindow, [ptr], i32)
+        _signature(self.user32.SystemParametersInfoW, [u32, u32, ctypes.c_void_p, u32], i32)
         _signature(self.user32.RegisterWindowMessageW, [wstr], u32)
         _signature(self.user32.GetForegroundWindow, [], ptr)
         _signature(self.user32.GetDesktopWindow, [], ptr)
@@ -557,12 +571,24 @@ class Win32:
     def release_capture(self):
         self.user32.ReleaseCapture()
 
-    def track_menu(self, hwnd, x, y):
+    def animations_enabled(self):
+        """系统是否允许客户端区域动画（SPI_GETCLIENTAREAANIMATION）；查询失败按允许。
+
+        返回真正的 bool：测试里的假 w32（Mock）拿不到 True，动画就不会开。
+        """
+        value = ctypes.c_int(1)
+        ok = self.user32.SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(value), 0)
+        if not ok:
+            return True
+        return bool(value.value)
+
+    def track_menu(self, hwnd, x, y, skin=None):
         """弹出右键菜单，返回选中的命令号（取消返回 0）。
 
-        TrackPopupMenu 自带模态消息循环，期间计时器消息照常送到窗口过程。弹出前把
-        自己的窗口设为前台，否则点菜单以外的地方菜单不会收起；系统可能拒绝这次
-        设置，不影响菜单本身，所以不检查返回值。
+        第三个菜单项是 "Progress Bar Skin" 子菜单，列出全部皮肤，当前皮肤打勾（skin
+        为 None 时都不打勾）。TrackPopupMenu 自带模态消息循环，期间计时器消息照常送到
+        窗口过程。弹出前把自己的窗口设为前台，否则点菜单以外的地方菜单不会收起；
+        系统可能拒绝这次设置，不影响菜单本身，所以不检查返回值。
         """
         menu = self.user32.CreatePopupMenu()
         if not menu:
@@ -571,6 +597,14 @@ class Win32:
             for item_id, text in MENU_ITEMS:
                 if text is None:
                     self.user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+                elif item_id == MENU_SKIN_SUBMENU:
+                    submenu = self.user32.CreatePopupMenu()
+                    if not submenu:
+                        raise OSError("CreatePopupMenu failed, error %d" % ctypes.get_last_error())
+                    for skin_name, command in SKIN_MENU_ITEMS:
+                        flags = MF_STRING | (MF_CHECKED if skin_name == skin else 0)
+                        self.user32.AppendMenuW(submenu, flags, command, SKIN_LABELS[skin_name])
+                    self.user32.AppendMenuW(menu, MF_POPUP, submenu, text)
                 else:
                     self.user32.AppendMenuW(menu, MF_STRING, item_id, text)
             self.user32.SetForegroundWindow(hwnd)
@@ -578,6 +612,7 @@ class Win32:
                 menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, x, y, 0, hwnd, None)
             self.user32.PostMessageW(hwnd, WM_NULL, 0, 0)
         finally:
+            # 子菜单随父菜单一起销毁，不再单独 DestroyMenu。
             self.user32.DestroyMenu(menu)
         return int(command)
 

@@ -34,6 +34,7 @@ import sys
 import time
 
 from usage_bar.data import *
+from usage_bar.skins import *
 from usage_bar.render import *
 from usage_bar.win32 import *
 from usage_bar.app import *

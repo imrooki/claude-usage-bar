@@ -935,7 +935,7 @@ def last_display(app):
 def menu_swaps_in_newer_claude(app):
     """Menu loop stand-in: a poll during the menu replaces the Claude snapshot."""
 
-    def menu(hwnd, x, y):
+    def menu(hwnd, x, y, skin=None):
         app.reader.snapshot = data_at(OBS_NEW)
         return widget.MENU_REFRESH
 
@@ -2029,7 +2029,7 @@ class SourceGuardAppTests(unittest.TestCase):
         names = {
             "%s.%s" % pair
             for pair in re.findall(r"_signature\(\s*self\.(\w+)\.(\w+)", self.source)}
-        self.assertEqual(len(names), 63)
+        self.assertEqual(len(names), 64)
         self.assertEqual(names, FROZEN_CTYPES)
         structures = []
         for node in ast.walk(self.tree):
@@ -2118,7 +2118,8 @@ class AppSampleTests(unittest.TestCase):
         with patch.object(widget, "say"):
             self.assertEqual(widget.selftest_render(holder.name), 0)
         pngs = [name for name in os.listdir(holder.name) if name.lower().endswith(".png")]
-        self.assertEqual(len(pngs), 6 * len(widget.ALL_SAMPLE_STATES) + 1)
+        # 每套皮肤各出一整套样张与一张联系人表：默认皮肤与另一套皮肤（文件名带皮肤名）。
+        self.assertEqual(len(pngs), 2 * (6 * len(widget.ALL_SAMPLE_STATES) + 1))
         caption_new_index = widget.ALL_SAMPLE_STATES.index("caption_new") + 1
         dual_index = widget.ALL_SAMPLE_STATES.index("dual_caption_new_same") + 1
         for theme, scale in widget.SAMPLE_COMBOS:

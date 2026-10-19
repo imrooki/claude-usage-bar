@@ -25,6 +25,10 @@ from usage_bar.data import (
     MODE_AUTO,
     MODE_MANUAL,
     POS_FILE_NAME,
+    SKIN_FILE_NAME,
+    SKIN_MECHA,
+    SKIN_NEON,
+    SKINS,
     SNAPSHOT_NAME,
     SnapshotReader,
     Win,
@@ -53,6 +57,8 @@ from usage_bar.win32 import (
     MAX_TIMER_MS,
     MENU_QUIT,
     MENU_REFRESH,
+    MENU_SKIN_MECHA,
+    MENU_SKIN_NEON,
     MENU_SNAP,
     MK_LBUTTON,
     OBJID_CLIENT,
@@ -109,10 +115,16 @@ TIMER_FLASH = 8
 TIMER_CAPTION = 9
 TIMER_PING = 10
 TIMER_APP = 11
+TIMER_ANIM = 12
 FLASH_MS = 300
 FLASH_ALPHA_SCALE = 0.35
 # Refresh now 之后反馈文字显示的毫秒数。
 CAPTION_MS = 2500
+# 填充长度动画：数据变化时进度条从旧长度滑到新长度，每次 ANIM_TICK_MS 画一帧。
+ANIM_SECONDS = 0.25
+ANIM_TICK_MS = 40
+# 皮肤子菜单命令号 -> 皮肤名。
+SKIN_COMMANDS = {MENU_SKIN_NEON: SKIN_NEON, MENU_SKIN_MECHA: SKIN_MECHA}
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +180,15 @@ APP_SLOT = RefreshSlot(
     drop_state="no_session", drop_note="poll timer unavailable; request abandoned",
     skip_notes={})
 REFRESH_SLOTS = (CODEX_SLOT, APP_SLOT)  # 窗口重建后按这个顺序补计时器
+
+
+def _display_fills(display):
+    """显示元组里各条进度条的填充目标值（5h、7d、5h、7d 顺序）；无进度条时为 None。"""
+    if display.kind == "dual":
+        return tuple(row.fill for block in display.rows for row in block.rows)
+    if display.kind == "data":
+        return tuple(row.fill for row in display.rows)
+    return None
 
 
 class WidgetApp:
@@ -237,6 +258,12 @@ class WidgetApp:
         self._app_before = None
         # 最近一次渲染的未变暗画面：(显示元组, RGBA 图)，None 表示还没渲染过；见 _frame_image。
         self._frame = None
+        self.skin_path = os.path.join(self.data_dir, SKIN_FILE_NAME)
+        self.skin = _entry().load_skin(self.skin_path)
+        # 填充长度动画：_anim 是 (起点时刻, 起点 fills, 目标 fills) 或 None；
+        # _fills_shown 是最近一次静态画面的填充长度，还没画过时是 None。
+        self._anim = None
+        self._fills_shown = None
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -363,6 +390,9 @@ class WidgetApp:
             # 计时器到点就直接擦。系统计时器可能比墙钟略早触发，不能再拿截止时间去比。
             self._caption = None
             self.refresh_view()
+        elif timer_id == TIMER_ANIM:
+            self.kill_timer(TIMER_ANIM)
+            self.refresh_view()
         elif timer_id == TIMER_PING:
             self._on_ping_timer()
         elif timer_id == TIMER_APP:
@@ -471,6 +501,7 @@ class WidgetApp:
         self._z_order_pending = False
         self._flashing = False
         self._caption = None
+        self._anim = None
         self._start_timers(recreated=True)
         self.refresh_view(force=True, reassert_topmost=True)
 
@@ -605,7 +636,12 @@ class WidgetApp:
                 captions = tuple(base)
         display = build_display(
             self._current_snapshot(), now, theme, scale, height,
-            codex=codex_snapshot, codex_available=codex_available, captions=captions)
+            codex=codex_snapshot, codex_available=codex_available, captions=captions,
+            skin=self.skin)
+        # 动画状态机先看真实填充长度（缓动只作用在要画的这一帧上）：换帧从上一帧的长度
+        # 起步、滑动到真实目标，不会把中间值当成目标反复爬行，也不会先跳一帧真实值。
+        self._track_animation(display, now)
+        display = _entry().apply_fills(display, self._anim_fills(now))
         tray = self.w32.tray_notify_rect() if self.mode == MODE_AUTO else None
         geom = compute_layout(rect, edge, scale, display.width, self.mode, self.offset, tray)
         self.scale = scale
@@ -1044,6 +1080,75 @@ class WidgetApp:
             if not self.set_timer(TIMER_FLASH, FLASH_MS):
                 self._end_flash()
 
+    # 皮肤与填充动画 --------------------------------------------------------------
+
+    def _anim_fills(self, now):
+        """动画中间帧的各条填充长度；没有动画时返回 None。
+
+        缓动曲线是平滑起步停步的 k^2(3-2k)，k 为已过时间占 ANIM_SECONDS 的比例；
+        k 到 1 后直接返回目标值，那一帧的显示元组与静态画面相等，命中渲染缓存。
+        """
+        anim = self._anim
+        if anim is None:
+            return None
+        start, origin, target = anim
+        span = ANIM_SECONDS
+        k = 1.0 if span <= 0 else (now - start) / span
+        if k >= 1.0:
+            return target
+        k = max(0.0, k)
+        eased = k * k * (3.0 - 2.0 * k)
+        return tuple(o + (t - o) * eased for o, t in zip(origin, target))
+
+    def _track_animation(self, display, now):
+        """按未换缓动值的真实显示元组推进填充动画：数据变化时从旧长度滑到新长度。
+
+        只在系统允许动画、不在变暗闪烁、非自测时开新动画；显示元组里没有进度条
+        （无数据）时直接收掉。动画进行中数据又变了，就从当前中间值接着滑；调用方随后
+        用 _anim_fills 把缓动帧换进同一显示元组再画。
+        """
+        targets = _display_fills(display)
+        if targets is None:
+            self._anim = None
+            self._fills_shown = None
+            return
+        anim = self._anim
+        if anim is not None:
+            if anim[2] == targets:
+                if now - anim[0] < ANIM_SECONDS:
+                    self.set_timer(TIMER_ANIM, ANIM_TICK_MS)
+                else:
+                    self._anim = None
+                    self._fills_shown = targets
+                    self.kill_timer(TIMER_ANIM)
+                return
+            origin = self._anim_fills(now) or anim[2]
+        else:
+            origin = self._fills_shown
+        if (origin is None or origin == targets or self.snapshot_override is not None
+                or self._flashing or not self.hwnd
+                or self.w32.animations_enabled() is not True):
+            self._anim = None
+            self._fills_shown = targets
+            return
+        self._anim = (now, origin, targets)
+        self._fills_shown = targets
+        self.set_timer(TIMER_ANIM, ANIM_TICK_MS)
+
+    def _set_skin(self, skin):
+        """右键菜单里切皮肤：与当前不同才保存并重绘。"""
+        if skin not in SKINS or skin == self.skin:
+            return
+        self.skin = skin
+        self._save_skin()
+        self.refresh_view(force=True)
+
+    def _save_skin(self):
+        try:
+            _entry().save_skin(self.data_dir, self.skin)
+        except OSError as exc:
+            self._log_exception(exc)
+
     def _save_position(self):
         try:
             _entry().save_position(self.data_dir, self.mode, self.offset)
@@ -1059,7 +1164,7 @@ class WidgetApp:
         before = self._latest_observed()
         self.menu_open = True
         try:
-            command = self.w32.track_menu(self.hwnd, x, y)
+            command = self.w32.track_menu(self.hwnd, x, y, self.skin)
         finally:
             self.menu_open = False
         if self.exiting:
@@ -1073,6 +1178,8 @@ class WidgetApp:
             self.mode = MODE_AUTO
             self._save_position()
             self.refresh_view()
+        elif command in SKIN_COMMANDS:
+            self._set_skin(SKIN_COMMANDS[command])
         elif command == MENU_QUIT:
             self.request_exit()
 

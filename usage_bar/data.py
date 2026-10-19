@@ -39,6 +39,14 @@ POS_SCHEMA = 2
 MODE_AUTO = "auto"
 MODE_MANUAL = "manual"
 
+SKIN_FILE_NAME = "widget_skin.json"
+SKIN_SCHEMA = 1
+SKIN_NEON = "neon"
+SKIN_MECHA = "mecha"
+SKINS = (SKIN_NEON, SKIN_MECHA)
+DEFAULT_SKIN = SKIN_NEON
+SKIN_LABELS = {SKIN_NEON: "Neon Minimal", SKIN_MECHA: "Mecha Tech"}
+
 MAX_SNAPSHOT_BYTES = 1024 * 1024
 
 LOG_MAX_BYTES = 64 * 1024
@@ -1089,6 +1097,49 @@ def save_position(data_dir, mode, offset):
     path = os.path.join(data_dir, POS_FILE_NAME)
     temp = path + ".tmp"
     payload = json.dumps({"schema": POS_SCHEMA, "mode": mode, "offset_from_right": int(offset)}) + "\n"
+    try:
+        with open(temp, "wb") as handle:
+            handle.write(payload.encode("utf-8"))
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def load_skin(path):
+    """读皮肤文件，返回皮肤名；读不到、坏了、schema 不认识、皮肤名不认识都退回默认皮肤。
+
+    这里从不抛错：皮肤只是外观偏好，任何异常都不该挡住小窗启动。
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(4096)
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, ValueError, RecursionError):
+        return DEFAULT_SKIN
+    if not isinstance(doc, dict):
+        return DEFAULT_SKIN
+    if not _schema_is(doc, SKIN_SCHEMA):
+        return DEFAULT_SKIN
+    skin = doc.get("skin")
+    if skin in SKINS:
+        return skin
+    return DEFAULT_SKIN
+
+
+def save_skin(data_dir, skin):
+    """临时文件 + os.replace 原子写皮肤文件；data-dir 不存在或皮肤名不认识时不写，返回是否写入。"""
+    if not data_dir or not os.path.isdir(data_dir):
+        return False
+    if skin not in SKINS:
+        return False
+    path = os.path.join(data_dir, SKIN_FILE_NAME)
+    temp = path + ".tmp"
+    payload = json.dumps({"schema": SKIN_SCHEMA, "skin": skin}) + "\n"
     try:
         with open(temp, "wb") as handle:
             handle.write(payload.encode("utf-8"))

@@ -74,7 +74,7 @@ SUPERSAMPLE = 4
 INITIAL_WINDOW_PX = 8
 
 # 颜色与 alpha（直通 alpha 的 RGBA；提交前才转成预乘 alpha）。进度条本身的颜色与
-# 画法在皮肤层（usage_bar.skins）：等级色 LEVEL_RGB、陈旧灰 STALE_FILL_RGB 都在那里。
+# 画法在皮肤层（usage_bar.skins）：填充渐变 fill_rgb、陈旧灰 STALE_FILL_RGB 都在那里。
 BACKGROUND_ALPHA = 1
 TEXT_RGB = {"light": (0x1B, 0x1B, 0x1B), "dark": (0xF2, 0xF2, 0xF2)}
 TRACK_RGBA = {"light": (0, 0, 0, 48), "dark": (255, 255, 255, 56)}
@@ -681,7 +681,7 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
     """画一个块里的两行：标签、进度条、百分比、重置时间。
 
     origin 为 0 时行中心与原来的单栏相同。双栏传入页眉高度，两行排在页眉下面。
-    进度条交给当前皮肤的 paint_bar（等级色、陈旧灰、装饰都在皮肤层）。陈旧行的文字
+    进度条交给当前皮肤的 paint_bar（充能渐变、陈旧灰、装饰都在皮肤层）。陈旧行的文字
     仍用 TEXT_ALPHA_STALE 变淡。
     """
     bar_left, bar_right = edges["bar"]
@@ -698,7 +698,7 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
             fill_width = int(math.floor(row.fill * bar_width / 100.0 + 0.5))
         top = int(math.floor(center - bar_height / 2.0 + 0.5))
         _entry().paint_bar(canvas, skin, bar_left, top, bar_width, bar_height, bar_radius,
-                           fill_width, row.tier, stale, theme, track_rgba)
+                           fill_width, row.tier, stale, theme, track_rgba, row.fill)
         _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, ink, "r")
         if row.reset_text:
             _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")

@@ -290,18 +290,30 @@ class StaleFillPixelTests(unittest.TestCase):
                 self.assertNotEqual(
                     pixel, widget.LEVEL_RGB[widget.usage_level(65.0)] + (widget.FILL_ALPHA,))
 
-    def test_fresh_row_fill_keeps_its_tier_color(self):
+    def test_fresh_row_fill_keeps_its_gradient_color(self):
         for theme in ("light", "dark"):
             with self.subTest(theme=theme):
                 display = mixed_stale_display(theme)
                 image = widget.render_display(display)
                 edges, _stale_y, fresh_y = bar_sample_points(display)
                 pixel = image.getpixel((edges["bar"][0] + 10, fresh_y))
-                # 填充带渐变与高光，无法逐字节相等：比对等级基色并留出亮度余量。
-                level_rgb = widget.LEVEL_RGB[widget.usage_level(33.0)]
+                # 填充带充能渐变与高光，无法逐字节相等：比对渐变基色并留出亮度余量。
+                base = widget.fill_rgb(33.0)
                 self.assertEqual(pixel[3], widget.FILL_ALPHA)
-                for channel, base in zip(pixel[:3], level_rgb):
-                    self.assertLessEqual(abs(channel - base), 60, (pixel, level_rgb))
+                for channel, expected in zip(pixel[:3], base):
+                    self.assertLessEqual(abs(channel - expected), 60, (pixel, base))
+
+    def test_fresh_fill_is_dimmer_at_the_start_and_brighter_at_the_tip(self):
+        for theme in ("light", "dark"):
+            with self.subTest(theme=theme):
+                display = mixed_stale_display(theme)
+                image = widget.render_display(display)
+                edges, _stale_y, fresh_y = bar_sample_points(display)
+                left, right = edges["bar"]
+                fill_px = int(33.0 * (right - left) / 100.0 + 0.5)
+                start = image.getpixel((left + 4, fresh_y))
+                tip = image.getpixel((left + fill_px - 3, fresh_y))
+                self.assertGreater(sum(tip[:3]), sum(start[:3]), (start, tip))
 
     def test_unfilled_part_of_a_stale_bar_stays_the_track(self):
         for theme in ("light", "dark"):

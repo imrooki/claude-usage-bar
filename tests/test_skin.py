@@ -74,6 +74,34 @@ class LevelPaletteTests(unittest.TestCase):
             widget.SKIN_LABELS, {"neon": "Neon Minimal", "mecha": "Mecha Tech"})
 
 
+class FillGradientTests(unittest.TestCase):
+    def test_anchor_values_are_the_documented_stops(self):
+        self.assertEqual(widget.fill_rgb(0.0), (0xBE, 0xD6, 0xC6))
+        self.assertEqual(widget.fill_rgb(50.0), widget.LEVEL_RGB[widget.LEVEL_MODERATE])
+        self.assertEqual(widget.fill_rgb(80.0), widget.LEVEL_RGB[widget.LEVEL_CRITICAL])
+        self.assertEqual(widget.fill_rgb(100.0), (0xC8, 0x4C, 0x52))
+
+    def test_values_clamp_to_the_ends_and_blend_between_stops(self):
+        self.assertEqual(widget.fill_rgb(-5.0), widget.fill_rgb(0.0))
+        self.assertEqual(widget.fill_rgb(250.0), widget.fill_rgb(100.0))
+        blended = widget.fill_rgb(65.0)
+        self.assertNotEqual(blended, widget.fill_rgb(50.0))
+        for channel, blue, red in zip(blended, widget.fill_rgb(50.0), widget.fill_rgb(80.0)):
+            self.assertLessEqual(min(blue, red), channel, (channel, blue, red))
+            self.assertLessEqual(channel, max(blue, red), (channel, blue, red))
+
+    def test_eighty_is_red_and_one_hundred_is_the_reddest(self):
+        eighty = widget.fill_rgb(80.0)
+        hundred = widget.fill_rgb(100.0)
+        self.assertGreater(eighty[0], eighty[1] + 60, eighty)
+        self.assertGreater(hundred[0], hundred[1] + 80, hundred)
+
+    def test_invalid_readings_have_no_colour(self):
+        for value in (None, True, "33", float("nan"), float("inf"), 10 ** 400):
+            with self.subTest(value=value):
+                self.assertIsNone(widget.fill_rgb(value))
+
+
 class SkinFileTests(unittest.TestCase):
     def setUp(self):
         holder = tempfile.TemporaryDirectory()

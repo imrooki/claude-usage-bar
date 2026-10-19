@@ -14,10 +14,11 @@ NOW = 1791000000.0
 
 
 class UsageLevelTests(unittest.TestCase):
-    def test_level_boundaries_are_under_forty_under_seventy_and_above(self):
+    def test_level_boundaries_are_under_forty_under_seventy_and_under_eighty(self):
         cases = ((0, "safe"), (39.9, "safe"), (40, "moderate"), (46, "moderate"),
-                 (69.9, "moderate"), (70, "warning"), (89.9, "warning"),
-                 (90, "critical"), (100, "critical"), (250, "critical"))
+                 (69.9, "moderate"), (70, "warning"), (79.9, "warning"),
+                 (80, "critical"), (89.9, "critical"), (100, "critical"),
+                 (250, "critical"))
         for pct, level in cases:
             with self.subTest(pct=pct):
                 self.assertEqual(widget.usage_level(pct), level)

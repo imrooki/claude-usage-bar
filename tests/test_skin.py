@@ -76,25 +76,33 @@ class LevelPaletteTests(unittest.TestCase):
 
 class FillGradientTests(unittest.TestCase):
     def test_anchor_values_are_the_documented_stops(self):
-        self.assertEqual(widget.fill_rgb(0.0), (0xBE, 0xD6, 0xC6))
-        self.assertEqual(widget.fill_rgb(50.0), widget.LEVEL_RGB[widget.LEVEL_MODERATE])
-        self.assertEqual(widget.fill_rgb(80.0), widget.LEVEL_RGB[widget.LEVEL_CRITICAL])
-        self.assertEqual(widget.fill_rgb(100.0), (0xC8, 0x4C, 0x52))
+        self.assertEqual(widget.fill_rgb(0.0), (0xF2, 0x52, 0x5E))
+        self.assertEqual(widget.fill_rgb(25.0), (0xAE, 0x57, 0xD2))
+        self.assertEqual(widget.fill_rgb(50.0), (0x4D, 0x84, 0xF5))
+        self.assertEqual(widget.fill_rgb(75.0), (0x28, 0xC5, 0xC8))
+        self.assertEqual(widget.fill_rgb(100.0), (0x23, 0xD8, 0xA5))
 
     def test_values_clamp_to_the_ends_and_blend_between_stops(self):
         self.assertEqual(widget.fill_rgb(-5.0), widget.fill_rgb(0.0))
         self.assertEqual(widget.fill_rgb(250.0), widget.fill_rgb(100.0))
-        blended = widget.fill_rgb(65.0)
+        blended = widget.fill_rgb(62.0)
         self.assertNotEqual(blended, widget.fill_rgb(50.0))
-        for channel, blue, red in zip(blended, widget.fill_rgb(50.0), widget.fill_rgb(80.0)):
-            self.assertLessEqual(min(blue, red), channel, (channel, blue, red))
-            self.assertLessEqual(channel, max(blue, red), (channel, blue, red))
+        self.assertNotEqual(blended, widget.fill_rgb(75.0))
 
-    def test_eighty_is_red_and_one_hundred_is_the_reddest(self):
-        eighty = widget.fill_rgb(80.0)
-        hundred = widget.fill_rgb(100.0)
-        self.assertGreater(eighty[0], eighty[1] + 60, eighty)
-        self.assertGreater(hundred[0], hundred[1] + 80, hundred)
+    def test_remaining_reads_green_and_exhausted_reads_red(self):
+        plenty = widget.fill_rgb(95.0)
+        empty = widget.fill_rgb(5.0)
+        self.assertGreater(plenty[1], plenty[0], plenty)
+        self.assertGreater(empty[0], empty[1], empty)
+        self.assertGreater(widget.fill_rgb(0.0)[0], widget.fill_rgb(0.0)[1] + 100)
+
+    def test_ramp_never_passes_through_yellow_or_orange(self):
+        for step in range(0, 101):
+            rgb = widget.fill_rgb(float(step))
+            orangeish = (rgb[0] > rgb[1] > rgb[2]
+                         and rgb[0] - rgb[2] > 120 and rgb[1] - rgb[2] > 40)
+            yellowish = rgb[0] > 150 and rgb[1] > 150 and rgb[2] < 120
+            self.assertFalse(orangeish or yellowish, (step, rgb))
 
     def test_invalid_readings_have_no_colour(self):
         for value in (None, True, "33", float("nan"), float("inf"), 10 ** 400):

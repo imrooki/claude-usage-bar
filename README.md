@@ -15,7 +15,7 @@ With Codex installed, each block carries its name above the bars:
  7d [#########-]  88%  Sun       7d [#####-----]  50%  Fri
 ```
 
-Percentages are the share already used, as Claude's usage page shows them (Codex's own status shows the share left, so 5 % used there reads as 95 % left). The bar fill is one continuous gradient: pale green at 0 %, blue around 50 %, red from 80 %, and the deepest red at 100 %. The leading edge is the brightest, like a charge filling the bar.
+Percentages are the share left, so a full bar means plenty of headroom. The bar colour follows that same number: green at 100 % left, through teal at 75 %, blue at 50 % and purple at 25 %, to red as it runs out. The leading edge is the brightest, like a charge that is draining.
 
 ## How it works
 

@@ -11,8 +11,9 @@
   - Neon Minimal：圆角胶囊空槽、充能态连续渐变填充（起点偏暗、笔尖最亮）、
     推进笔尖高光与局部辉光、外圈淡辉光；
   - Mecha Tech：切角机匣、内凹槽、充能态金属渐变填充（起点偏暗、笔尖高光）。
-填充基色只由已用百分比决定（fill_rgb 的整条连续渐变，0% 浅绿 -> 50% 蓝 ->
-80% 红 -> 100% 最浓的红），等级只用于分档判断与文字，不再决定填充色。
+填充基色只由剩余额度决定（fill_rgb：100% 剩余 = 绿 #23D8A5、75% 青绿 #28C5C8、
+50% 蓝 #4D84F5、25% 紫 #AE57D2、0% 红 #F2525E，相邻锚点在 OKLCH 里插值），
+等级只用于分档判断与文字，不再决定填充色。
 陈旧读数两套皮肤都画中性灰平填充（与旧行为一致），无数据只画空槽。
 """
 
@@ -57,19 +58,6 @@ FILL_ALPHA = 255
 # 陈旧行的进度条填充用固定中性灰，alpha 与正常行相同。
 STALE_FILL_RGB = (0x8A, 0x8A, 0x8A)
 
-# 填充基色的整条渐变锚点：0% 浅绿 -> 50% 蓝 -> 80% 红 -> 100% 最浓的红。
-# 中段两处锚点与 LEVEL_RGB 的 moderate / critical 同色，段内线性过渡、越界夹到两端。
-FILL_STOPS = (
-    (0.0, (0xBE, 0xD6, 0xC6)),
-    (50.0, (0x74, 0xA1, 0xE8)),
-    (80.0, (0xE9, 0x83, 0x86)),
-    (100.0, (0xC8, 0x4C, 0x52)),
-)
-
-# 充能态：填充从起点压暗到笔尖全亮，笔尖再叠高光（两套皮肤共用口径）。
-FILL_HEAD_DIM = 0.28
-FILL_TIP_CAP = 0.45
-
 
 def usage_level(pct):
     """已用百分比 -> 等级名；无效读数返回 none。
@@ -95,12 +83,86 @@ def usage_level(pct):
     return LEVEL_SAFE
 
 
-def fill_rgb(pct):
-    """已用百分比 -> 填充基色；无效读数返回 None（与 usage_level 同口径）。
+# 填充基色的五个锚点：按剩余额度排（0% 红、25% 紫、50% 蓝、75% 青绿、100% 绿）。
+# 相邻锚点之间在 OKLCH 中插值（亮度、彩度线性，色相走短弧），所以过渡里没有黄色或橙色。
+FILL_ANCHORS = (
+    (0.0, (0xF2, 0x52, 0x5E)),
+    (25.0, (0xAE, 0x57, 0xD2)),
+    (50.0, (0x4D, 0x84, 0xF5)),
+    (75.0, (0x28, 0xC5, 0xC8)),
+    (100.0, (0x23, 0xD8, 0xA5)),
+)
 
-    整条按 FILL_STOPS 连续渐变：0% 浅绿、50% 蓝、80% 红、100% 最浓的红；
-    段内线性过渡，越界值夹到两端。填充的充能感（起点压暗、笔尖高光与辉光）
-    由两套皮肤在基色之上叠加。
+# 充能态：填充从起点压暗到笔尖全亮，笔尖再叠高光（两套皮肤共用口径）。
+FILL_HEAD_DIM = 0.28
+FILL_TIP_CAP = 0.45
+
+
+def _srgb_to_linear(channel):
+    value = channel / 255.0
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _linear_to_srgb(value):
+    if value <= 0.0031308:
+        return 12.92 * value
+    return 1.055 * value ** (1.0 / 2.4) - 0.055
+
+
+def _srgb_to_oklch(rgb):
+    """sRGB 0..255 -> (L, C, 色相角度)。"""
+    red, green, blue = (_srgb_to_linear(channel) for channel in rgb)
+    light = 0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue
+    medium = 0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue
+    short = 0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue
+    light, medium, short = (
+        math.copysign(abs(value) ** (1.0 / 3.0), value)
+        for value in (light, medium, short))
+    luma = 0.2104542553 * light + 0.7936177850 * medium - 0.0040720468 * short
+    axis_a = 1.9779984951 * light - 2.4285922050 * medium + 0.4505937099 * short
+    axis_b = 0.0259040371 * light + 0.7827717662 * medium - 0.8086757660 * short
+    chroma = math.hypot(axis_a, axis_b)
+    hue = math.degrees(math.atan2(axis_b, axis_a)) % 360.0
+    return luma, chroma, hue
+
+
+def _oklch_to_srgb(luma, chroma, hue):
+    """(L, C, 色相角度) -> sRGB 0..255，越界通道夹到 0..255。"""
+    axis_a = chroma * math.cos(math.radians(hue))
+    axis_b = chroma * math.sin(math.radians(hue))
+    light = luma + 0.3963377774 * axis_a + 0.2158037573 * axis_b
+    medium = luma - 0.1055613458 * axis_a - 0.0638541728 * axis_b
+    short = luma - 0.0894841775 * axis_a - 1.2914855480 * axis_b
+    light, medium, short = (value ** 3 for value in (light, medium, short))
+    red = 4.0767416621 * light - 3.3077115913 * medium + 0.2309699292 * short
+    green = -1.2684380046 * light + 2.6097574011 * medium - 0.3413193965 * short
+    blue = -0.0041960863 * light - 0.7034186147 * medium + 1.7076147010 * short
+    return tuple(
+        max(0, min(255, int(round(255.0 * _linear_to_srgb(
+            max(0.0, min(1.0, value)))))))
+        for value in (red, green, blue))
+
+
+def _lerp_hue(start, end, weight):
+    """色相按短弧插值（结果取模 360）。"""
+    step = (end - start) % 360.0
+    if step > 180.0:
+        step -= 360.0
+    return (start + step * weight) % 360.0
+
+
+_FILL_ANCHOR_OKLCH = tuple(
+    (percent,) + _srgb_to_oklch(rgb) for percent, rgb in FILL_ANCHORS)
+
+
+def fill_rgb(pct):
+    """剩余额度百分比 -> 填充基色；无效读数返回 None（与 usage_level 同口径）。
+
+    整条按 FILL_ANCHORS 连续过渡：100% 剩余绿、75% 青绿、50% 蓝、25% 紫、
+    0% 红；相邻锚点在 OKLCH 里插值，越界值夹到两端。填充的充能感（起点压暗、
+    笔尖高光与辉光）由两套皮肤在基色之上叠加。
     """
     if isinstance(pct, bool) or not isinstance(pct, (int, float)):
         return None
@@ -111,14 +173,14 @@ def fill_rgb(pct):
     if not math.isfinite(value):
         return None
     value = min(100.0, max(0.0, value))
-    if value <= FILL_STOPS[0][0]:
-        return FILL_STOPS[0][1]
-    for (left, rgb_left), (right, rgb_right) in zip(FILL_STOPS, FILL_STOPS[1:]):
-        if value <= right:
-            weight = (value - left) / (right - left)
-            return tuple(int(round(a + (b - a) * weight))
-                         for a, b in zip(rgb_left, rgb_right))
-    return FILL_STOPS[-1][1]
+    anchors = _FILL_ANCHOR_OKLCH
+    for (low, l0, c0, h0), (high, l1, c1, h1) in zip(anchors, anchors[1:]):
+        if value <= high:
+            weight = (value - low) / (high - low)
+            return _oklch_to_srgb(l0 + (l1 - l0) * weight,
+                                  c0 + (c1 - c0) * weight,
+                                  _lerp_hue(h0, h1, weight))
+    return _oklch_to_srgb(*anchors[-1][1:])
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +209,7 @@ def paint_bar(canvas, skin, bar_left, top, bar_width, bar_height, bar_radius,
 
     bar_left/top 是进度条左上角在画布里的位置；fill_width 是填充的像素宽（0 表示
     未知或重置，只画空槽）；level 是 usage_level 的结果；stale 为真时画中性灰。
-    fill_pct 是已用百分比（动画中可带小数），决定填充基色；缺省时按 fill_width
+    fill_pct 是剩余额度百分比（动画中可带小数），决定填充基色；缺省时按 fill_width
     反推。填充本身呈充能态（起点偏暗、推进笔尖最亮），笔尖的局部辉光画在进度条
     矩形之外，所以由这里直接合成到画布，而不是拼进条内。
     """
@@ -155,7 +217,7 @@ def paint_bar(canvas, skin, bar_left, top, bar_width, bar_height, bar_radius,
         return
     if fill_pct is None:
         fill_pct = fill_width * 100.0 / bar_width
-    base_rgb = None if stale else fill_rgb(100.0 - fill_pct)
+    base_rgb = None if stale else fill_rgb(fill_pct)
     if skin == SKIN_MECHA:
         image = _mecha_bar(bar_width, bar_height, bar_radius, fill_width, level,
                            stale, theme, track_rgba, base_rgb)

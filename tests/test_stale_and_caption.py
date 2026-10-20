@@ -297,11 +297,13 @@ class StaleFillPixelTests(unittest.TestCase):
                 image = widget.render_display(display)
                 edges, _stale_y, fresh_y = bar_sample_points(display)
                 pixel = image.getpixel((edges["bar"][0] + 10, fresh_y))
-                # 填充带充能渐变与高光，无法逐字节相等：比对渐变基色并留出亮度余量。
-                base = widget.fill_rgb(33.0)
+                # 填充带充能渐变与高光，无法逐字节相等：比对剩余额度对应的基色并留出亮度余量。
+                base = widget.fill_rgb(float(display.rows[1].fill))
                 self.assertEqual(pixel[3], widget.FILL_ALPHA)
+                self.assertGreater(pixel[2], pixel[1], (pixel, base))
+                self.assertGreater(pixel[1], pixel[0], (pixel, base))
                 for channel, expected in zip(pixel[:3], base):
-                    self.assertLessEqual(abs(channel - expected), 60, (pixel, base))
+                    self.assertLessEqual(abs(channel - expected), 80, (pixel, base))
 
     def test_fresh_fill_is_dimmer_at_the_start_and_brighter_at_the_tip(self):
         for theme in ("light", "dark"):
@@ -344,6 +346,46 @@ class StaleFillPixelTests(unittest.TestCase):
         self.assertGreater(stale_alpha, 0)
         self.assertLessEqual(stale_alpha, widget.TEXT_ALPHA_STALE)
         self.assertGreater(fresh_alpha, stale_alpha)
+
+
+class RemainingZeroTests(unittest.TestCase):
+    def test_exhausted_row_keeps_an_empty_bar_and_red_percentage(self):
+        display = widget.build_display(
+            snapshot(win(100.0, 0.0), win(0.0, 0.0)), NOW, "light", 1.0, height_for(1.0))
+        image = widget.render_display(display)
+        edges, exhausted_y, _full_y = bar_sample_points(display)
+        self.assertEqual(
+            image.getpixel((edges["bar"][0] + 10, exhausted_y)),
+            widget.TRACK_RGBA["light"])
+        split = int(display.height / 2.0)
+        red = widget.fill_rgb(0.0)
+        exhausted = max_text_alpha(
+            image, (edges["pct"][0], 0, edges["pct"][1], split), red)
+        # 细笔画不一定有满覆盖像素，但必须是亮红而不是淡化后的文字。
+        self.assertGreater(exhausted, 200)
+        self.assertLessEqual(exhausted, widget.TEXT_ALPHA)
+        full = max_text_alpha(
+            image, (edges["pct"][0], split, edges["pct"][1], display.height), red)
+        self.assertEqual(full, 0)
+
+    def test_stale_row_at_zero_keeps_the_dim_neutral_percentage(self):
+        display = widget.build_display(
+            snapshot(win(100.0, 31 * 60.0), win(0.0, 60.0)), NOW, "light", 1.0, height_for(1.0))
+        image = widget.render_display(display)
+        edges, exhausted_y, _fresh_y = bar_sample_points(display)
+        self.assertEqual(
+            image.getpixel((edges["bar"][0] + 10, exhausted_y)),
+            widget.TRACK_RGBA["light"])
+        split = int(display.height / 2.0)
+        self.assertEqual(
+            max_text_alpha(
+                image, (edges["pct"][0], 0, edges["pct"][1], split), widget.fill_rgb(0.0)),
+            0)
+        neutral = max_text_alpha(
+            image, (edges["pct"][0], 0, edges["pct"][1], split),
+            widget.TEXT_RGB["light"])
+        self.assertGreater(neutral, 0)
+        self.assertLessEqual(neutral, widget.TEXT_ALPHA_STALE)
 
 
 class DualHeaderTests(unittest.TestCase):

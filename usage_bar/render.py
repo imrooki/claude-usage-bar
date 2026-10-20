@@ -682,7 +682,7 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
 
     origin 为 0 时行中心与原来的单栏相同。双栏传入页眉高度，两行排在页眉下面。
     进度条交给当前皮肤的 paint_bar（充能渐变、陈旧灰、装饰都在皮肤层）。陈旧行的文字
-    仍用 TEXT_ALPHA_STALE 变淡。
+    仍用 TEXT_ALPHA_STALE 变淡；正常行剩余额度为 0 时条保持空槽，百分比改用红色画。
     """
     bar_left, bar_right = edges["bar"]
     bar_width = bar_right - bar_left
@@ -692,6 +692,11 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
         center = origin + (index + 0.5) * row_height
         stale = row.state == "stale"
         ink = text_rgb + (TEXT_ALPHA_STALE if stale else TEXT_ALPHA,)
+        pct_ink = ink
+        if not stale and row.state == "normal" and row.fill <= 0:
+            red = _entry().fill_rgb(0.0)
+            if red is not None:
+                pct_ink = red + (TEXT_ALPHA,)
         _draw_text(text_draw, font, edges["label"][0], center, row.label, ink, "l")
         fill_width = 0
         if row.state in ("normal", "stale"):
@@ -699,7 +704,7 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
         top = int(math.floor(center - bar_height / 2.0 + 0.5))
         _entry().paint_bar(canvas, skin, bar_left, top, bar_width, bar_height, bar_radius,
                            fill_width, row.tier, stale, theme, track_rgba, row.fill)
-        _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, ink, "r")
+        _draw_text(text_draw, font, edges["pct"][1], center, row.pct_text, pct_ink, "r")
         if row.reset_text:
             _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")
 

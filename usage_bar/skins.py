@@ -155,7 +155,7 @@ def paint_bar(canvas, skin, bar_left, top, bar_width, bar_height, bar_radius,
         return
     if fill_pct is None:
         fill_pct = fill_width * 100.0 / bar_width
-    base_rgb = None if stale else fill_rgb(fill_pct)
+    base_rgb = None if stale else fill_rgb(100.0 - fill_pct)
     if skin == SKIN_MECHA:
         image = _mecha_bar(bar_width, bar_height, bar_radius, fill_width, level,
                            stale, theme, track_rgba, base_rgb)

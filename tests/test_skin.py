@@ -267,8 +267,8 @@ class AnimationFillsTests(unittest.TestCase):
             second, self.app._anim_fills(NOW + 1.0 + widget.ANIM_SECONDS / 2.0))
         for value, begin, end in zip(
                 display_fills(at_middle), display_fills(first), display_fills(second)):
-            self.assertLessEqual(begin, value)
-            self.assertLessEqual(value, end)
+            self.assertLessEqual(min(begin, end), value)
+            self.assertLessEqual(value, max(begin, end))
         # 到点后画出的长度与真实目标完全相等（命中静态缓存），动画收掉。
         later = NOW + 1.0 + widget.ANIM_SECONDS + 1.0
         end_display = self.display(64.0, 12.0, later)
@@ -286,7 +286,7 @@ class AnimationFillsTests(unittest.TestCase):
     def test_apply_fills_reaches_both_blocks_of_a_dual_display(self):
         display = widget.sample_display("dual_green", "light", 1.0)
         before = tuple(row.fill for block in display.rows for row in block.rows)
-        boosted = tuple(value + 7 for value in before)
+        boosted = tuple(value - 7 for value in before)
         filled = widget.apply_fills(display, boosted)
         # 双栏槽位顺序 5h、7d、5h、7d：两块各自按 offset 对上自己的两条。
         self.assertEqual(

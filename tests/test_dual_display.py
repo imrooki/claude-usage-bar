@@ -117,10 +117,10 @@ class DualDisplayTests(unittest.TestCase):
         height = widget.scaled(widget.LOGICAL_H, 1.0)
 
         green = widget.sample_display("dual_green", "light", 1.0)
-        self.assertEqual(green.rows[0].rows[0].pct_text, "30%")
-        self.assertEqual(green.rows[0].rows[1].pct_text, "10%")
-        self.assertEqual(green.rows[1].rows[0].pct_text, "3%")
-        self.assertEqual(green.rows[1].rows[1].pct_text, "36%")
+        self.assertEqual(green.rows[0].rows[0].pct_text, "70%")
+        self.assertEqual(green.rows[0].rows[1].pct_text, "90%")
+        self.assertEqual(green.rows[1].rows[0].pct_text, "97%")
+        self.assertEqual(green.rows[1].rows[1].pct_text, "64%")
         self.assertTrue(all(row.state == "normal" for block in green.rows for row in block.rows))
 
         mixed = widget.build_display(
@@ -145,7 +145,7 @@ class DualDisplayTests(unittest.TestCase):
         self.assertEqual(tuple(row.state for row in empty.rows[0].rows), ("unknown", "unknown"))
         self.assertEqual(empty.rows[0].rows[0].pct_text, "--")
         self.assertEqual(empty.rows[0].rows[0].reset_text, "")
-        self.assertEqual(empty.rows[1].rows[0].pct_text, "30%")
+        self.assertEqual(empty.rows[1].rows[0].pct_text, "70%")
         self.assertEqual(empty.rows[1].rows[0].state, "normal")
 
     def test_nodata_when_both_sides_empty(self):
@@ -346,7 +346,7 @@ class OptionsAndPollTests(unittest.TestCase):
         display = app._apply.call_args[0][0]
         self.assertEqual(display.kind, "data")
         self.assertEqual(display.rows[0].label, "5h")
-        self.assertEqual(display.rows[0].pct_text, "30%")
+        self.assertEqual(display.rows[0].pct_text, "70%")
         self.assertEqual(display.rows[1].label, "7d")
         self.assertEqual(display.width, widget.display_width("data", 1.0, display.height))
 
@@ -367,7 +367,7 @@ class OptionsAndPollTests(unittest.TestCase):
         app._refresh_once(False, False)
         hidden = app._apply.call_args[0][0]
         self.assertEqual(hidden.kind, "data")
-        self.assertEqual(hidden.rows[0].pct_text, "30%")
+        self.assertEqual(hidden.rows[0].pct_text, "70%")
 
         app.codex.available = True
         app._apply.reset_mock()
@@ -381,7 +381,7 @@ class OptionsAndPollTests(unittest.TestCase):
         app._refresh_once(False, False)
         override = app._apply.call_args[0][0]
         self.assertEqual(override.kind, "data")
-        self.assertEqual(override.rows[0].pct_text, "30%")
+        self.assertEqual(override.rows[0].pct_text, "70%")
 
 
 GEOMETRY_QUERIES = ("taskbar_pos", "taskbar_autohide", "notification_state", "scale_for", "tray_notify_rect", "fullscreen_window_present")

@@ -30,8 +30,8 @@ class UsageLevelTests(unittest.TestCase):
                 self.assertEqual(widget.usage_level(pct), "none")
 
     def test_level_uses_the_unrounded_percentage(self):
-        """39.5 is written as 40% but stays safe: the level is decided on the float."""
-        self.assertEqual(widget.display_percent(39.5), 40)
+        """39.5 is written as 60% remaining (40% used) but stays safe: the level is decided on the float."""
+        self.assertEqual(widget.display_percent(39.5), 60)
         self.assertEqual(widget.usage_level(39.5), "safe")
 
 
@@ -43,14 +43,14 @@ class PercentRoundingTests(unittest.TestCase):
                 self.assertEqual(widget.percent_int(pct), expected)
 
     def test_display_percent_is_clamped_to_zero_through_999(self):
-        cases = ((0, 0), (49.5, 50), (998.4, 998), (998.5, 999), (999, 999),
-                 (1000, 999), (1e9, 999), (1e300, 999), (-3, 0), (-0.4, 0))
+        cases = ((0, 100), (49.5, 50), (998.4, 0), (998.5, 0), (999, 0),
+                 (1000, 0), (1e9, 0), (1e300, 0), (-3, 100), (-0.4, 100))
         for pct, expected in cases:
             with self.subTest(pct=pct):
                 self.assertEqual(widget.display_percent(pct), expected)
 
     def test_fill_percent_is_clamped_to_zero_through_one_hundred(self):
-        cases = ((0, 0), (42.4, 42), (99.5, 100), (100.4, 100), (150, 100), (-20, 0), (1e300, 100))
+        cases = ((0, 100), (42.4, 58), (99.5, 0), (100.4, 0), (150, 0), (-20, 100), (1e300, 0))
         for pct, expected in cases:
             with self.subTest(pct=pct):
                 self.assertEqual(widget.fill_percent(pct), expected)

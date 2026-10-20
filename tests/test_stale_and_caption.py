@@ -310,7 +310,7 @@ class StaleFillPixelTests(unittest.TestCase):
                 image = widget.render_display(display)
                 edges, _stale_y, fresh_y = bar_sample_points(display)
                 left, right = edges["bar"]
-                fill_px = int(33.0 * (right - left) / 100.0 + 0.5)
+                fill_px = int(display.rows[1].fill * (right - left) / 100.0 + 0.5)
                 start = image.getpixel((left + 4, fresh_y))
                 tip = image.getpixel((left + fill_px - 3, fresh_y))
                 self.assertGreater(sum(tip[:3]), sum(start[:3]), (start, tip))

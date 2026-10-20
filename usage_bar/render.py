@@ -126,11 +126,11 @@ def percent_int(pct):
 
 
 def display_percent(pct):
-    return max(0, min(999, percent_int(pct)))
+    return max(0, min(100, 100 - percent_int(pct)))
 
 
 def fill_percent(pct):
-    return max(0, min(100, percent_int(pct)))
+    return max(0, min(100, 100 - percent_int(pct)))
 
 
 def reset_text(resets_at, seven_day):

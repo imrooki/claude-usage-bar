@@ -9,7 +9,10 @@ import ctypes
 import ctypes.wintypes as wintypes
 import sys
 
-from usage_bar.data import SKIN_LABELS, SKIN_MECHA, SKIN_NEON
+from usage_bar.data import (
+    SKIN_LABELS, SKIN_MECHA, SKIN_NEON,
+    STYLE_AUTO, STYLE_BAR, STYLE_LABELS, STYLE_RINGS,
+)
 
 
 def _entry():
@@ -36,14 +39,24 @@ MENU_SNAP = 2
 MENU_QUIT = 3
 MENU_SKIN_NEON = 4
 MENU_SKIN_MECHA = 5
+MENU_STYLE_AUTO = 6
+MENU_STYLE_BAR = 7
+MENU_STYLE_RINGS = 8
 # 皮肤子菜单里的勾选项：(皮肤名, 命令号)。皮肤名取自数据层的 SKINS。
 SKIN_MENU_ITEMS = ((SKIN_NEON, MENU_SKIN_NEON), (SKIN_MECHA, MENU_SKIN_MECHA))
+STYLE_MENU_ITEMS = (
+    (STYLE_AUTO, MENU_STYLE_AUTO),
+    (STYLE_BAR, MENU_STYLE_BAR),
+    (STYLE_RINGS, MENU_STYLE_RINGS),
+)
 # 子菜单在 MENU_ITEMS 里的占位命令号：TrackPopupMenu 永远返回不了它。
 MENU_SKIN_SUBMENU = -1
+MENU_STYLE_SUBMENU = -2
 MENU_ITEMS = (
     (MENU_REFRESH, "Refresh now"),
     (MENU_SNAP, "Snap to tray"),
     (0, None),
+    (MENU_STYLE_SUBMENU, "Display"),
     (MENU_SKIN_SUBMENU, "Progress Bar Skin"),
     (0, None),
     (MENU_QUIT, "Quit"),
@@ -582,11 +595,11 @@ class Win32:
             return True
         return bool(value.value)
 
-    def track_menu(self, hwnd, x, y, skin=None):
+    def track_menu(self, hwnd, x, y, skin=None, style=None):
         """弹出右键菜单，返回选中的命令号（取消返回 0）。
 
-        第三个菜单项是 "Progress Bar Skin" 子菜单，列出全部皮肤，当前皮肤打勾（skin
-        为 None 时都不打勾）。TrackPopupMenu 自带模态消息循环，期间计时器消息照常送到
+        Display 与 Progress Bar Skin 子菜单列出全部样式和皮肤，当前项打勾；
+        对应参数为 None 时不打勾。TrackPopupMenu 自带模态消息循环，期间计时器消息照常送到
         窗口过程。弹出前把自己的窗口设为前台，否则点菜单以外的地方菜单不会收起；
         系统可能拒绝这次设置，不影响菜单本身，所以不检查返回值。
         """
@@ -597,6 +610,14 @@ class Win32:
             for item_id, text in MENU_ITEMS:
                 if text is None:
                     self.user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+                elif item_id == MENU_STYLE_SUBMENU:
+                    submenu = self.user32.CreatePopupMenu()
+                    if not submenu:
+                        raise OSError("CreatePopupMenu failed, error %d" % ctypes.get_last_error())
+                    for style_name, command in STYLE_MENU_ITEMS:
+                        flags = MF_STRING | (MF_CHECKED if style_name == style else 0)
+                        self.user32.AppendMenuW(submenu, flags, command, STYLE_LABELS[style_name])
+                    self.user32.AppendMenuW(menu, MF_POPUP, submenu, text)
                 elif item_id == MENU_SKIN_SUBMENU:
                     submenu = self.user32.CreatePopupMenu()
                     if not submenu:

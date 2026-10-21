@@ -25,7 +25,7 @@ def real_width():
     return widget.build_display(None, 0.0, "dark", 1.0, HEIGHT).width
 
 
-def make_app(data_dir):
+def make_app(data_dir, probe=None):
     w32 = Mock()
     w32.taskbar_hwnd.return_value = 0
     w32.taskbar_pos.return_value = TASKBAR
@@ -39,8 +39,9 @@ def make_app(data_dir):
     w32.cursor_pos.return_value = RESTING_CURSOR
     options = widget.Options(data_dir, None, None, None, no_codex=True, no_app_refresh=True)
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, widget.DEFAULT_OFFSET)), \
-            patch.object(widget, "read_light_theme", return_value=False):
-        app = widget.WidgetApp(options, w32, Mock())
+            patch.object(widget, "read_light_theme", return_value=False), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
+        app = widget.WidgetApp(options, w32, Mock(), probe=probe)
     app.hwnd = HWND
     app.visible = True
     app._apply = Mock()

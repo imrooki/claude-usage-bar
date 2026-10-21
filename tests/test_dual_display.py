@@ -37,7 +37,7 @@ def metric_rows(snapshot, now):
     )
 
 
-def make_app(argv=None):
+def make_app(argv=None, probe=None):
     w32 = Mock()
     w32.taskbar_hwnd.return_value = 0
     w32.taskbar_pos.return_value = ((0, 100, 1000, 140), widget.ABE_BOTTOM)
@@ -54,8 +54,9 @@ def make_app(argv=None):
     w32.post_z_order_check.return_value = True
     opts = widget.parse_args([] if argv is None else argv)
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-            patch.object(widget, "read_light_theme", return_value=False):
-        app = widget.WidgetApp(opts, w32, Mock())
+            patch.object(widget, "read_light_theme", return_value=False), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
+        app = widget.WidgetApp(opts, w32, Mock(), probe=probe)
     app.hwnd = 10
     app.visible = True
     app._apply = Mock()

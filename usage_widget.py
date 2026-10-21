@@ -38,6 +38,7 @@ from usage_bar.skins import *
 from usage_bar.render import *
 from usage_bar.win32 import *
 from usage_bar.app import *
+from usage_bar.uia import TaskbarProbe, rightmost
 
 from usage_bar.data import (
     _read_codex_tail,
@@ -68,7 +69,8 @@ def run_app(opts, log):
     try:
         prepare_data_folder(opts, log)
         w32.set_dpi_awareness()
-        return WidgetApp(opts, w32, log).run()
+        probe = TaskbarProbe(w32.taskbar_hwnd)
+        return WidgetApp(opts, w32, log, probe=probe).run()
     finally:
         w32.close_handle(handle)
 

@@ -1023,7 +1023,7 @@ class RefreshCaptionFlowTests(unittest.TestCase):
         app.reader = FakeReader(data_at(OBS_OLD))
         during_menu = []
 
-        def menu(hwnd, x, y, skin=None):
+        def menu(hwnd, x, y, skin=None, style=None):
             # The modal menu loop still dispatches WM_TIMER: TIMER_POLL reads the
             # new file into the reader, and menu_open blocks the redraw.
             app.reader.queued = (data_at(OBS_NEW), "")

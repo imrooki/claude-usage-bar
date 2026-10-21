@@ -142,12 +142,13 @@ class FakeDriver:
         setattr(self, self.busy_name, False)
 
 
-def make_app():
+def make_app(probe=None):
     """A real WidgetApp with the window mocked out and both providers switched off."""
     options = widget.Options(".", None, None, None, no_codex=True, no_app_refresh=True)
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-            patch.object(widget, "read_light_theme", return_value=False):
-        app = widget.WidgetApp(options, Mock(), Mock())
+            patch.object(widget, "read_light_theme", return_value=False), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
+        app = widget.WidgetApp(options, Mock(), Mock(), probe=probe)
     app.hwnd = 10
     app.w32.set_timer.return_value = True
     app.refresh_view = Mock()
@@ -172,7 +173,8 @@ class RefreshSlotTableTests(unittest.TestCase):
     def test_the_names_in_the_table_exist_on_the_real_objects(self):
         with tempfile.TemporaryDirectory() as root:
             with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-                    patch.object(widget, "read_light_theme", return_value=False):
+                    patch.object(widget, "read_light_theme", return_value=False), \
+                    patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
                 app = widget.WidgetApp(widget.Options(root, None, None, None), Mock(), Mock())
             for slot in widget.REFRESH_SLOTS:
                 with self.subTest(driver=slot.driver):

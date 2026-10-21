@@ -47,6 +47,19 @@ SKINS = (SKIN_NEON, SKIN_MECHA)
 DEFAULT_SKIN = SKIN_NEON
 SKIN_LABELS = {SKIN_NEON: "Neon Minimal", SKIN_MECHA: "Mecha Tech"}
 
+STYLE_AUTO = "auto"
+STYLE_BAR = "bar"
+STYLE_RINGS = "rings"
+STYLES = (STYLE_AUTO, STYLE_BAR, STYLE_RINGS)
+DEFAULT_STYLE = STYLE_AUTO
+STYLE_FILE_NAME = "widget_style.json"
+STYLE_SCHEMA = 1
+STYLE_LABELS = {
+    STYLE_AUTO: "Auto (fit taskbar)",
+    STYLE_BAR: "Full bar",
+    STYLE_RINGS: "Rings",
+}
+
 MAX_SNAPSHOT_BYTES = 1024 * 1024
 
 LOG_MAX_BYTES = 64 * 1024
@@ -1151,6 +1164,72 @@ def save_skin(data_dir, skin):
             pass
         raise
     return True
+
+
+def load_style(path):
+    """读样式文件；缺失、损坏或不认识的 schema/样式均退回 Auto。"""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(4096)
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except (OSError, TypeError, ValueError, RecursionError):
+        return DEFAULT_STYLE
+    if not isinstance(doc, dict) or not _schema_is(doc, STYLE_SCHEMA):
+        return DEFAULT_STYLE
+    style = doc.get("style")
+    return style if style in STYLES else DEFAULT_STYLE
+
+
+def save_style(data_dir, style):
+    """原子写样式文件；目录不存在或样式无效时不写，I/O 异常交给调用方。"""
+    if not data_dir or not os.path.isdir(data_dir):
+        return False
+    if style not in STYLES:
+        return False
+    path = os.path.join(data_dir, STYLE_FILE_NAME)
+    temp = path + ".tmp"
+    payload = json.dumps({"schema": STYLE_SCHEMA, "style": style}) + "\n"
+    try:
+        with open(temp, "wb") as handle:
+            handle.write(payload.encode("utf-8"))
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def read_taskbar_centered():
+    """只读 TaskbarAl；1 为居中、0 为左对齐，其他情况返回 None。"""
+    registry = getattr(_entry(), "winreg", winreg)
+    if registry is None:
+        return None
+    key = None
+    result = None
+    try:
+        key = registry.OpenKey(
+            registry.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced",
+            0,
+            registry.KEY_READ,
+        )
+        value, _kind = registry.QueryValueEx(key, "TaskbarAl")
+        if value == 1:
+            result = True
+        elif value == 0:
+            result = False
+    except Exception:
+        result = None
+    finally:
+        if key is not None:
+            try:
+                registry.CloseKey(key)
+            except Exception:
+                result = None
+    return result
 
 
 def read_light_theme():

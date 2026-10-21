@@ -79,7 +79,7 @@ class DataFolderStartupTests(StartupTestCase):
             seen.append(("mutex", os.path.isdir(target)))
             return 1234, 0
 
-        def start_app(opts, _win32, _log):
+        def start_app(opts, _win32, _log, probe=None):
             seen.append(("app", os.path.isdir(target)))
             app = Mock()
             app.run.return_value = 0

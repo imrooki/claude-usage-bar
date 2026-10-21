@@ -30,6 +30,11 @@ from usage_bar.data import (
     SKIN_NEON,
     SKINS,
     SNAPSHOT_NAME,
+    STYLE_AUTO,
+    STYLE_BAR,
+    STYLE_FILE_NAME,
+    STYLE_RINGS,
+    STYLES,
     SnapshotReader,
     Win,
     _snapshot_observed_at,
@@ -38,13 +43,20 @@ from usage_bar.data import (
     valid_ping_model,
 )
 from usage_bar.render import (
+    AUTO_FIT_HYSTERESIS,
+    AUTO_FIT_MARGIN,
     INITIAL_WINDOW_PX,
+    TRAY_GAP,
     _font_state,
+    auto_shape,
     build_display,
+    build_rings_display,
     caption_text,
     compute_layout,
     offset_from_right_edge,
     premultiply_bgra,
+    ring_display_width,
+    scaled,
     window_height,
 )
 from usage_bar.win32 import (
@@ -60,6 +72,9 @@ from usage_bar.win32 import (
     MENU_SKIN_MECHA,
     MENU_SKIN_NEON,
     MENU_SNAP,
+    MENU_STYLE_AUTO,
+    MENU_STYLE_BAR,
+    MENU_STYLE_RINGS,
     MK_LBUTTON,
     OBJID_CLIENT,
     OBJID_WINDOW,
@@ -125,6 +140,11 @@ ANIM_SECONDS = 0.25
 ANIM_TICK_MS = 40
 # 皮肤子菜单命令号 -> 皮肤名。
 SKIN_COMMANDS = {MENU_SKIN_NEON: SKIN_NEON, MENU_SKIN_MECHA: SKIN_MECHA}
+STYLE_COMMANDS = {
+    MENU_STYLE_AUTO: STYLE_AUTO,
+    MENU_STYLE_BAR: STYLE_BAR,
+    MENU_STYLE_RINGS: STYLE_RINGS,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +204,7 @@ REFRESH_SLOTS = (CODEX_SLOT, APP_SLOT)  # 窗口重建后按这个顺序补计�
 
 def _display_fills(display):
     """显示元组里各条进度条的填充目标值（5h、7d、5h、7d 顺序）；无进度条时为 None。"""
-    if display.kind == "dual":
+    if display.kind in ("dual", "rings"):
         return tuple(row.fill for block in display.rows for row in block.rows)
     if display.kind == "data":
         return tuple(row.fill for row in display.rows)
@@ -198,7 +218,7 @@ class WidgetApp:
     一次失败不影响下一次。
     """
 
-    def __init__(self, opts, w32, log):
+    def __init__(self, opts, w32, log, probe=None):
         self.opts = opts
         self.w32 = w32
         self.log = log
@@ -260,10 +280,17 @@ class WidgetApp:
         self._frame = None
         self.skin_path = os.path.join(self.data_dir, SKIN_FILE_NAME)
         self.skin = _entry().load_skin(self.skin_path)
+        self.style_path = os.path.join(self.data_dir, STYLE_FILE_NAME)
+        self.style = _entry().load_style(self.style_path)
+        self.probe = probe
+        self._auto_shape = None
+        self._probe_error_logged = None
         # 填充长度动画：_anim 是 (起点时刻, 起点 fills, 目标 fills) 或 None；
         # _fills_shown 是最近一次静态画面的填充长度，还没画过时是 None。
         self._anim = None
         self._fills_shown = None
+        if self.style == STYLE_AUTO and self.probe is not None:
+            self.probe.start()
 
     # 基础设施 ----------------------------------------------------------------
 
@@ -580,6 +607,26 @@ class WidgetApp:
         finally:
             self._busy = False
 
+    def _available_gap(self, tray, scale):
+        """只读探针缓存；读数超过三秒或托盘矩形不可用时不估计空间。"""
+        if self.probe is None:
+            return None
+        error = self.probe.last_error
+        if error != self._probe_error_logged:
+            self._probe_error_logged = error
+            if error:
+                self.log.log("TaskbarProbe", error)
+        if not isinstance(tray, tuple) or len(tray) != 4:
+            return None
+        reading = self.probe.reading()
+        if reading is None:
+            return None
+        right, observed_at = reading
+        age = time.monotonic() - observed_at
+        if not isinstance(right, int) or isinstance(right, bool) or not 0 <= age <= 3.0:
+            return None
+        return tray[0] - scaled(TRAY_GAP, scale) - right
+
     def _refresh_once(self, force, reassert_topmost):
         if self.menu_open or self.drag is not None:
             # 菜单或拖动进行中不挪窗口、不隐藏窗口
@@ -638,12 +685,44 @@ class WidgetApp:
             self._current_snapshot(), now, theme, scale, height,
             codex=codex_snapshot, codex_available=codex_available, captions=captions,
             skin=self.skin)
+        tray = self.w32.tray_notify_rect() if (
+            self.mode == MODE_AUTO or (self.probe is not None and self.style != STYLE_BAR)) else None
+        gap = self._available_gap(tray, scale)
+        if not isinstance(tray, tuple) or len(tray) != 4:
+            tray = None
+        margin = scaled(AUTO_FIT_MARGIN, scale)
+        rings_width = ring_display_width(2 if codex_available else 1, scale, height)
+        shape = self.style
+        if self.style == STYLE_AUTO:
+            if gap is not None:
+                if display.kind == "nodata":
+                    shape = STYLE_BAR if gap >= display.width + margin else None
+                else:
+                    shape = auto_shape(
+                        display.width, rings_width, gap, self._auto_shape,
+                        margin, scaled(AUTO_FIT_HYSTERESIS, scale))
+                self._auto_shape = shape
+            elif (self.probe is not None and display.kind != "nodata"
+                    and _entry().read_taskbar_centered() is True):
+                shape = STYLE_RINGS
+            else:
+                shape = STYLE_BAR
+        elif self.style == STYLE_RINGS and gap is not None and gap < rings_width + margin:
+            shape = None
+        if shape is None:
+            self._hide()
+            return
+        if shape == STYLE_RINGS:
+            display = build_rings_display(
+                self._current_snapshot(), now, theme, scale, height,
+                codex=codex_snapshot, codex_available=codex_available, skin=self.skin, captions=captions)
         # 动画状态机先看真实填充长度（缓动只作用在要画的这一帧上）：换帧从上一帧的长度
         # 起步、滑动到真实目标，不会把中间值当成目标反复爬行，也不会先跳一帧真实值。
         self._track_animation(display, now)
         display = _entry().apply_fills(display, self._anim_fills(now))
-        tray = self.w32.tray_notify_rect() if self.mode == MODE_AUTO else None
-        geom = compute_layout(rect, edge, scale, display.width, self.mode, self.offset, tray)
+        geom = compute_layout(
+            rect, edge, scale, display.width, self.mode, self.offset,
+            tray if self.mode == MODE_AUTO else None)
         self.scale = scale
         self._apply(display, geom, force)
         shown_now = not self.visible
@@ -1149,6 +1228,26 @@ class WidgetApp:
         except OSError as exc:
             self._log_exception(exc)
 
+    def _set_style(self, style):
+        """切换显示样式并持久化；只有 Auto 启用后台任务栏探针。"""
+        if style not in STYLES or style == self.style:
+            return
+        self.style = style
+        self._save_style()
+        self._auto_shape = None
+        if self.probe is not None:
+            if style == STYLE_AUTO:
+                self.probe.start()
+            else:
+                self.probe.stop()
+        self.refresh_view(force=True)
+
+    def _save_style(self):
+        try:
+            _entry().save_style(self.data_dir, self.style)
+        except OSError as exc:
+            self._log_exception(exc)
+
     def _save_position(self):
         try:
             _entry().save_position(self.data_dir, self.mode, self.offset)
@@ -1164,7 +1263,7 @@ class WidgetApp:
         before = self._latest_observed()
         self.menu_open = True
         try:
-            command = self.w32.track_menu(self.hwnd, x, y, self.skin)
+            command = self.w32.track_menu(self.hwnd, x, y, self.skin, self.style)
         finally:
             self.menu_open = False
         if self.exiting:
@@ -1180,6 +1279,8 @@ class WidgetApp:
             self.refresh_view()
         elif command in SKIN_COMMANDS:
             self._set_skin(SKIN_COMMANDS[command])
+        elif command in STYLE_COMMANDS:
+            self._set_style(STYLE_COMMANDS[command])
         elif command == MENU_QUIT:
             self.request_exit()
 
@@ -1188,7 +1289,7 @@ class WidgetApp:
     def _arm_watchdog(self):
         """退出请求发出 10 秒后进程还在就强制结束。
 
-        这是整个程序里唯一的线程：只在退出时启动一次，只睡眠和 os._exit，不碰窗口，
+        退出看门狗只在退出时启动一次，只睡眠和 os._exit，不碰窗口，
         因此主线程卡死（例如销毁窗口或菜单循环不返回）时它仍能生效。
         """
         def force_exit():
@@ -1209,6 +1310,8 @@ class WidgetApp:
         if self.exiting:
             return
         self.exiting = True
+        if self.probe is not None:
+            self._safe(self.probe.stop)
         for slot in _entry().REFRESH_SLOTS:
             self._stop_slot(slot)
         self._flashing = False
@@ -1292,6 +1395,8 @@ class WidgetApp:
                 self.w32.unwatch_window_events()
                 self.w32.unregister_class()
         finally:
+            if self.probe is not None:
+                self._safe(self.probe.stop)
             for slot in _entry().REFRESH_SLOTS:
                 self._stop_slot(slot)
             _entry()._APP = None

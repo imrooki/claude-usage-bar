@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import usage_widget as widget
 
 
-def make_app(data_dir, light):
+def make_app(data_dir, light, probe=None):
     w32 = Mock()
     w32.taskbar_hwnd.return_value = 0
     w32.taskbar_pos.return_value = ((0, 1032, 1920, 1080), widget.ABE_BOTTOM)
@@ -23,8 +23,9 @@ def make_app(data_dir, light):
     w32.set_timer.return_value = True
     options = widget.Options(data_dir, None, None, None, no_codex=True, no_app_refresh=True)
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, widget.DEFAULT_OFFSET)), \
-            patch.object(widget, "read_light_theme", return_value=light):
-        app = widget.WidgetApp(options, w32, Mock())
+            patch.object(widget, "read_light_theme", return_value=light), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
+        app = widget.WidgetApp(options, w32, Mock(), probe=probe)
     app.hwnd = 10
     app.visible = True
     app._apply = widget.WidgetApp._apply.__get__(app, widget.WidgetApp)

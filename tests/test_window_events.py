@@ -16,7 +16,7 @@ TASKBAR_RECT = (0, 1032, 1920, 1080)
 MONITOR_RECT = (0, 0, 1920, 1080)
 
 
-def make_app():
+def make_app(probe=None):
     w32 = Mock()
     w32.taskbar_hwnd.return_value = 0
     w32.taskbar_pos.return_value = ((0, 100, 1000, 140), widget.ABE_BOTTOM)
@@ -32,9 +32,10 @@ def make_app():
     w32.topmost_allowed.return_value = True
     w32.post_z_order_check.return_value = True
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-            patch.object(widget, "read_light_theme", return_value=False):
+            patch.object(widget, "read_light_theme", return_value=False), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
         app = widget.WidgetApp(
-            widget.Options(".", None, None, None, no_codex=True), w32, Mock())
+            widget.Options(".", None, None, None, no_codex=True), w32, Mock(), probe=probe)
     app.hwnd = 10
     app.visible = True
     app._apply = Mock()

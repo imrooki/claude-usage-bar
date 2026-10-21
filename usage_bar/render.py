@@ -65,6 +65,20 @@ DUAL_HEADER_H = 12
 DUAL_HEADER_FONT_PX = 10
 DUAL_FONT_PX = 11
 DUAL_BAR_H = 6
+RING_GAP = 4
+RING_THICKNESS = 4
+RING_INNER_GAP = 2
+RING_SUPERSAMPLE = 4
+RING_TEXT_GAP = 4
+RING_TEXT_W = 80
+RING_BLOCK_GAP = 10
+RING_LABEL_W = 14
+RING_PCT_W = 26
+RING_RESET_W = 30
+RING_COL_GAP = 3
+RING_RESET_GAP = 7
+AUTO_FIT_MARGIN = 4
+AUTO_FIT_HYSTERESIS = 24
 PROVIDER_TAGS = ("Claude", "Codex")
 TRAY_GAP = 2
 MIN_HEIGHT_PX = 12
@@ -324,6 +338,56 @@ def dual_render_metrics(scale, height):
     }
 
 
+def _ring_block_width(scale, height):
+    """每块包含高度见方的圆环、间隙与固定逻辑宽度的文字。"""
+    return height + scaled(RING_TEXT_GAP, scale) + scaled(RING_TEXT_W, scale)
+
+
+def ring_display_width(count, scale, height):
+    """圆环与右侧文字块的总宽度，提供方之间留缩放后的块间隙。"""
+    if count <= 0:
+        return 0
+    return count * _ring_block_width(scale, height) + (count - 1) * scaled(RING_BLOCK_GAP, scale)
+
+
+def _ring_text_columns(scale, left):
+    """圆环右侧的标签左端、百分比左端与重置时间左端。"""
+    pct_left = left + scaled(RING_LABEL_W + RING_COL_GAP, scale)
+    reset_left = pct_left + scaled(RING_PCT_W + RING_RESET_GAP, scale)
+    return left, pct_left, reset_left
+
+
+def ring_metrics(scale, height):
+    """圆环的外边界半径、笔宽与环间隙；矮窗口按比例压缩笔宽和间隙。"""
+    outer_radius = max(0.0, height / 2.0 - max(1, scaled(1, scale)))
+    thickness = max(2, scaled(RING_THICKNESS, scale))
+    inner_gap = max(1, scaled(RING_INNER_GAP, scale))
+    if outer_radius - 2 * thickness - inner_gap <= 1:
+        ratio = max(0.0, outer_radius - 1.0) / (2 * thickness + inner_gap)
+        thickness *= ratio
+        inner_gap *= ratio
+    return {
+        "outer_radius": outer_radius,
+        "inner_radius": max(0.0, outer_radius - thickness - inner_gap),
+        "thickness": thickness,
+        "inner_gap": inner_gap,
+    }
+
+
+def auto_shape(bar_width, rings_width, gap, previous, margin, hysteresis):
+    """按实测空隙选横条、圆环或隐藏；从圆环恢复横条时加入回差。"""
+    if gap is None:
+        return "bar"
+    bar_threshold = bar_width + margin
+    if previous == "rings":
+        bar_threshold += hysteresis
+    if gap >= bar_threshold:
+        return "bar"
+    if gap >= rings_width + margin:
+        return "rings"
+    return None
+
+
 def display_width(kind, scale, height, aside=""):
     """小窗宽度（像素）：数据行按列布局算，双栏按两块加间隙算，无数据时按两行文字的实际宽度算。
 
@@ -427,7 +491,7 @@ def apply_fills(display, fills):
     """
     if fills is None:
         return display
-    if display.kind == "dual":
+    if display.kind in ("dual", "rings"):
         rows = tuple(
             block._replace(rows=_with_fills(block.rows, fills, 2 * index))
             for index, block in enumerate(display.rows))
@@ -482,6 +546,21 @@ def build_display(snapshot, now, theme, scale, height, codex=None, codex_availab
     return Display(
         "dual", blocks, theme, scale, width, height,
         _stored_strings(ages), _stored_strings(caption_pair), skin)
+
+
+def build_rings_display(snapshot, now, theme, scale, height, codex=None, codex_available=False,
+                        skin=DEFAULT_SKIN, fills=None, captions=None):
+    """把每个提供方的两条读数保留在圆环与文字块里；缺失读数仍有轨道。"""
+    pairs = (_window_pair(snapshot),)
+    if codex_available:
+        pairs += (_window_pair(codex),)
+    blocks = tuple(
+        BlockView(PROVIDER_TAGS[index], _with_fills(_metric_rows(five, seven, now), fills, 2 * index))
+        for index, (five, seven) in enumerate(pairs))
+    ages = _stored_strings(tuple(_age_text(five, seven, now) for five, seven in pairs))
+    captions = _stored_strings((_caption_at(captions, 0), _caption_at(captions, 1)))
+    width = ring_display_width(len(blocks), scale, height)
+    return Display("rings", blocks, theme, scale, width, height, ages, captions, skin)
 
 
 def rect_inside(inner, outer):
@@ -709,6 +788,74 @@ def _draw_rows(canvas, text_draw, font, rows, edges, metrics, text_rgb, track_rg
             _draw_text(text_draw, font, edges["reset"][0], center, row.reset_text, ink, "l")
 
 
+def _draw_ring_text(display, index, text_draw, row_font, header_font, left, metrics, text_rgb):
+    """在最终尺寸图层上画页眉与两行文字，不经过圆环的超采样缩放。"""
+    label_left, pct_left, reset_left = _ring_text_columns(display.scale, left)
+    header_height = metrics["header_height"]
+    header_text, header_alpha = dual_header(display, index)
+    header_center = left + scaled(RING_TEXT_W, display.scale) / 2.0
+    _draw_text(text_draw, header_font, header_center, header_height / 2.0,
+               header_text, text_rgb + (header_alpha,), "c")
+    for row_index, row in enumerate(display.rows[index].rows):
+        center = header_height + (row_index + 0.5) * metrics["row_height"]
+        stale = row.state == "stale"
+        ink = text_rgb + (TEXT_ALPHA_STALE if stale else TEXT_ALPHA,)
+        pct_ink = ink
+        if not stale and row.state == "normal" and row.fill <= 0:
+            red = _entry().fill_rgb(0.0)
+            if red is not None:
+                pct_ink = red + (TEXT_ALPHA,)
+        _draw_text(text_draw, row_font, label_left, center, row.label, ink, "l")
+        _draw_text(text_draw, row_font, pct_left, center, row.pct_text, pct_ink, "l")
+        if row.reset_text:
+            _draw_text(text_draw, row_font, reset_left, center, row.reset_text, ink, "l")
+
+
+def _render_rings(display):
+    """从实际 fill 画双层同心圆（7d 在外、5h 在内），右侧画页眉与读数。"""
+    from usage_bar.skins import STALE_FILL_RGB, fill_rgb
+
+    width, height = display.width, display.height
+    sample = RING_SUPERSAMPLE
+    canvas = Image.new("RGBA", (width * sample, height * sample), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    metrics = ring_metrics(display.scale, height)
+    block_width = _ring_block_width(display.scale, height)
+    gap = scaled(RING_BLOCK_GAP, display.scale)
+    stroke = max(1, scaled(metrics["thickness"], sample))
+    for index, block in enumerate(display.rows):
+        cx = index * (block_width + gap) + height / 2.0
+        cy = height / 2.0
+        for row_index, radius in ((1, metrics["outer_radius"]), (0, metrics["inner_radius"])):
+            if radius <= 0 or metrics["thickness"] <= 0:
+                continue
+            box = tuple(value * sample for value in (cx - radius, cy - radius, cx + radius, cy + radius))
+            draw.arc(box, 0, 360, fill=TRACK_RGBA[display.theme], width=stroke)
+            row = block.rows[row_index]
+            fill = max(0, min(100, row.fill))
+            if row.state not in ("normal", "stale") or fill <= 0:
+                continue
+            rgb = STALE_FILL_RGB if row.state == "stale" else fill_rgb(fill)
+            ink = rgb + (FILL_ALPHA,)
+            if fill >= 100:
+                draw.ellipse(box, outline=ink, width=stroke)
+            else:
+                draw.arc(box, -90, -90 + 3.6 * fill, fill=ink, width=stroke)
+    canvas = canvas.resize((width, height), Image.Resampling.BOX)
+    text_rgb = TEXT_RGB[display.theme]
+    text_layer = Image.new("RGBA", (width, height), text_rgb + (0,))
+    text_draw = ImageDraw.Draw(text_layer)
+    text_metrics = dual_render_metrics(display.scale, height)
+    row_font = get_font(text_metrics["font_px"])
+    header_font = get_font(text_metrics["header_font_px"])
+    for index in range(len(display.rows)):
+        left = index * (block_width + gap) + height + scaled(RING_TEXT_GAP, display.scale)
+        _draw_ring_text(display, index, text_draw, row_font, header_font, left, text_metrics, text_rgb)
+    canvas.alpha_composite(text_layer)
+    red, green, blue, alpha = canvas.split()
+    return Image.merge("RGBA", (red, green, blue, alpha.point(_ALPHA_FLOOR)))
+
+
 def render_display(display):
     """把显示元组画成直通 alpha 的 RGBA 图（纯函数：同输入同输出）。
 
@@ -721,6 +868,8 @@ def render_display(display):
     元组相等画面就相同，所以 WidgetApp 会把最近一次的结果按显示元组缓存起来复用；
     返回的图因此不得被原地修改，要变暗请用 dim_image 另取新图。
     """
+    if display.kind == "rings":
+        return _render_rings(display)
     theme = display.theme
     text_rgb = TEXT_RGB[theme]
     track_rgba = TRACK_RGBA[theme]

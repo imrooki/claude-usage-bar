@@ -32,15 +32,16 @@ def display_fills(display):
     return tuple(row.fill for row in display.rows)
 
 
-def make_skin_app(data_dir):
+def make_skin_app(data_dir, probe=None):
     """WidgetApp with a fake w32 and no data sources, so only skin code is on stage."""
     w32 = Mock()
     w32.cursor_pos.return_value = (4, 8)
     w32.set_timer.return_value = True
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-            patch.object(widget, "read_light_theme", return_value=False):
+            patch.object(widget, "read_light_theme", return_value=False), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
         app = widget.WidgetApp(
-            widget.Options(data_dir, None, None, None, no_codex=True), w32, Mock())
+            widget.Options(data_dir, None, None, None, no_codex=True), w32, Mock(), probe=probe)
     app.hwnd = 10
     app.visible = True
     app._apply = Mock()
@@ -326,7 +327,7 @@ class Win32SkinMenuTests(unittest.TestCase):
         for skin, checked in (("neon", "neon"), ("mecha", "mecha"), (None, None)):
             with self.subTest(skin=skin):
                 w32 = self.make_win32()
-                w32.user32.CreatePopupMenu.side_effect = [101, 202]
+                w32.user32.CreatePopupMenu.side_effect = [101, 202, 303]
                 w32.user32.TrackPopupMenu.return_value = 0
                 self.assertEqual(w32.track_menu(7, 5, 6, skin), 0)
                 items = self.skin_item_calls(w32)
@@ -341,13 +342,15 @@ class Win32SkinMenuTests(unittest.TestCase):
                 popup_calls = [
                     item for item in w32.user32.AppendMenuW.call_args_list
                     if len(item.args) >= 2 and item.args[1] == widget.MF_POPUP]
-                self.assertEqual(len(popup_calls), 1)
+                self.assertEqual(len(popup_calls), 2)
                 self.assertEqual(popup_calls[0].args[2], 202)
-                self.assertEqual(popup_calls[0].args[3], "Progress Bar Skin")
+                self.assertEqual(popup_calls[0].args[3], "Display")
+                self.assertEqual(popup_calls[1].args[2], 303)
+                self.assertEqual(popup_calls[1].args[3], "Progress Bar Skin")
 
     def test_track_menu_returns_the_command_and_cleans_up(self):
         w32 = self.make_win32()
-        w32.user32.CreatePopupMenu.side_effect = [101, 202]
+        w32.user32.CreatePopupMenu.side_effect = [101, 202, 303]
         w32.user32.TrackPopupMenu.return_value = widget.MENU_SKIN_MECHA
         self.assertEqual(w32.track_menu(7, 5, 6, "neon"), widget.MENU_SKIN_MECHA)
         w32.user32.SetForegroundWindow.assert_called_once_with(7)
@@ -382,7 +385,7 @@ class SkinSwitchAppTests(unittest.TestCase):
         app.on_right_up()
         self.assertEqual(app.skin, "mecha")
         app.refresh_view.assert_called_once_with(force=True)
-        app.w32.track_menu.assert_called_once_with(10, 4, 8, "neon")
+        app.w32.track_menu.assert_called_once_with(10, 4, 8, "neon", widget.DEFAULT_STYLE)
         self.assertEqual(
             widget.load_skin(os.path.join(self.root, widget.SKIN_FILE_NAME)), "mecha")
 

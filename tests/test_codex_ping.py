@@ -109,7 +109,7 @@ class FakePinger:
             raise self.stop_error
 
 
-def make_app(claude=None, codex=None, pinger=True, options=None):
+def make_app(claude=None, codex=None, pinger=True, options=None, probe=None):
     """Widget with fake readers. pinger=True installs FakePinger; False leaves it unset."""
     w32 = Mock()
     w32.taskbar_hwnd.return_value = 0
@@ -131,8 +131,9 @@ def make_app(claude=None, codex=None, pinger=True, options=None):
         options = widget.Options(
             ".", None, None, None, codex_home=os.path.join("nowhere", "codex-home"))
     with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-            patch.object(widget, "read_light_theme", return_value=False):
-        app = widget.WidgetApp(options, w32, Mock())
+            patch.object(widget, "read_light_theme", return_value=False), \
+            patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
+        app = widget.WidgetApp(options, w32, Mock(), probe=probe)
     app.hwnd = 10
     app.visible = True
     app._apply = Mock()
@@ -157,7 +158,7 @@ def last_display(app):
 def _menu_swaps_in_newer_codex(app):
     """Menu loop stand-in: a poll during the menu replaces the Codex snapshot."""
 
-    def menu(hwnd, x, y, skin=None):
+    def menu(hwnd, x, y, skin=None, style=None):
         app.codex.snapshot = data_at(OBS_NEW)
         return widget.MENU_REFRESH
 
@@ -177,7 +178,8 @@ class NoRealProcessGuardTests(NoRealProcessTestCase):
 class PingerCreationTests(NoRealProcessTestCase):
     def _construct(self, options):
         with patch.object(widget, "load_position", return_value=(widget.MODE_AUTO, 330)), \
-                patch.object(widget, "read_light_theme", return_value=False):
+                patch.object(widget, "read_light_theme", return_value=False), \
+                patch.object(widget, "load_style", return_value=widget.DEFAULT_STYLE):
             return widget.WidgetApp(options, Mock(), Mock())
 
     def test_no_codex_builds_neither_reader_nor_pinger(self):
@@ -1720,8 +1722,9 @@ class SourceGuardTests(unittest.TestCase):
             self.assertNotIn(needle, segment)
 
     def test_no_new_threads(self):
-        self.assertNotIn("threading.Thread(", self.source)
+        self.assertEqual(self.source.count("threading.Thread("), 1)
         self.assertEqual(self.source.count("threading.Timer("), 1)
+        self.assertEqual(self.source.count('name="TaskbarProbe"'), 1)
 
     def test_ctypes_surface_is_unchanged(self):
         names = {
@@ -1739,13 +1742,13 @@ class SourceGuardTests(unittest.TestCase):
         structures.sort()
         self.assertEqual(
             [name for _lineno, name in structures],
-            ["APPBARDATA", "MONITORINFO", "BITMAPINFOHEADER", "BLENDFUNCTION", "WNDCLASSEXW"])
+            ["GUID", "APPBARDATA", "MONITORINFO", "BITMAPINFOHEADER", "BLENDFUNCTION", "WNDCLASSEXW"])
         self.assertEqual(
             re.findall(r'WinDLL\("(\w+)"', self.source),
-            ["user32", "gdi32", "shell32", "kernel32", "shcore", "dwmapi"])
+            ["ole32", "oleaut32", "user32", "gdi32", "shell32", "kernel32", "shcore", "dwmapi"])
         # Expectation updated on purpose. The callback factory is WINFUNCTYPE on Windows and
         # CFUNCTYPE elsewhere (so the offline tests can import the module), and the literal name
-        # now appears once in the fallback line instead of once per callback. Pin the fallback
+        # appears once in the fallback line and once in the UIA vtable call. Pin the fallback
         # line and the three callback definitions by name, and count every spelling of the factory
         # in the whole file: a callback built indented (inside a method) or through a second
         # getattr fallback at module level must fail too.
@@ -1755,7 +1758,8 @@ class SourceGuardTests(unittest.TestCase):
             re.findall(r"^(\w+) = _CALLBACK_TYPE\(", self.source, re.M),
             ["WNDPROC", "WINEVENTPROC", "WNDENUMPROC"])
         self.assertEqual(self.source.count("_CALLBACK_TYPE("), 3)
-        self.assertEqual(self.source.count("WINFUNCTYPE"), 1)
+        self.assertEqual(self.source.count("WINFUNCTYPE"), 2)
+        self.assertEqual(self.source.count("ctypes.WINFUNCTYPE("), 1)
         self.assertEqual(self.source.count("ctypes.CFUNCTYPE"), 1)
 
     def test_timer_ids_are_unique(self):

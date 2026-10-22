@@ -1,0 +1,256 @@
+# Technical reference
+
+[English guide](../README.md) | [简体中文指南](../README.zh-CN.md) | [AI-assisted setup](AI_SETUP.md)
+
+This reference retains the implementation details, timing rules, diagnostic fields and development commands from the user guide. For installation and everyday use, start with either guide above. Timing measurements and Windows build checks mentioned here are prior project observations, not benchmarks re-run for this documentation update. Commands in this document are examples, not instructions to run real model requests automatically.
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Updating while using chat and Code](#updating-while-using-chat-and-code)
+- [Claude app refresh](#app-refresh)
+- [Codex usage and refresh costs](#codex-usage)
+- [Update timing](#when-the-numbers-change)
+- [Troubleshooting and event log](#when-the-numbers-do-not-move)
+- [Widget behavior and limitations](#using-the-widget)
+- [Design notes and snapshot schema](#design-notes)
+- [Repository layout](#repository-layout)
+- [Building and testing](#building-a-release)
+- [Disclaimer](#disclaimer)
+
+## How it works
+
+Compatibility notes from this checkout: the desktop folder-loading integration was
+tested with Claude Code 2.1.286; the current CI workflow pins 2.1.293 for plugin
+validation and tests. These are project observations, not a guarantee that every
+Claude desktop or Claude Code version exposes the same tools. Use a version with
+mod support and consult the current Claude Code documentation when installing.
+
+```
+Claude Code session (desktop app Code tab, or terminal)
+  |   usage-feed plugin (a Claude Code "mod"): on session start, after every turn,
+  |   and whenever a rate-limit window moves by a whole percentage point, it takes
+  |   the usage figures Claude Code itself reports and merges them into data/usage.json
+  v
+usage_widget.py: reads data/usage.json every 15 s and draws the bars
+  ^
+  |   Codex CLI / Codex app: after each model response it appends a record with the
+  |   current rate limits to its local session log, %USERPROFILE%\.codex\sessions\...
+  |   The widget reads the newest such record across the newest session logs,
+  |   read-only, every 15 s. When you click
+  |   "Refresh now" it also starts your own Codex CLI once for a tiny request, so that
+  |   Codex logs the account's current limits (see "Codex usage").
+```
+
+- Normal Claude readings come from Claude Code's documented [mods API](https://code.claude.com/docs/en/plugins/mods/overview), using the figures Claude Code itself reports. Only when you click `Refresh now`, the plugin can also ask the Claude desktop app's own usage tool through the documented `$.mcp.call` mechanism. The app's `get_usage` tool itself is not a documented mods interface; see [Claude app refresh](#app-refresh). The project never reads your login token and never calls an unofficial endpoint itself. The only extra requests are the two optional ones you trigger with a click: the Claude one above, made by the app's own tool, and the Codex one under "Codex usage", made by your own Codex CLI. The widget itself sends none, and both can be turned off.
+- Numbers change only while a Claude Code session is active, because they come from the last API response of a session. After 30 minutes without an update the bars turn grey and an age label (`41m`, `3h`, `2d`) shows how old the reading is. Once a window's reset time has passed its row shows `reset` until fresh data arrives.
+- With several sessions open, the plugin merges readings instead of blindly overwriting: inside one window period the usage can only go up, so an idle session's older reading does not replace a newer one, and a later reset time means a new period. Exception one: a session's own latest reading always replaces the one it wrote earlier, because readings are in order within one process. Exception two: the account figure that `Refresh now` fetches from the desktop app replaces a stored figure of the same period that is higher by 1 point or more, but only when that stored figure was last observed at least 2 minutes ago (the app is not guaranteed to answer from live data, so a click right after a turn does not swap a fresher session reading for an older number). Figures from the app carry no session id, so they never count as a session's own earlier reading, and that session's next older reading cannot replace them. Together the two exceptions let a raised limit (for example after a plan upgrade) show up instead of staying hidden until the period ends, which for the weekly bar can take days. There is no file lock, so in a rare race one update can be lost until the next event.
+- The display style is saved in `data/widget_style.json`: `auto` (default), `bar` or `rings`. In `auto`, a background probe reads, read-only, the right edge of the taskbar's application buttons through Windows UI Automation; if the full bar would reach them, the widget switches to the ring blocks, and if even they do not fit it hides until space returns. The probe stops while the style is `bar` or `rings`.
+
+## Updating while using chat and Code
+
+Chat and Claude Code count toward the [same subscription limits](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work) when signed into the same account. A fresh Code reading therefore reflects the shared quota, including chat usage. The widget updates when the plugin receives those readings.
+
+The widget does not refresh account limits by itself in the background, so while only chat is active the numbers age and turn grey after 30 minutes. `Refresh now` fixes that on demand when a Code session of the desktop app is open: see "Refresh now and the app's usage tool" below. The widget does not extract login tokens and adds no background account requests.
+
+<a id="app-refresh"></a>
+
+### Refresh now and the app's usage tool
+
+When you click `Refresh now`, the widget writes a small request file, `refresh-request.json`, into the data folder. The plugin, loaded in your desktop-app Code sessions, looks for that file every 3 s: it checks whether the file exists, and once you have clicked at least once (the file is never deleted, a plugin has no way to delete files) it also reads that file of about 100 bytes and compares its id with the last one it handled. When a new request shows up it calls, once, the `get_usage` tool of the app's own `ccd_session_mgmt` server through the documented `$.mcp.call`, which uses the app's own connection and sign-in and sends no model request. The tool returns the account's 5-hour and weekly limits, the same numbers as the app's usage card. The plugin merges them into `usage.json`, then writes `refresh-ack.json`; the widget re-reads `usage.json` and shows `new HH:MM` or `same HH:MM`.
+
+- **Limits.** One request per click; after an answer the widget accepts the next click after 60 s (10 s after an unanswered one); each session also refuses to call the tool more than once per 10 s, which matches the widget's retry cooldown (a failed call counts too, so a retry within 10 s of a failure can show `no session` once more; the widget's own cooldown normally keeps clicks further apart than that); a request older than 30 s is ignored; an attempt that takes longer than 5 s is given up, and that 5 s is one limit shared by both server names (the plugin notices a request within 3 s and the widget waits 9 s for the answer, so 3 s + 5 s fits with about 1 s to spare for the file writes: a call that uses its full 5 s still answers in time, and only a longer delay makes the widget give up; the numbers then still arrive with the next 15 s read, and the next click is not throttled). Nothing is sent without a click.
+- **The numbers it writes.** The tool reports whole percents, the session figures carry one decimal. If the tool's number is the same as the stored one within 1 point, the stored number is kept (with its session id) and only its observation time is refreshed, so the widget can say `new` without the figure jumping. A figure is not replaced by a lower one from the same period, with two exceptions. First, when the tool's number is lower than the stored figure by 1 point or more and that figure was last observed at least 2 minutes ago, the tool's number replaces it (the stored one is out of date, as after a plan upgrade that raised the limit); a fresher stored figure is kept, because the app is not guaranteed to answer from live data and a click right after a turn must not swap a newer session reading for an older number. Second, a session's own latest reading always replaces the one that session wrote earlier, because readings are in order within one process. The tool's numbers are written without a session id (`session_id` is `null`), so they never count as a session's own earlier reading: that session's next reading, if it is lower, is held back like any other session's.
+- **No session.** If no desktop-app session answers within 9 s, the Claude block shows `no session`, or `no file` when `usage.json` is missing (see the table under "When the numbers do not move"). Reasons for `no session`: only terminal sessions are open (they have no such tool); no open desktop-app session runs the updated plugin (a plugin update is only picked up by sessions that start after it, so open a new one); the plugin is loaded in the desktop app through a marketplace install instead of `CLAUDE_CODE_PLUGIN_DIRS` (see the [installation guide](../README.md): that copy loads but its hooks never run in desktop sessions); or the app has no session open at all. To tell these apart, look in `usage-feed-events.json`: a desktop session that runs the plugin has entries with its own `sid`, and a click it handled leaves a `refresh.app` entry. Every failure is silent on the plugin side, so a terminal session never blocks a desktop one; the plugin's log, `usage-feed-events.json`, records the attempts as `refresh.app` entries.
+- **Not a promise.** `ccd_session_mgmt` is a tool of the desktop app, not part of the documented mods API; only `$.mcp.call` is documented. If the app renames or removes it, the click falls back to `no session` (or `no file` while `usage.json` is missing) and nothing else breaks. Turn the request off with `--no-app-refresh`.
+
+## Codex usage
+
+The Codex block needs no setup. The Codex CLI and the Codex app write a local session log for each session under `%USERPROFILE%\.codex\sessions\YYYY\MM\DD\rollout-*.jsonl` (or under `CODEX_HOME` if you set that variable). After every model response they append a `token_count` record that carries the current rate limits: the 5-hour window (`primary`) and the weekly window (`secondary`), each with the used percentage and the reset time. The widget reads the most recent such record among the newest session logs.
+
+- **Automatic detection.** The widget looks in the Codex folder of the Windows user it runs as. Without a `sessions` folder it shows only the Claude block, exactly as before; once Codex has been used, the Codex block appears on its own.
+- **Read-only and local.** The widget reads the tails of local session logs and parses only lines that contain both `"token_count"` and `"rate_limits"` as usage records; it does not interpret prompts or answers as usage data. The log tails can contain chat text, so this is not a claim that those bytes are never read. It never opens `auth.json` or any other Codex credential file, and the widget itself makes no network connection. Only records whose `limit_id` is missing or `codex` are used.
+- **Refresh now asks Codex for a fresh reading.** When you click `Refresh now` and the Codex block is shown (a `sessions` folder exists), the widget starts your own Codex CLI once, without a window, through its non-interactive mode, with a fixed command line and no shell: `codex.exe exec -m gpt-6-luna -c model_reasoning_effort="low" --ignore-user-config --ignore-rules -s read-only -C <data folder>\codex-ping --skip-git-repo-check --json ok`. Codex answers the one-word prompt and, as for every response, writes the account's current limits into a new session log, which the widget then reads. This is the only way to see Codex use that happened on another computer or through another provider. It costs a small request on your Codex plan (measured: about 17,000 input tokens, partly cached, and about ten output tokens on the small model `gpt-6-luna`, 4 to 7 s). Limits on it: at most one request every 5 minutes (a click inside that time shows `cooldown`), stopped after 60 s, never started by the 15 s polling, never started when Codex has not been used on this computer. Each request leaves one small session file in Codex's own `sessions` folder, which may also appear in Codex's own session list. The widget never reads your Codex login file; the Codex CLI uses its own sign-in, as it does when you run it yourself. Whether this is acceptable under your own plan's terms is your decision; turn it off with `--no-codex-ping`.
+- **Finding the Codex CLI.** Only the native `codex.exe` is used, never the `codex.cmd` shim. The widget takes `--codex-bin <file>` if you give one (it must be an existing `.exe`, otherwise nothing is started), else a `codex.exe` in a PATH folder (only absolute folders count; empty and relative PATH entries are ignored, so the widget's own working folder is never searched), else the copy inside the npm package `@openai/codex` under `%APPDATA%\npm\node_modules`. If none is found, `Refresh now` only re-reads the logs and writes one line to `widget_error.log`.
+- **Not an official interface.** The session-log format belongs to Codex and may change in a future release. If it does, the Codex block keeps its last numbers, which turn grey after 30 minutes, or shows `--` if it never read any; the Claude block is not affected.
+- **What updates it.** Interactive Codex use updates it, and so does the request that `Refresh now` sends. Runs started with `codex exec --ephemeral` write no session log and therefore never show up.
+- **Options.** `--no-codex` hides the block (and so also stops the request). `--no-codex-ping` keeps the block but never starts Codex. `--codex-home <folder>` reads another Codex home; the request then runs with `CODEX_HOME` set to the same folder. `--codex-bin <file>` names the `codex.exe` to start. `--codex-ping-model <name>` replaces `gpt-6-luna` (letters, digits, `.`, `_`, `:` and `-` only), for example if your plan does not offer that model; a refused model ends in `ping failed`.
+
+## When the numbers change
+
+| What | How often |
+|---|---|
+| The widget re-reads `data/usage.json` and the Codex session log | every 15 s |
+| The widget looks for a newer Codex session log | at most every 60 s |
+| A block turns grey and shows its age when its newest reading is older than | 30 min |
+| The result of `Refresh now` stays on screen for | about 2.5 s |
+| The Codex request of `Refresh now` runs at most | once every 5 min |
+| The Codex request is given up after | 60 s |
+| The plugin looks for a refresh request | every 3 s (a file-exists check, plus a read of the tiny request file once it exists) |
+| The plugin gives up a call to the desktop app's usage tool after | 5 s |
+| A session calls the desktop app's usage tool at most | once every 10 s |
+| The widget waits for the plugin's answer | up to 9 s |
+| The next Claude request of `Refresh now` is accepted after | 60 s (10 s after an unanswered one) |
+
+The widget can only show what its sources have written. Claude's numbers arrive when a Code session finishes a turn, a limit moves by a whole point, or you click `Refresh now` with a desktop-app session open (within about 3 to 4 s); Codex's numbers arrive after each Codex model response. A reading from an ongoing Codex session therefore shows up within about 15 s, one from a newly started session within about 75 s. `Refresh now` in the right-click menu re-reads both sources at once, looks for a new Codex session log immediately and, if the limits allow, asks for fresh readings: Codex through your Codex CLI (4 to 7 s, at most every 5 minutes) and Claude through the desktop app's usage tool (about 3 to 4 s, at most every 60 s). Each block shows `asking` while its answer is pending.
+
+The grey of an old reading is drawn at full strength on purpose: on a transparent taskbar a faded bar is almost invisible, a grey one is not. The age label shows the age of the oldest stale reading of that block, rounded down: minutes below 2 h, hours below 48 h, then days (never more than `999d`).
+
+## When the numbers do not move
+
+First rule out the two usual causes, which are not faults:
+
+- **The usage happened somewhere the widget cannot see.** Claude Code sessions on another computer, the phone app, claude.ai in a browser and the desktop Chat tab do not write to this folder. They count against the same limits, but the widget only learns about them once a local Code session reports a fresh reading, or when you click `Refresh now` with a desktop-app session open (the app's usage tool reports the whole account).
+- **The session reports no limits.** Claude Code hands the plugin rate-limit figures only from the last response that carried them, so a session that has not completed a turn yet, or whose responses carried none, gives the plugin nothing to write.
+
+To see which one it is, click `Refresh now` in the right-click menu. For about 2.5 s the widget shows what the click found next to the numbers (in the block header when two blocks are shown):
+
+| Text | Meaning |
+|---|---|
+| `new 14:59` | A reading newer than the one on screen was found; 14:59 is when it was taken (local time). |
+| `same 14:29` | Nothing newer exists in the data; the newest reading was taken at 14:29. The widget works, the source has not written anything since. |
+| `no data` | There is no reading at all yet for this block. |
+| `no file` | Claude block only: `usage.json` is not in the data folder. Any numbers already shown stay until a new file arrives. It also appears 9 s after an unanswered click, instead of `no session`, and usually means the widget and the plugin use different data folders (see `--data-dir` under Install). |
+| `read error` | The data (the Claude data file, or the Codex session log for the Codex block) exists but could not be read or parsed. |
+| `asking` | The request of that block is pending: Codex block, your Codex CLI is running the small request (4 to 7 s); Claude block, the widget waits for a desktop-app session to answer (up to 9 s). The text stays until it ends, then the result shows as `new` or `same`. |
+| `cooldown` | No new request was sent because the last one was too recent: Codex block, less than 5 minutes ago; Claude block, less than 60 s ago (10 s after an unanswered one). |
+| `ping failed` | Codex block only: the request could not be started, exited with an error (for example a model your plan does not offer, or no sign-in), or ran for more than 60 s. `widget_error.log` has the exit code. |
+| `no session` | Claude block only: no desktop-app session answered within 9 s, while `usage.json` exists (with no file the caption is `no file`). See "Refresh now and the app's usage tool" for the reasons. |
+| `no limits` | Claude block only: a session answered, but the app reported no limits for this account (an API key or a gateway account has none). `usage.json` was not changed. |
+| `not sent` | Claude block only: the request file could not be written into the data folder. `widget_error.log` has the reason. |
+
+Each block gets its own text, so a fresh Claude block and a stale Codex block can say `new` and `same` side by side.
+
+For the Codex block this also fixes the first cause above: Codex use on another computer is invisible to a local log, but the answer to the request carries the account's current limits, so a click gives you the real numbers.
+
+If a Code session is running and the widget still says `same`, look at the plugin's own log, `usage-feed-events.json`, in the same folder as `usage.json`. The plugin adds one entry per hook call (and one per handled click on `Refresh now`) and keeps the latest 200. It is plain JSON with one entry per line, each entry compact and the newest one last:
+
+```json
+{"t":1790900000123,"ev":"session.measure","sid":"...","n":2,"kinds":["five_hour","seven_day"],"kept":2,"out":"wrote","why":"","held":[],"changed":[]}
+```
+
+| Field | Meaning |
+|---|---|
+| `t` | Time of the call, in milliseconds since 1970 |
+| `ev` | `session.start`, `session.measure` (after every turn or whenever a limit moves) or `refresh.app` (the plugin handled a click on `Refresh now`) |
+| `sid` | The session that made the call |
+| `n`, `kinds` | How many limit windows Claude Code handed over, and which kinds (`five_hour`, `seven_day`, `spend_limit`) |
+| `kept` | How many of them were usable |
+| `out` | `wrote` (usage.json updated), `skipped` (nothing to write) or `failed` (the write failed) |
+| `why` | Empty when `out` is `wrote`. Otherwise `no_rate_limits` (the session reported none), `all_dropped` (every window was unusable, see `drops`), `bad_clock` (no valid time from the engine), `usage_error:<name>` (reading the usage failed) or `write_error:<name>` (writing failed) |
+| `drops` | Why windows were unusable, as counts, for example `{"no_resets_at": 2}`; left out when nothing was dropped. Reasons: `not_object`, `unknown_kind`, `bad_percent`, `no_resets_at`, `bad_resets_at`, `duplicate_kind` |
+| `held` | Windows whose new reading did not replace the stored one, because it came from another session and was lower in the same period, or belonged to an earlier period; the stored value was kept. A click on `Refresh now` holds back an earlier period, or a number 1 point or more below a stored figure that was observed less than 2 minutes ago |
+| `changed` | The names of the metrics that changed, as the engine reported them (empty at session start) |
+
+For `refresh.app` entries `n` is the number of windows the app's tool reported, `kinds` and `kept` count the ones the plugin could use (`five_hour`, `seven_day`), and `why` is one of: empty (usage.json updated and the answer written), `duplicate_ack` (another session had already answered this click), `throttled` (this session called the tool less than 10 s ago), `mcp_error:<name>` (the call failed on both server names, typically a terminal session; `<name>` is the error of the first name), `mcp_timeout` (no answer within the 5 s that cover the whole attempt), `app_is_error` (the tool reported an error), `parse_failed` (its answer was not readable), `app_unavailable:<status>` or `no_windows` (the account has no limits to report; the widget shows `no limits`), `bad_clock`, `write_error:<name>` or `ack_write_error:<name>`.
+
+How to read it: many `no_rate_limits` entries mean that session never receives limits (not a fault of the widget or the plugin). `all_dropped` with `no_resets_at` means Claude Code sent percentages without a reset time, which the plugin does not accept. `held` filled in again and again means another session wrote a higher reading in the same period. No new entries at all while you work usually means the plugin is not loaded in that session; see the [installation guide](../README.md) and the debug-file check below.
+
+The log holds no file paths, working folders, prompts or model names, only what the table lists. It is written without a lock; with several sessions at once an entry can be lost, and in a rare race (another session is half-way through writing the file) one entry is skipped, not the whole log. A log the plugin cannot read, because it is not valid JSON or is larger than 256 KB, is left alone once and replaced by a fresh one only if it is still the same at the next entry; when the plugin rewrites the log it also drops entries that are not plain objects or are larger than 2 KB. It is for troubleshooting only and nothing reads it back.
+
+### Checking whether the plugin loaded
+
+After a completed turn, compare the session's id with `session_id` in `data/usage.json` and `sid` in `data/usage-feed-events.json`. A session normally leaves `session.start`, then `session.measure` entries. If neither file has an entry from that session, start Claude Code with `--debug-file <path>` and look for `hooks module usage-feed@inline loaded` (or `usage-feed@usage-bar-local` for a marketplace install). Re-check the paths and plugin keys in `%USERPROFILE%\.claude\settings.json`, then open a new session. Do not share the whole debug file without reviewing it for private content.
+
+## Using the widget
+
+- **Drag** it sideways to move it. It then stays where you put it.
+- **Right-click** for the menu: `Refresh now`, `Snap to tray` (go back to following the notification area automatically), `Display` (`Auto (fit taskbar)`, `Full bar`, `Rings`) and `Quit`. `Refresh now` re-reads both sources at once, dims the widget for about 0.3 s and then shows for about 2.5 s what it found (`new 14:59`, `same 14:29`, `no data`, `no file` or `read error`, see "When the numbers do not move"), so you can see that it ran even when no new reading has arrived. It also asks for fresh readings: the small Codex request described under "Codex usage" (when the Codex block is shown) and the request to the desktop app's usage tool described under "Refresh now and the app's usage tool".
+- **Display** chooses the layout. `Auto (fit taskbar)` is the default: the full bar while the app buttons leave room, the ring blocks before they would overlap, and no widget if even the two ring blocks do not fit. `Full bar` and `Rings` pin one layout. In Rings, Claude is the left block and Codex the right; each block has the double ring on the left and its name, 5h/7d percentages and reset times on the right; the header also carries the age or the 2.5 s `Refresh now` feedback. The choice is saved in `data/widget_style.json`.
+- It hides itself while a full-screen app is running (an ordinary application window covering an entire display, on any monitor, whether or not it is the foreground window) and while the taskbar is set to auto-hide. Clicking the taskbar or the desktop does not count as full screen, and neither do maximized windows.
+- It stays visible while the Start menu, Quick Settings or the notification overflow is open, and after a click on empty taskbar space. This was checked with screenshots on build 26200, opening Start and Quick Settings both by keyboard and by mouse.
+
+Known limitations:
+
+- Windows 11 does not let ordinary windows live inside the notification area, so the widget sits beside it, not inside.
+- After the right-click menu closes, keyboard focus stays on the widget until you click another window.
+- Only the primary monitor's taskbar is handled.
+- With several Codex sessions open (for example the app and the CLI), the Codex block shows the most recent rate-limit record across the newest session logs, not the record in the most recently written file, because typing a prompt touches a log without adding a record.
+- If the system clock ran far ahead while Codex was writing and was corrected later, the Codex block can stay on an old reading for about as long as the clock was ahead, or until that session writes again. With several session logs, a normal record from another session, or the one that a `Refresh now` request writes, replaces such a reading at the next read.
+- When Explorer restarts, the widget recreates its window under the new taskbar. This was tested with one real restart; two restarts within 30 s can leave the widget without an owner for up to about 30 s, during which an open Start menu covers it.
+- The Auto style cannot reserve taskbar space. When the taskbar is full enough that even the two ring blocks (about 258 px at 100 % scaling) do not fit, the widget hides until room returns; choosing Rings by hand does not reserve space either. Full-taskbar overlap is a Windows 11 limitation, not something an overlay window can fix.
+- The Auto fit reads the taskbar through UI Automation about once a second. If UI Automation is unavailable, Auto falls back to the `TaskbarAl` alignment setting: centered uses the rings, left alignment the full bar.
+
+## Design notes
+
+- The widget is a top-level layered window with per-pixel transparency, created with the primary taskbar (`Shell_TrayWnd`) as its owner through the documented `hWndParent` argument of `CreateWindowEx`. While the Start menu is open, Windows moves the taskbar into a higher window band than ordinary topmost windows, and it moves the taskbar's owned windows with it; an unowned topmost window stays hidden underneath. The widget is not a child window, and nothing is injected into Explorer.
+- Trade-off of the owner link: a cross-thread owner relationship attaches the input queues of the widget thread and the taskbar thread, so a hung widget could delay taskbar input. The widget therefore does only short work on its main thread (small file reads and small renders).
+- Ownership cannot be transferred after a window is created. When the taskbar window is replaced (for example after an Explorer restart), it destroys and recreates its own window, at most once every 30 s. If the widget started without an owner because no taskbar existed yet, it does the same once a taskbar appears. If creating the owned window failed and the widget fell back to an unowned one, it retries only for a different taskbar window or after the `TaskbarCreated` broadcast, so it does not flicker every 30 s. It does not use `GetWindow(GW_OWNER)` for that decision: on build 26200 that call returns no owner while the Start menu or a mouse-opened Quick Settings is showing, and the taskbar again once it closes, while the widget keeps following the taskbar. A mismatch there is only logged.
+- After an Explorer restart (tested once with `taskkill` and `start explorer.exe` on build 26200) the widget recreated its window under the new taskbar within the same second, and it again stayed visible over the Start menu.
+- To follow the notification area the widget reads the window rectangle of `TrayNotifyWnd` (read-only queries, every 2 s), so it moves when tray icons come and go.
+- The Auto fit asks UI Automation (read-only) for the taskbar's `TaskbarFrame` element and takes the greatest right edge among its immediate children (Start and the running or pinned app buttons). The free gap is `TrayNotifyWnd.left - 2 px - that edge`. The full bar is used when the gap is at least the bar width plus 4 px; otherwise one pair of ring blocks (each a 40 px ring plus an 80 px text block, 10 px between blocks, about 258 px at 100 % scaling) when that fits with the same 4 px margin; otherwise the widget hides. Returning from the rings to the bar needs an extra 24 px, so opening or closing one taskbar button does not make the widget flicker. The rings are drawn at 4x supersampling, one square badge as tall as the widget: outer ring 7d, inner ring 5h, clockwise from 12 o'clock by the share left, with the same colour ramp and grey for stale readings. The text block is drawn at 1x to the right of each ring with the header font and the two row positions of the full bar; it shows the provider name (or the age/caption), 5h/7d, the percentage and the reset time. The style file is read at start and written only from the Display menu.
+- Foreground, window-order and top-level window movement notifications use out-of-context WinEvent hooks and drive the same visibility check as the 2 s fallback: when an ordinary window starts or stops covering a whole display the widget hides or comes back at once instead of waiting for the next tick. When the taskbar covers the widget, for example after the Start menu closes, it restores its own window order without taking focus; repeated notifications are coalesced and the 2 s check remains as a fallback that likewise reasserts the window order only while the taskbar covers the widget (and once when the widget is shown again after being hidden). Only overlapping shell panel rectangles prevent that restoration. Full-screen, auto-hide and menu rules still apply. Some machines report a busy notification state all the time, so the widget does not use that state to decide: it hides when an ordinary application window covers an entire display, on any monitor, whether or not that window is the foreground window. The taskbar, the desktop, maximized windows and the widget's own windows never count.
+- The widget makes no network connections. Its only subprocess is the optional Codex request after a click on `Refresh now`: one `Popen` call with a fixed argument list (no shell, standard streams closed, no window), a non-blocking check every 0.5 s on the main thread, `terminate` then `kill` after 60 s, and a stop on quit. While the display style is `auto`, one background UI Automation probe thread reads the taskbar's `TaskbarFrame` accessibility children about once a second; it stops while the style is `bar` or `rings` and on quit. It reads two registry values (the light/dark setting and the taskbar alignment `TaskbarAl`), `data/usage.json`, the plugin's answer `data/refresh-ack.json` (at most 4 KB, only while it waits for one) and, read-only, the tail of the newest Codex session logs, and it writes only `widget_pos.json`, `widget_skin.json`, `widget_style.json`, the request file `refresh-request.json` (replaced atomically, only after a click) and a small error log (rotated once at 64 KB, so at most about 128 KB on disk) into the data folder, which it creates on start (only once it is the single running instance), and the `codex-ping/` folder inside it for the Codex request. Looking for the newest Codex session logs stats the files of the last 14 date folders at most once a minute (about 2 ms with 1,200 session logs); reading takes at most 1 MB from the end of each of the up to 5 newest logs, and each 15 s poll stats those logs again and re-reads only those whose size or mtime changed (`Refresh now` reads them all again).
+- The plugin calls nine Claude Code APIs (`session.usage`, `session.id`, `clock.now`, `clock.every`, `clock.after`, `fs.read`, `fs.write`, `fs.exists`, `mcp.call`), hooks only `session.start` and `session.measure`, and writes only `usage.json`, the troubleshooting log `usage-feed-events.json` and the answer file `refresh-ack.json` in the folder you configured. Every hook runs the engine's own handling first, and a failure inside the plugin is swallowed, so it cannot change how a session behaves. The only timer is one 3 s interval per session that checks the request file (`fs.exists`, then a read of the tiny file once it exists); `mcp.call` is made only for a new request, only to `ccd_session_mgmt`'s `get_usage`, with an empty argument and a 5 s limit that covers both server names together. The plugin does not hook `session.end` or cancel the timer itself: the engine drops a plugin's timers when it reloads it, a process takes them with it when it exits, and `/clear` and resume end a session without ending the process, so a cancel there would only stop the clicks from being served. Everything the plugin reads is size-capped before it is parsed (`usage.json` 64 KB, the log 256 KB, the request and the answer 4 KB, and the text block of the app's reply 64 KB; the caps count characters, not bytes, and structured content in the reply is not size-capped); anything bigger counts as unreadable.
+- The request and the answer are matched by a random id, not by file existence (a plugin cannot delete files). The plugin writes `usage.json` before the answer, so a widget that sees the answer always reads the new numbers; a failed call writes no answer, so a terminal session cannot make a desktop session's click look failed; several sessions may answer the same click, which is harmless (the first answer wins, later sessions see it and skip).
+
+`usage.json` looks like this (`resets_at` is Unix seconds, `observed_at` is when the value was last confirmed, `session_id` is the session that read the value, or `null` when it came from the app's usage tool):
+
+```json
+{
+  "schema": 1,
+  "written_at": 1790900000.123,
+  "windows": {
+    "five_hour": {"used_percentage": 65.0, "resets_at": 1790909400, "observed_at": 1790900000.123, "session_id": "..."},
+    "seven_day": {"used_percentage": 33.0, "resets_at": 1791093600, "observed_at": 1790899000.456, "session_id": "..."}
+  }
+}
+```
+
+## Repository layout
+
+| Path | Content |
+|---|---|
+| `usage_widget.py` | Entry point: CLI parsing, single-instance mutex, app wiring; re-exports the widget's public names |
+| `usage_bar/` | The widget, split by layer: `win32.py` (thin ctypes wrappers), `data.py` (usage.json and Codex log readers, plugin answer, error log, position/skin/style files), `render.py` (layout math and PIL drawing, including the ring badges and their text blocks), `uia.py` (read-only UI Automation probe for the Auto display fit), `app.py` (window, timers, refresh loop) |
+| `plugins/.claude-plugin/marketplace.json` | Local marketplace that lists the plugin |
+| `plugins/usage-feed/` | The Claude Code plugin: `hooks/register.ts` and its tests in `tests/` |
+| `tests/` | Widget tests (native and real-Codex tests opt-in): window events and topmost handling, taskbar ownership and recovery, full-screen detection, drag and the position file, usage.json and Codex log reading, layout and pixel rules, display styles and ring text, render caches, captions and Refresh now (fake process, temporary folders, fake clocks), startup and the error log |
+| `claude-usage-bar.spec` | PyInstaller recipe for the one-file, windowless `claude-usage-bar.exe` |
+| `packaging/build_release.ps1`, `packaging/INSTALL.txt` | Builds the release zip; the install guide that goes into it |
+
+### Building a release
+
+On Windows, with PyInstaller installed in the same Python that runs the tests (`python -m pip install pyinstaller`):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File packaging\build_release.ps1 -Python python
+```
+
+The script runs the widget tests (skip with `-SkipTests`), builds the exe from `claude-usage-bar.spec`, runs it once with `--selftest-render` as a smoke test, and writes `dist\claude-usage-bar-<version>-<commit>.zip` and its `.sha256`. The version is the plugin's version in `plugin.json`; a build from a tree with uncommitted changes gets `-dirty` in its name, so publish only zips built from a clean commit.
+
+The plugin tests run on Claude Code's own test kit (they use stand-ins for the engine, so `$.mcp.call` is never really called):
+
+```powershell
+claude plugin validate ./plugins/usage-feed
+claude plugin test ./plugins/usage-feed
+```
+
+Widget regression tests run on Windows with Python and Pillow:
+
+```powershell
+python -B -m unittest discover -s tests -v
+```
+
+The non-native widget tests also run on Linux, and the widget tests (Linux and Windows) and the
+plugin tests run in GitHub Actions on every push and pull request (see [the CI workflow](../.github/workflows/ci.yml)).
+
+To also check real Windows event delivery, repeated reordering, window ownership and the real message loop, enable the native tests. They create only their own off-screen windows and do not operate the real taskbar:
+
+```powershell
+$env:CLAUDE_USAGE_NATIVE_TEST = '1'
+python -B -m unittest discover -s tests -v
+Remove-Item Env:CLAUDE_USAGE_NATIVE_TEST
+```
+
+One more test is off by default because it sends a real request through your Codex CLI (a small one, it uses a little of your Codex allowance and leaves a session file). It needs `CLAUDE_USAGE_CODEX_PING_TEST=1` and a Python of 3.10 or newer:
+
+```powershell
+$env:CLAUDE_USAGE_CODEX_PING_TEST = '1'
+python -B -m unittest tests.test_codex_ping.RealPingTests -v
+Remove-Item Env:CLAUDE_USAGE_CODEX_PING_TEST
+```
+
+## Disclaimer
+
+Unofficial project, not affiliated with or endorsed by Anthropic or OpenAI. It relies on Claude Code's mods API, on the `get_usage` tool of the Claude desktop app (not a documented interface) and on the format of Codex's local session logs, which may change. The Codex request on `Refresh now` runs your own signed-in Codex CLI the way a script would and uses a little of your Codex allowance; check that it suits your plan, or start the widget with `--no-codex-ping`.
